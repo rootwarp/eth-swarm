@@ -3,10 +3,11 @@
 //!
 //! - **The map** ([`map`], execution-apis `paris.md` L99-118): `VALID` is [`ElVerdict::Valid`]
 //!   only if its `latestValidHash` is the submitted payload's `block_hash` (`paris.md`, payload
-//!   validation, rule 3), else [`Reason::Malformed`]; `INVALID` and `INVALID_BLOCK_HASH` are
-//!   [`ElVerdict::Invalid`] with `latestValidHash` as given, `null` included; `SYNCING` and
-//!   `ACCEPTED` are [`ElVerdict::Optimistic`]. It reads one reply: two contradicting replies for
-//!   one payload are the caller's to reconcile.
+//!   validation, rule 3), else [`Reason::Malformed`]; `INVALID` is [`ElVerdict::Invalid`] with
+//!   `latestValidHash` as given, `null` included; `INVALID_BLOCK_HASH` is
+//!   [`Reason::InvalidBlockHash`], whatever its `latestValidHash`; `SYNCING` and `ACCEPTED` are
+//!   [`ElVerdict::Optimistic`]. It reads one reply: two contradicting replies for one payload are
+//!   the caller's to reconcile.
 //! - **Fail closed.** A status this client cannot name, a reply that breaks the contract, an
 //!   error from cl-engine, a failed call and a timeout are [`ElVerdict::NotVerified`], never
 //!   `Valid`: [`map_json`] for the Engine API JSON, [`map_proto`] for engine.v1, where
@@ -29,7 +30,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 pub enum ElVerdict {
     /// `VALID`.
     Valid,
-    /// `INVALID` or `INVALID_BLOCK_HASH`, with `latestValidHash` as the EL gave it.
+    /// `INVALID`, with `latestValidHash` as the EL gave it. `INVALID_BLOCK_HASH` is not this:
+    /// see [`Reason::InvalidBlockHash`].
     Invalid {
         /// `latestValidHash`: `None` when the EL sent `null`.
         latest_valid_hash: Option<Hash32>,
@@ -61,6 +63,12 @@ pub enum Reason {
     Timeout,
     /// No connection to cl-engine.
     Connect,
+    /// `INVALID_BLOCK_HASH`: the payload sent does not hash to the `block_hash` it claims. That
+    /// says nothing of the payload that has this hash, which can be an honest one (a tampered
+    /// envelope can claim it), so it is no verdict on it. Its `latestValidHash` does not count
+    /// either: `paris.md` requires `null` with this status, and one from a faulty EL must not
+    /// move a boundary.
+    InvalidBlockHash,
 }
 
 impl ElVerdict {
@@ -97,6 +105,7 @@ impl ElVerdict {
 
 /// The verdict of one `PayloadStatusV1` for the submitted payload `block_hash`. A `VALID` must
 /// carry `block_hash` as `latestValidHash`; `null` or another hash is [`Reason::Malformed`].
+/// `INVALID_BLOCK_HASH` is [`Reason::InvalidBlockHash`], with any `latestValidHash`.
 /// `validationError` does not change the verdict.
 #[must_use]
 pub fn map(status: &PayloadStatusV1, block_hash: Hash32) -> ElVerdict {
@@ -108,9 +117,10 @@ pub fn map(status: &PayloadStatusV1, block_hash: Hash32) -> ElVerdict {
                 ElVerdict::NotVerified(Reason::Malformed)
             }
         }
-        ValidationStatus::Invalid | ValidationStatus::InvalidBlockHash => ElVerdict::Invalid {
+        ValidationStatus::Invalid => ElVerdict::Invalid {
             latest_valid_hash: status.latest_valid_hash.map(|h| Hash32::from(h.0)),
         },
+        ValidationStatus::InvalidBlockHash => ElVerdict::NotVerified(Reason::InvalidBlockHash),
         ValidationStatus::Syncing | ValidationStatus::Accepted => ElVerdict::Optimistic,
     }
 }
@@ -173,14 +183,17 @@ pub enum ExecutionStatus {
     Valid,
     /// Imported on `SYNCING` or `ACCEPTED`, and not `VALID` or `INVALID` yet.
     Optimistic,
-    /// The EL answered `INVALID` or `INVALID_BLOCK_HASH` for it, or it is in the invalid part of
-    /// the chain of such an answer, or it descends from an `Invalid` payload.
+    /// The EL answered `INVALID` for it, or it is in the invalid part of the chain of such an
+    /// answer, or it descends from an `Invalid` payload. `INVALID_BLOCK_HASH` never makes a
+    /// payload `Invalid` ([`Reason::InvalidBlockHash`]).
     Invalid,
 }
 
-/// Most `Invalid` payloads [`ExecutionStatuses`] keeps: 128 epochs at one per slot. Past it, the
-/// payload that became `Invalid` first is dropped first. A dropped payload has no status, so a
-/// later payload on it is not refused by the table; the EL still gives its own verdict.
+/// Most `Invalid` payloads [`ExecutionStatuses`] keeps a full entry for: 128 epochs at one per
+/// slot. Past it, the payload that became `Invalid` first loses its entry first, and only its
+/// hash and parent hash stay. It stays `Invalid` until [`ExecutionStatuses::prune_finalized`]
+/// drops it: a later `VALID` or `SYNCING` must not bring an `INVALID` payload back. A boundary
+/// it waited for is dropped with the entry.
 pub const MAX_INVALID_PAYLOADS: usize = 4096;
 
 /// One payload's status, as the table holds it.
@@ -218,7 +231,7 @@ struct Entry {
 enum Walk {
     /// The next hash up is the `latestValidHash`.
     Found,
-    /// A `Valid` payload, or one the walk passed before: the boundary is not in this chain.
+    /// A payload the walk passed before: the boundary is not in this chain.
     Stopped,
     /// A payload that is not recorded (yet).
     Missing,
@@ -226,24 +239,34 @@ enum Walk {
 
 /// The [`ExecutionStatus`] of each payload cl-chain has a verdict for, by its `block_hash`,
 /// with its `parent_hash`. Nothing reads it yet; it will give `execution_optimistic` and the
-/// confirmed and safe hashes. The rules are those of `bellatrix/optimistic-sync.md`.
+/// confirmed and safe hashes. The rules are those of consensus-specs v1.7.0-beta.4,
+/// `specs/bellatrix/optimistic-sync.md`. A payload moves only from `Optimistic`
+/// (`NOT_VALIDATED`) to `Valid` or to `Invalid` ("How to optimistically import blocks"). The
+/// spec leaves out `Valid` to `Invalid` and `Invalid` to `Valid` ("Transitioning from VALID ->
+/// INVALIDATED or INVALIDATED -> VALID"): only a faulty EL asks for them, and they need manual
+/// intervention. So the table keeps both as they are and records the contradiction
+/// ([`ExecutionStatuses::el_contradiction`]).
 ///
 /// - `Valid` makes the payload `Valid`, and every ancestor still `Optimistic` too, walking the
 ///   recorded parent hashes up to the first ancestor that is not recorded or not `Optimistic`.
+///   An `Invalid` payload, or an `Invalid` ancestor on that walk, stays `Invalid`: an EL
+///   contradiction.
 /// - `Optimistic` makes a payload with no status `Optimistic`, and leaves `Valid` alone.
-/// - `Invalid` makes the payload `Invalid`, whatever it was. `INVALID` is final (`paris.md`
-///   L114): a later `Valid` or `Optimistic` leaves it `Invalid`. Every recorded descendant
-///   becomes `Invalid` too, whatever it was, and so does every payload recorded later on an
-///   `Invalid` one: a payload on an invalid parent is invalid.
+/// - `Invalid` makes the payload and every recorded `Optimistic` descendant `Invalid`. A `Valid`
+///   one stays `Valid`: an EL contradiction. `INVALID` is final (`paris.md` L114): a later
+///   `Valid` or `Optimistic` leaves it `Invalid`. A payload recorded on an `Invalid` one is
+///   `Invalid` whatever its verdict: its parent MUST NOT be `INVALIDATED`.
 /// - The `latestValidHash` of an `Invalid` sets a boundary ("How to apply `latestValidHash`
-///   when payload status is `INVALID`"). The walk goes up the recorded `Optimistic` ancestors,
-///   and passes those that are `Invalid` already (an earlier walk of the same boundary can have
-///   made them `Invalid`). For a hash, if the next hash up is the `latestValidHash`, every
-///   payload of the walk is `Invalid` (with its descendants), and the `latestValidHash` payload
-///   and its `Optimistic` ancestors are `Valid`. For the zero hash, every `Optimistic` ancestor
-///   of the walk is `Invalid`. For `null`, or a hash whose walk stops at a `Valid` payload, only
-///   the payload is. A walk that stops at a payload that is not recorded waits for it, and so
-///   does a `latestValidHash` payload that is not recorded yet.
+///   when payload status is `INVALID`"). The walk goes up every recorded ancestor: an `Invalid`
+///   one (an earlier walk of the same boundary, or evicted) does not hide a boundary above it,
+///   and a `Valid` one only makes the boundary an EL contradiction. For a hash, if the next hash
+///   up is the `latestValidHash`, the topmost payload of the walk is `invalidBlock`: it and its
+///   descendants become `Invalid` as above, and the `latestValidHash` payload and its
+///   `Optimistic` ancestors become `Valid`. For the zero hash, `invalidBlock` is the first
+///   execution payload of the chain, and the table knows none above the topmost of the walk, so
+///   that one is. For `null`, or a hash the walk does not find, only the payload is. A walk
+///   that stops at a payload that is not recorded waits for it, and so does a `latestValidHash`
+///   payload that is not recorded yet.
 /// - A payload recorded after its children links up with them: a `Valid` child makes it `Valid`
 ///   (with its `Optimistic` ancestors), an `Invalid` one passes `Invalid` down to them, and a
 ///   boundary below it that waited for it is applied again.
@@ -251,16 +274,23 @@ enum Walk {
 ///   earlier status stays as it is.
 ///
 /// [`ExecutionStatuses::prune_finalized`] drops what finality makes useless, and at most
-/// [`MAX_INVALID_PAYLOADS`] `Invalid` payloads are kept.
+/// [`MAX_INVALID_PAYLOADS`] `Invalid` payloads keep a full entry.
 #[derive(Debug, Default)]
 pub struct ExecutionStatuses {
     blocks: HashMap<Hash32, Entry>,
-    /// The recorded payloads on each parent hash, recorded or not, in the order they came.
+    /// The recorded payloads on each parent hash, recorded or not, in the order they came. An
+    /// evicted payload stays here, so that the walks down and finality still reach it.
     children: HashMap<Hash32, Vec<Hash32>>,
-    /// The `Invalid` payloads by the order they became `Invalid`: the first goes first.
+    /// The `Invalid` payloads with a full entry by the order they became `Invalid`: the first
+    /// goes first.
     invalid: BTreeMap<u64, Hash32>,
     /// The order the next `Invalid` payload takes.
     next_order: u64,
+    /// The `Invalid` payloads that lost their entry to [`MAX_INVALID_PAYLOADS`], with their parent
+    /// hash.
+    evicted: HashMap<Hash32, Hash32>,
+    /// See [`ExecutionStatuses::el_contradiction`].
+    contradiction: bool,
 }
 
 impl ExecutionStatuses {
@@ -281,7 +311,7 @@ impl ExecutionStatuses {
         if let ElVerdict::NotVerified(_) = verdict {
             return self.status(&block_hash);
         }
-        let new = !self.blocks.contains_key(&block_hash);
+        let new = self.get(&block_hash).is_none();
         if new {
             self.blocks.insert(
                 block_hash,
@@ -294,6 +324,11 @@ impl ExecutionStatuses {
                 .entry(parent_hash)
                 .or_default()
                 .push(block_hash);
+            // A payload on an Invalid parent is Invalid. This comes before the verdict, so that
+            // a VALID cannot make it Valid first: Valid never turns Invalid.
+            if self.status(&parent_hash) == Some(ExecutionStatus::Invalid) {
+                self.invalidate(block_hash);
+            }
         }
         match verdict {
             ElVerdict::Valid => self.make_valid(block_hash),
@@ -304,7 +339,7 @@ impl ExecutionStatuses {
             ElVerdict::Optimistic | ElVerdict::NotVerified(_) => {}
         }
         if new {
-            self.link(block_hash, parent_hash);
+            self.link(block_hash);
         }
         self.evict_past_bound();
         self.status(&block_hash)
@@ -313,9 +348,7 @@ impl ExecutionStatuses {
     /// The status of the payload `block_hash`, `None` if it has none.
     #[must_use]
     pub fn status(&self, block_hash: &Hash32) -> Option<ExecutionStatus> {
-        self.blocks
-            .get(block_hash)
-            .map(|entry| entry.state.status())
+        self.get(block_hash).map(|(status, _)| status)
     }
 
     /// The table's import gate: [`ElVerdict::permits_payload_import`], and neither the payload
@@ -337,23 +370,34 @@ impl ExecutionStatuses {
     /// Drops what finality at the payload `finalized` makes useless: `finalized` and every
     /// recorded ancestor of it, and every payload that descends from one of those ancestors but
     /// not from `finalized` (a fork that can no longer become canonical). Keeps the descendants
-    /// of `finalized` and the payloads whose ancestry is not recorded. Returns how many payloads
-    /// it dropped: none if `finalized` is not recorded.
+    /// of `finalized` and the payloads whose ancestry is not recorded. An evicted `Invalid`
+    /// payload counts as recorded. Returns how many payloads it dropped: none if `finalized` is
+    /// not recorded.
+    ///
+    /// The walk up ends at a parent hash with no entry, usually the payload an earlier prune
+    /// finalized. That payload is an ancestor of `finalized` too, and `children` keeps its
+    /// children after its entry is gone, so it anchors the forks off it: none of them leaks
+    /// past a later finality.
     pub fn prune_finalized(&mut self, finalized: &Hash32) -> usize {
         let mut seen = HashSet::new();
         let mut doomed = Vec::new();
         let mut at = *finalized;
-        while let Some(entry) = self.blocks.get(&at) {
+        while let Some((_, parent)) = self.get(&at) {
             if !seen.insert(at) {
                 break;
             }
             doomed.push(at);
-            at = entry.parent_hash;
+            at = parent;
         }
-        // The forks off the ancestors; the chain itself is already in `seen`.
+        if doomed.is_empty() {
+            // Nothing tells which children of `finalized` it is not an ancestor of.
+            return 0;
+        }
+        // The forks off the ancestors and off `at`; the chain itself is already in `seen`.
         let mut forks: VecDeque<Hash32> = doomed
             .iter()
             .skip(1)
+            .chain([&at])
             .filter_map(|ancestor| self.children.get(ancestor))
             .flatten()
             .copied()
@@ -373,55 +417,90 @@ impl ExecutionStatuses {
         doomed.len()
     }
 
-    /// How many payloads have a status.
+    /// Whether the EL has contradicted itself since the table was made: it called a `Valid`
+    /// payload invalid (an `INVALID` for it, or a boundary or a descendant cascade that reaches
+    /// it), or an `Invalid` payload valid (a `VALID` for it or a descendant, or a
+    /// `latestValidHash` that names it). The statuses stay as they were (see the type docs). It
+    /// stays `true`: the spec asks for manual intervention, and how cl-chain reacts is the
+    /// caller's to decide.
+    #[must_use]
+    pub fn el_contradiction(&self) -> bool {
+        self.contradiction
+    }
+
+    /// How many payloads have a full entry: an evicted `Invalid` payload (see
+    /// [`MAX_INVALID_PAYLOADS`]) has a status but does not count.
     #[must_use]
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
 
-    /// Whether no payload has a status.
+    /// Whether no payload has a full entry (see [`Self::len`]).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
 
-    /// `hash`, unless it is `Invalid`, and every `Optimistic` ancestor become `Valid`.
-    fn make_valid(&mut self, hash: Hash32) {
-        let Some(entry) = self.blocks.get_mut(&hash) else {
-            return;
-        };
-        if let State::Invalid { .. } = entry.state {
-            return;
-        }
-        entry.state = State::Valid;
-        let mut ancestor = entry.parent_hash;
-        // Each step turns one Optimistic entry Valid, so the walk ends.
-        while let Some(entry) = self.blocks.get_mut(&ancestor) {
-            if !matches!(entry.state, State::Optimistic) {
-                break;
-            }
-            entry.state = State::Valid;
-            ancestor = entry.parent_hash;
+    /// The status and parent hash of the payload `hash`. An evicted payload is `Invalid`.
+    fn get(&self, hash: &Hash32) -> Option<(ExecutionStatus, Hash32)> {
+        match self.blocks.get(hash) {
+            Some(entry) => Some((entry.state.status(), entry.parent_hash)),
+            None => self
+                .evicted
+                .get(hash)
+                .map(|&parent| (ExecutionStatus::Invalid, parent)),
         }
     }
 
-    /// `hash` and every recorded descendant become `Invalid`, whatever they were. A payload that
-    /// is `Invalid` already has only `Invalid` descendants, so the walk does not go past it.
+    /// `hash` and every `Optimistic` ancestor become `Valid`. An `Invalid` one on the way,
+    /// `hash` included, stays `Invalid` and ends the walk: an EL contradiction.
+    fn make_valid(&mut self, hash: Hash32) {
+        let mut at = hash;
+        let mut first = true;
+        // After the first step, each step turns one Optimistic entry Valid, so the walk ends,
+        // also on a parent hash loop.
+        while let Some((status, parent)) = self.get(&at) {
+            match status {
+                ExecutionStatus::Invalid => {
+                    self.contradiction = true;
+                    return;
+                }
+                ExecutionStatus::Valid if !first => return,
+                ExecutionStatus::Valid | ExecutionStatus::Optimistic => {}
+            }
+            if let Some(entry) = self.blocks.get_mut(&at) {
+                entry.state = State::Valid;
+            }
+            first = false;
+            at = parent;
+        }
+    }
+
+    /// `hash` and every recorded descendant that is `Optimistic` become `Invalid`. A `Valid` one
+    /// stays `Valid` (an EL contradiction), and the walk goes on below it and below an `Invalid`
+    /// one: the spec moves every `NOT_VALIDATED` descendant.
     fn invalidate(&mut self, hash: Hash32) {
+        let mut seen = HashSet::new();
         let mut queue = VecDeque::from([hash]);
         while let Some(at) = queue.pop_front() {
-            let Some(entry) = self.blocks.get_mut(&at) else {
-                continue;
-            };
-            if let State::Invalid { .. } = entry.state {
+            if !seen.insert(at) {
                 continue;
             }
-            entry.state = State::Invalid {
-                order: self.next_order,
-                pending: None,
-            };
-            self.invalid.insert(self.next_order, at);
-            self.next_order += 1;
+            match self.status(&at) {
+                None => continue,
+                Some(ExecutionStatus::Valid) => self.contradiction = true,
+                Some(ExecutionStatus::Invalid) => {}
+                Some(ExecutionStatus::Optimistic) => {
+                    if let Some(entry) = self.blocks.get_mut(&at) {
+                        entry.state = State::Invalid {
+                            order: self.next_order,
+                            pending: None,
+                        };
+                        self.invalid.insert(self.next_order, at);
+                        self.next_order += 1;
+                    }
+                }
+            }
             if let Some(children) = self.children.get(&at) {
                 queue.extend(children.iter().copied());
             }
@@ -434,36 +513,31 @@ impl ExecutionStatuses {
         let Some(boundary) = latest_valid_hash else {
             return;
         };
-        let Some(entry) = self.blocks.get(&hash) else {
+        let Some((_, mut at)) = self.get(&hash) else {
             return;
         };
         let zero = boundary == Hash32::ZERO;
-        // The recorded Optimistic ancestors, nearest first.
-        let mut walked = Vec::new();
+        // The topmost recorded ancestor the walk passed: `invalidBlock` when the walk finds the
+        // boundary, and for the zero hash.
+        let mut top = None;
         let mut seen = HashSet::new();
-        let mut at = entry.parent_hash;
         let end = loop {
             if !zero && at == boundary {
                 break Walk::Found;
             }
-            match self.blocks.get(&at) {
-                // An Invalid ancestor is passed, not walked: it can be Invalid from an earlier
-                // walk of this boundary, and the boundary can be above it.
-                Some(entry) if !matches!(entry.state, State::Valid) && seen.insert(at) => {
-                    if let State::Optimistic = entry.state {
-                        walked.push(at);
-                    }
-                    at = entry.parent_hash;
+            match self.get(&at) {
+                Some((_, parent)) if seen.insert(at) => {
+                    top = Some(at);
+                    at = parent;
                 }
                 Some(_) => break Walk::Stopped,
                 None => break Walk::Missing,
             }
         };
         if zero || end == Walk::Found {
-            // The topmost payload of the walk is the first invalid one, and the rest descend
-            // from it.
-            if let Some(&first) = walked.last() {
-                self.invalidate(first);
+            // The rest of the walk descends from it.
+            if let Some(top) = top {
+                self.invalidate(top);
             }
         }
         if end == Walk::Found {
@@ -473,7 +547,7 @@ impl ExecutionStatuses {
         // the `latestValidHash` payload, which becomes Valid when it is recorded.
         let waits = match end {
             Walk::Missing => true,
-            Walk::Found => !self.blocks.contains_key(&boundary),
+            Walk::Found => self.get(&boundary).is_none(),
             Walk::Stopped => false,
         };
         if let Some(Entry {
@@ -486,11 +560,9 @@ impl ExecutionStatuses {
     }
 
     /// Links the payload `hash`, recorded for the first time, with what was recorded before
-    /// it: its parent, its children, and the boundaries below it that waited for it.
-    fn link(&mut self, hash: Hash32, parent_hash: Hash32) {
-        if self.status(&parent_hash) == Some(ExecutionStatus::Invalid) {
-            self.invalidate(hash);
-        }
+    /// it: its children, and the boundaries below it that waited for it. `record` has applied
+    /// an `Invalid` parent already.
+    fn link(&mut self, hash: Hash32) {
         let Some(children) = self.children.get(&hash) else {
             return;
         };
@@ -532,28 +604,36 @@ impl ExecutionStatuses {
         waiting
     }
 
-    /// Drops the oldest `Invalid` payloads past [`MAX_INVALID_PAYLOADS`].
+    /// Evicts the oldest `Invalid` payloads past [`MAX_INVALID_PAYLOADS`]: each keeps only its
+    /// hash and parent hash, and stays in `children`.
     fn evict_past_bound(&mut self) {
         while self.invalid.len() > MAX_INVALID_PAYLOADS {
             let Some((_, hash)) = self.invalid.pop_first() else {
                 break;
             };
-            self.remove(&hash);
+            if let Some(entry) = self.blocks.remove(&hash) {
+                self.evicted.insert(hash, entry.parent_hash);
+            }
         }
     }
 
-    /// Drops the payload `hash` from the table and its indexes. Its children keep their status.
+    /// Drops the payload `hash`, evicted or not, from the table and its indexes. Its children
+    /// keep their status.
     fn remove(&mut self, hash: &Hash32) {
-        let Some(entry) = self.blocks.remove(hash) else {
+        let parent_hash = if let Some(entry) = self.blocks.remove(hash) {
+            if let State::Invalid { order, .. } = entry.state {
+                self.invalid.remove(&order);
+            }
+            entry.parent_hash
+        } else if let Some(parent_hash) = self.evicted.remove(hash) {
+            parent_hash
+        } else {
             return;
         };
-        if let State::Invalid { order, .. } = entry.state {
-            self.invalid.remove(&order);
-        }
-        if let Some(siblings) = self.children.get_mut(&entry.parent_hash) {
+        if let Some(siblings) = self.children.get_mut(&parent_hash) {
             siblings.retain(|child| child != hash);
             if siblings.is_empty() {
-                self.children.remove(&entry.parent_hash);
+                self.children.remove(&parent_hash);
             }
         }
     }
