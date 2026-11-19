@@ -570,11 +570,19 @@ pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
 /// epoch (`validate_target_epoch_against_current_time`). So a vote with the target epoch of the
 /// prune, or of an earlier epoch, can arrive until the end of the next epoch. Until then the
 /// store keeps the dropped blocks with their states, the roots of their verified payloads and
-/// the checkpoint states that `on_attestation` stores for them. Then it forgets them, and `on_attestation` refuses a vote that
-/// names one of them, as a block that the store does not have. The spec's store keeps every
-/// block and takes such a vote if it is valid. A vote from the wire then has a target epoch
-/// after the prune, so if it names a forgotten block it also attests to one, and in the spec
-/// its message supports no node of the pruned store. A vote from a block has no such limit.
+/// the checkpoint states that `on_attestation` stores for them. Then it forgets them, and
+/// `on_attestation` refuses a vote that names one of them, as a block that the store does not
+/// have.
+///
+/// This is a deliberate deviation from the spec: the store does not keep the dropped blocks
+/// and their states forever. The spec's store keeps every block and takes such a vote if it
+/// is valid, also with a later target epoch. In an epoch `e` after the window, a vote for a
+/// forgotten block `X` with the target `(e, X)` passes every assert of the spec, because `X`
+/// is its own checkpoint block in `e`. Gossip ignores that vote, because `X` does not descend
+/// from the finalized block, but `process_attestation` does not, so a block can include it.
+/// The spec then replaces the older latest message of each attester, and so takes the weight
+/// of that attester off the kept blocks. Here the refused vote, also a vote from a block, leaves
+/// the older message in place, and its weight stays. So `get_head` can differ from the spec.
 pub(crate) fn release_dropped<E: Preset>(store: &mut Store<E>) {
     let epoch = get_current_store_epoch(store);
     let released: HashSet<Root> = store
