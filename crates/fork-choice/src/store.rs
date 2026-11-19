@@ -65,13 +65,14 @@ pub(crate) const PTC_TIMELINESS_INDEX: usize = 1;
 /// `anchor_root` is not a spec field. It is the root of the anchor block, the one block of
 /// `blocks` whose parent is not in `blocks`: the ancestor walk stops there ([`get_ancestor`]).
 ///
-/// `dropped` is not a spec field. It has the blocks that a prune dropped (`prune`) with what
-/// `on_attestation` reads of each: the slot, the parent root and the post-state. The spec's
-/// store keeps every block, and a valid attestation can name a dropped block. Head selection
-/// does not read `dropped`, so a message for a dropped block supports no node. `payloads` keeps
-/// the roots of the dropped blocks too, for `is_payload_verified`. A prune in epoch `p` keeps a
-/// dropped block through the end of epoch `p + 2`, and the first tick of epoch `p + 3` forgets
-/// it (`release_dropped`).
+/// `dropped` is not a spec field. It has the blocks that a prune dropped (`prune`) with their
+/// post-states. The spec's store keeps every block, and a valid attestation or envelope can
+/// name a dropped block: `on_attestation`, `on_execution_payload_envelope` and the gossip
+/// checks ([`Store::block_or_dropped`]) read them. Head selection does not read `dropped`, so
+/// a message for a dropped block supports no node. `payloads` keeps the roots of the dropped
+/// blocks too, for `is_payload_verified`. A prune in epoch `p` keeps a dropped block through
+/// the end of epoch `p + 2`, and the first tick of epoch `p + 3` forgets it
+/// (`release_dropped`).
 ///
 /// `children` and `ptc_timely_proposals` are not spec fields. They are indexes of `blocks`,
 /// so that head selection reads the blocks that it needs and does not scan every block for
@@ -113,14 +114,13 @@ pub struct Store<E: Preset> {
     pub(crate) dropped: HashMap<Root, DroppedBlock<E>>,
 }
 
-/// A block that a prune dropped, with what `validate_on_attestation` and
-/// `store_target_checkpoint_state` read of it.
+/// A block that a prune dropped, and its post-state: what `validate_on_attestation`,
+/// `store_target_checkpoint_state`, `on_execution_payload_envelope` and the gossip checks of
+/// an envelope read of it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DroppedBlock<E: Preset> {
-    /// `block.slot`.
-    pub(crate) slot: Slot,
-    /// `block.parent_root`.
-    pub(crate) parent_root: Root,
+    /// `store.blocks[root]`, with its body: the gossip checks of an envelope read its bid.
+    pub(crate) block: BeaconBlock<E>,
     /// `store.block_states[root]`.
     pub(crate) state: BeaconState<E>,
     /// The last epoch in which the store keeps the block: the second epoch after the prune.
@@ -163,14 +163,42 @@ impl<E: Preset> Store<E> {
         self.proposer_boost_root
     }
 
-    /// `store.blocks[root]`.
+    /// `store.blocks[root]`, of the blocks that the store keeps after a prune. A block that a
+    /// prune dropped is not here, also while the store retains it: see
+    /// [`Store::block_or_dropped`].
     pub fn block(&self, root: Root) -> Option<&BeaconBlock<E>> {
         self.blocks.get(&root)
     }
 
-    /// `store.block_states[root]`.
+    /// `store.block_states[root]`, of the blocks that the store keeps after a prune. The
+    /// post-state of a block that a prune dropped is not here, also while the store retains
+    /// it: see [`Store::block_state_or_dropped`].
     pub fn block_state(&self, root: Root) -> Option<&BeaconState<E>> {
         self.block_states.get(&root)
+    }
+
+    /// `store.blocks[root]` as the spec's store has it, for a reader that must see each block
+    /// that the store still has, such as the gossip checks of an envelope: a block of the
+    /// store ([`Store::block`]), else a block that a prune dropped and the store retains.
+    ///
+    /// The store retains a dropped block through the end of the second epoch after the prune,
+    /// and then forgets it (`release_dropped`). After that this gives `None`, where the spec's
+    /// store still has the block.
+    pub fn block_or_dropped(&self, root: Root) -> Option<&BeaconBlock<E>> {
+        match self.blocks.get(&root) {
+            Some(block) => Some(block),
+            None => self.dropped.get(&root).map(|d| &d.block),
+        }
+    }
+
+    /// `store.block_states[root]` as the spec's store has it: the post-state of a block of the
+    /// store ([`Store::block_state`]), else of a block that a prune dropped and the store
+    /// retains. It has the post-state of each block of [`Store::block_or_dropped`].
+    pub fn block_state_or_dropped(&self, root: Root) -> Option<&BeaconState<E>> {
+        match self.block_states.get(&root) {
+            Some(state) => Some(state),
+            None => self.dropped.get(&root).map(|d| &d.state),
+        }
     }
 
     /// `store.checkpoint_states[checkpoint]`.
@@ -221,21 +249,18 @@ impl<E: Preset> Store<E> {
     pub(crate) fn attestation_block(&self, root: Root) -> Option<(Slot, Root)> {
         match self.blocks.get(&root) {
             Some(block) => Some((block.slot, block.parent_root)),
-            None => self.dropped.get(&root).map(|d| (d.slot, d.parent_root)),
+            None => self
+                .dropped
+                .get(&root)
+                .map(|d| (d.block.slot, d.block.parent_root)),
         }
     }
 
     /// `store.block_states[root]` for `store_target_checkpoint_state`: the state of a block of
     /// the store, or of a block that a prune dropped and the store keeps.
     pub(crate) fn target_block_state(&self, root: Root) -> Result<&BeaconState<E>, Error> {
-        match self.block_states.get(&root) {
-            Some(state) => Ok(state),
-            None => self
-                .dropped
-                .get(&root)
-                .map(|d| &d.state)
-                .ok_or(Error::UnknownBlock(root)),
-        }
+        self.block_state_or_dropped(root)
+            .ok_or(Error::UnknownBlock(root))
     }
 
     /// `store.checkpoint_states[store.justified_checkpoint]`.
@@ -468,11 +493,12 @@ pub fn is_ancestor<E: Preset>(
 /// finalized checkpoint.
 ///
 /// It keeps the finalized checkpoint block and its descendants. It moves every other block to
-/// `store.dropped` with its slot, its parent root and its state, and keeps the root of its
-/// verified payload. It drops the other per-block entries of each, the index of children of
-/// each, and the checkpoint states of earlier epochs or of dropped blocks. The finalized block
-/// becomes the anchor, so the ancestor walk stops there ([`get_ancestor`]). Latest messages
-/// and equivocating indices stay as the spec keeps them.
+/// `store.dropped` with its body and its state, which stay there until [`release_dropped`]
+/// forgets the block, and keeps the root of its verified payload. It drops the other per-block
+/// entries of each, the index of children of each, and the checkpoint states of earlier epochs
+/// or of dropped blocks. The finalized block becomes the anchor, so the ancestor walk stops
+/// there ([`get_ancestor`]). Latest messages and equivocating indices stay as the spec keeps
+/// them.
 ///
 /// The spec's store keeps every block, and `get_head`, `get_weight` and the asserts of
 /// `on_block` give the same result on the pruned store:
@@ -484,8 +510,10 @@ pub fn is_ancestor<E: Preset>(
 /// - The PTC-timely proposals of the previous slot and later stay, also of dropped blocks,
 ///   for the early equivocation check of a later boost.
 ///
-/// `on_attestation` reads the dropped blocks in `store.dropped`, so it gives the result of the
-/// spec until the store forgets them ([`release_dropped`]).
+/// `on_attestation`, `on_execution_payload_envelope` and the gossip checks of an envelope
+/// ([`Store::block_or_dropped`]) read the dropped blocks in `store.dropped`, so they give the
+/// result of the spec until the store forgets them ([`release_dropped`]). [`Store::block`] and
+/// [`Store::block_state`] do not have them.
 ///
 /// If the finalized block is not in the store, or the justified or the unrealized justified
 /// block does not descend from it, nothing is dropped: the walks of the subtree of that
@@ -532,8 +560,7 @@ pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
         let state = store.block_states.remove(&root);
         if let (Some(block), Some(state)) = (block, state) {
             let dropped = DroppedBlock {
-                slot: block.slot,
-                parent_root: block.parent_root,
+                block,
                 state,
                 last_epoch,
             };

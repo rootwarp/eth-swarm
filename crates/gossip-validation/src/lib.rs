@@ -40,6 +40,14 @@ use state_transition::Preset;
 /// block and its post-state together, so for it the two sets are equal. A caller that also
 /// keeps the blocks that failed validation can give a view in which they are seen but have no
 /// post-state.
+///
+/// The spec's store keeps every block. The fork-choice [`Store`] drops the blocks that do not
+/// descend from the finalized block, and retains them with their post-states for a window
+/// after the prune. Its view reads them there too ([`Store::block_or_dropped`] and
+/// [`Store::block_state_or_dropped`]), so an envelope for a retained dropped block is
+/// validated, not ignored as unknown. [`Store::block`] and [`Store::block_state`] have only
+/// the blocks that the store keeps. After the window the store forgets a dropped block, and
+/// an envelope for it is ignored.
 pub trait StoreView<E: Preset> {
     /// `store.blocks[root]`.
     fn block(&self, root: Root) -> Option<&BeaconBlock<E>>;
@@ -53,11 +61,11 @@ pub trait StoreView<E: Preset> {
 
 impl<E: Preset> StoreView<E> for Store<E> {
     fn block(&self, root: Root) -> Option<&BeaconBlock<E>> {
-        Store::block(self, root)
+        Store::block_or_dropped(self, root)
     }
 
     fn block_state(&self, root: Root) -> Option<&BeaconState<E>> {
-        Store::block_state(self, root)
+        Store::block_state_or_dropped(self, root)
     }
 
     fn finalized_checkpoint(&self) -> &Checkpoint {
