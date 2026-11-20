@@ -506,7 +506,8 @@ fn system_clock() -> u128 {
 }
 
 /// The verdict of `verifier` on `sets`, or none by `deadline`. The call runs on `runtime`; the
-/// core thread waits for it.
+/// core thread waits for it. A deadline that passed sends nothing, and a verdict that comes at
+/// or after the deadline is no verdict: a late VALID never commits.
 fn verify<V: BlsVerifier + 'static>(
     runtime: &Handle,
     verifier: &Arc<V>,
@@ -515,14 +516,28 @@ fn verify<V: BlsVerifier + 'static>(
 ) -> BlsOutcome {
     let verifier = Arc::clone(verifier);
     let call = runtime.spawn(async move {
+        if Instant::now() >= deadline {
+            return BlsOutcome::NoVerdict(format!("{NO_VERDICT_IN_TIME}: no time left"));
+        }
         // The deadline of the verifier, not a second timer: it stops only a verifier that does
-        // not keep its deadline, so that a late VALID never commits. `BlsClient` closes its
-        // stream when its call is dropped, so this cannot leave a request in its window.
-        tokio::time::timeout_at(deadline, verifier.verify_sets(sets, deadline))
+        // not keep its deadline. `BlsClient` closes its stream when a call that sent its
+        // request is dropped, so this cannot leave a request in its window.
+        let outcome = tokio::time::timeout_at(deadline, verifier.verify_sets(sets, deadline))
             .await
-            .unwrap_or_else(|_| BlsOutcome::NoVerdict("no verdict by the deadline".into()))
+            .unwrap_or_else(|_| BlsOutcome::NoVerdict(NO_VERDICT_IN_TIME.into()));
+        // `timeout_at` polls the call before its timer, so a verdict that is ready at the
+        // deadline gets through it.
+        match outcome {
+            BlsOutcome::Valid | BlsOutcome::Invalid if Instant::now() >= deadline => {
+                BlsOutcome::NoVerdict(format!("{NO_VERDICT_IN_TIME}: the verdict came at it"))
+            }
+            outcome => outcome,
+        }
     });
     runtime
         .block_on(call)
         .unwrap_or_else(|e| BlsOutcome::NoVerdict(format!("the VerifyBls call failed: {e}")))
 }
+
+/// The no-verdict reason of a VerifyBls call without a verdict before its deadline.
+const NO_VERDICT_IN_TIME: &str = "no verdict by the deadline";

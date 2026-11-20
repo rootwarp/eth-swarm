@@ -25,7 +25,8 @@
 //! stream whose `request_id` does not increase, so a call holds the stream's send lock from
 //! reserving its frame's place on the stream until the frame is sent, and only then waits for its
 //! verdict. It takes its id only once that place is reserved, and sends without waiting: a call
-//! that is cancelled, or runs out of time, before its send holds no id. A call dropped after its
+//! that is cancelled, or runs out of time, before its send holds no id. A call whose deadline
+//! passed sends nothing. A call dropped after its
 //! send keeps its id until cl-verify's answer settles it, as one past its deadline does; cl-verify
 //! answers every request it reads (`DEADLINE_EXCEEDED` when too late). A reader task delivers the
 //! responses; when the stream ends, errs or breaks the contract, every call on it fails as no
@@ -49,7 +50,9 @@
 //! batch share it too, and the batch is valid only if each request is. A request without an
 //! answer closes its stream when its deadline passes or when its call is dropped first (a
 //! stalled VerifyBls stream must close, and a dropped call must not keep its slot in the window),
-//! and the next call opens a new one.
+//! and the next call opens a new one. Only a request that went out does that: a call that ends
+//! before it takes its id (cancelled or out of time at the send lock or the queue) leaves the
+//! stream to the requests on it.
 
 use ethswarm_proto::common::{ErrorCode, Hello};
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
@@ -59,7 +62,7 @@ use ethswarm_proto::verify::{
     VerifyBlsResponseBody, VerifyKzgRequest, VerifyKzgRequestBody, VerifyKzgResponse,
     VerifyKzgResponseBody, VerifyOrigin, VerifyStatus,
 };
-use ipc::deadline::{Calls, FenceMetrics, Ignored};
+use ipc::deadline::{Calls, FenceMetrics, Ignored, Pending};
 use ipc::fence::{FencedRequest, FencedResult, ItemHash, RequestTag};
 use ipc::hello::{negotiate, Generation, NetworkHello, API_VERSION_V1};
 use prost::Message;
@@ -390,6 +393,18 @@ impl<M: Method> Clone for StreamLink<M> {
 /// What a VerifyKzg call uses of the open stream.
 type Link = StreamLink<Kzg>;
 
+/// The answer to a request that went out, until `deadline`.
+async fn answer<M: Method>(
+    pending: Pending<M::Body>,
+    deadline: Instant,
+) -> Result<M::Body, Failure> {
+    match pending.wait_until(deadline).await {
+        Ok(body) => Ok(body),
+        Err(Ignored::Deadline) => Err(Failure::Late),
+        Err(Ignored::Reconnect) => Err(Failure::Other(format!("the {} stream ended", M::NAME))),
+    }
+}
+
 /// Why a call has no answer.
 enum Failure {
     /// The deadline passed.
@@ -420,45 +435,56 @@ impl<M: Method> StreamLink<M> {
         deadline: Instant,
         held: Held,
     ) -> Result<M::Body, Failure> {
-        let pending = {
-            // Ids go out in the order they are taken: the lock is held from reserving the
-            // frame's place through sending it. The verdict is awaited without it.
-            let Ok(_send) = tokio::time::timeout_at(deadline, self.send.lock()).await else {
-                return Err(Failure::Late);
-            };
-            let closed = || {
-                self.requests.close();
-                self.calls.close();
-                Failure::Other(format!("the {} stream is closed", M::NAME))
-            };
-            let Some(sender) = self.requests.sender() else {
-                return Err(closed());
-            };
-            // The frame's place on the stream first, so an id is taken only once its send is
-            // certain: a call cancelled or out of time before then holds no id.
-            let permit = match tokio::time::timeout_at(deadline, sender.reserve()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => return Err(closed()),
-                Err(_) => return Err(Failure::Late),
-            };
-            // A seam where a test cancels a call that has its frame's place and no id yet.
-            #[cfg(test)]
-            tokio::task::yield_now().await;
-            let (request, pending) = self
-                .calls
-                .start(build)
-                .map_err(|e| Failure::Other(format!("not sent: {e}")))?;
-            permit.send(Queued {
-                request,
-                _held: Some(held),
-            });
-            pending
+        let pending = self.send(build, deadline, held).await?;
+        answer::<M>(pending, deadline).await
+    }
+
+    /// Sends the request that `build` makes for its tag on this stream, and returns the wait
+    /// for its answer. `Err` if it sends nothing: the stream is closed, or `deadline` passed
+    /// first. Such a call holds no id.
+    async fn send(
+        &self,
+        build: impl FnOnce(RequestTag) -> (M::Request, Vec<ItemHash>),
+        deadline: Instant,
+        held: Held,
+    ) -> Result<Pending<M::Body>, Failure> {
+        // Ids go out in the order they are taken: the lock is held from reserving the frame's
+        // place through sending it. The verdict is awaited without it.
+        let Ok(_send) = tokio::time::timeout_at(deadline, self.send.lock()).await else {
+            return Err(Failure::Late);
         };
-        match pending.wait_until(deadline).await {
-            Ok(body) => Ok(body),
-            Err(Ignored::Deadline) => Err(Failure::Late),
-            Err(Ignored::Reconnect) => Err(Failure::Other(format!("the {} stream ended", M::NAME))),
+        let closed = || {
+            self.requests.close();
+            self.calls.close();
+            Failure::Other(format!("the {} stream is closed", M::NAME))
+        };
+        let Some(sender) = self.requests.sender() else {
+            return Err(closed());
+        };
+        // The frame's place on the stream first, so an id is taken only once its send is
+        // certain: a call cancelled or out of time before then holds no id.
+        let permit = match tokio::time::timeout_at(deadline, sender.reserve()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(closed()),
+            Err(_) => return Err(Failure::Late),
+        };
+        // A seam where a test cancels a call that has its frame's place and no id yet.
+        #[cfg(test)]
+        tokio::task::yield_now().await;
+        // `timeout_at` polls before its timer, so the lock and the place can come at or after
+        // the deadline. Such a request could not be answered in time: it does not go out.
+        if Instant::now() >= deadline {
+            return Err(Failure::Late);
         }
+        let (request, pending) = self
+            .calls
+            .start(build)
+            .map_err(|e| Failure::Other(format!("not sent: {e}")))?;
+        permit.send(Queued {
+            request,
+            _held: Some(held),
+        });
+        Ok(pending)
     }
 
     /// Whether `other` uses the same stream.
@@ -586,7 +612,11 @@ impl BlsClient {
 
     /// Sends one request of `sets` and waits for its verdict until `deadline`. A request
     /// without an answer by then, or whose call is dropped before its answer, closes its stream.
+    /// A call that sends nothing leaves the stream as it is.
     async fn request(&self, sets: Vec<BlsSet>, deadline: Instant, unix_ms: u64) -> BlsOutcome {
+        if Instant::now() >= deadline {
+            return BlsOutcome::NoVerdict(LATE.into());
+        }
         let link = match tokio::time::timeout_at(deadline, self.streams.live()).await {
             Ok(Ok(link)) => link,
             Ok(Err(why)) => return BlsOutcome::NoVerdict(why),
@@ -606,17 +636,23 @@ impl BlsClient {
             };
             (request, hashes)
         };
+        // Not sent: the call holds no id, so there is no request on the stream to close it for.
+        let pending = match link.send(build, deadline, Box::new(())).await {
+            Ok(pending) => pending,
+            Err(failure) => return BlsOutcome::NoVerdict(failure.why()),
+        };
+        // The request is on the stream from here, with no await before: until it is settled,
+        // a drop or a late answer closes the stream.
         let mut unsettled = Unsettled {
             streams: &self.streams,
             link: &link,
             settled: false,
         };
-        let outcome = match link.exchange(build, deadline, Box::new(())).await {
+        let outcome = match answer::<Bls>(pending, deadline).await {
             Ok(body) => bls_outcome(&body),
             // `unsettled` closes the stream on its drop.
             Err(Failure::Late) => return BlsOutcome::NoVerdict(LATE.into()),
-            // The stream is closed, ended or refused the request: there is no request on it
-            // to wait for.
+            // The stream ended: there is no request on it to wait for.
             Err(Failure::Other(why)) => BlsOutcome::NoVerdict(why),
         };
         unsettled.settled = true;
