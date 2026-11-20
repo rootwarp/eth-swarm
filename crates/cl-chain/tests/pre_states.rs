@@ -181,3 +181,31 @@ async fn a_committed_child_makes_its_parent_the_most_recent() {
         "the least recently used pre-state must go"
     );
 }
+
+#[tokio::test]
+async fn an_evicted_committed_block_again_is_ignored_and_the_head_stays() {
+    let (core, first, _, _) = full_core().await;
+    let first_root = first.message.tree_hash_root();
+    // One more commit removes the least recently used pre-state: the one of the first block.
+    let (core, last) = sibling(core, &first, 0xff).await;
+    let last_root = last.message.tree_hash_root();
+    let core = commit(core, last).await;
+    assert!(
+        core.state(&first_root).is_none(),
+        "the pre-state of the first block must be gone"
+    );
+    let head = core.head();
+    assert_eq!(head.block_root, last_root);
+    let (outcome, core, verify) = import_one(core, first, Answer::Valid).await;
+    assert!(
+        matches!(outcome, Outcome::Ignored(_)),
+        "a committed block must be IGNORE after its pre-state is gone: {outcome:?}"
+    );
+    assert!(
+        verify.calls().is_empty(),
+        "a committed block must not run the transition again"
+    );
+    assert_eq!(core.head(), head, "the head must not go back");
+    assert!(core.state(&first_root).is_none());
+    assert_eq!(core.pre_states(), max_pre_states::<Minimal>());
+}

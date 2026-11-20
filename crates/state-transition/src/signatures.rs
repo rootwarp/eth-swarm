@@ -108,11 +108,16 @@ pub struct BlsContext<'a> {
 /// The proposer signature set of a block: `verify_block_signature` (P0 L1839-1844) without
 /// the BLS call.
 ///
-/// `state` is the state at the block's slot. The function first checks that the proposer
-/// of `state.proposer_lookahead` for the slot is in the registry. If it is not, our own
-/// state is wrong, and the error is [`StfError::ListIndexOutOfRange`] (not a proof) for any
-/// block. [`StfError::UnknownValidator`] is only for a block index past the registry when
-/// the lookahead is valid.
+/// `state` is the state at the block's slot, or an earlier state of the same fork: the
+/// post-state of the parent, for a check before the slot loop. The domain is the proposer
+/// domain of the block's epoch, which is the current epoch of the state at the block's slot,
+/// as in the spec. The key is the one of `proposer_index` in the registry of `state`.
+///
+/// The function first checks that the proposer of `state.proposer_lookahead` for the slot
+/// of `state` is in the registry. If it is not, our own state is wrong, and the error is
+/// [`StfError::ListIndexOutOfRange`] (not a proof) for any block.
+/// [`StfError::UnknownValidator`] is only for a block index past the registry when the
+/// lookahead is valid.
 pub fn block_proposer_signature_set<E: Preset>(
     state: &BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
@@ -122,7 +127,8 @@ pub fn block_proposer_signature_set<E: Preset>(
     if block.proposer_index >= state.validators.len() as u64 {
         return Err(StfError::UnknownValidator(block.proposer_index));
     }
-    let domain = get_domain(state, DOMAIN_BEACON_PROPOSER, None);
+    let epoch = E::epoch_at_slot(block.slot);
+    let domain = get_domain(state, DOMAIN_BEACON_PROPOSER, Some(epoch));
     Ok(SignatureSet::single(
         SignerRef::Validator(block.proposer_index),
         compute_signing_root(block, domain),
@@ -130,7 +136,8 @@ pub fn block_proposer_signature_set<E: Preset>(
     ))
 }
 
-/// `verify_block_signature` (P0 L1839-1844) through `backend`.
+/// `verify_block_signature` (P0 L1839-1844) through `backend`, on a `state` as for
+/// [`block_proposer_signature_set`].
 pub fn verify_block_signature<E: Preset>(
     state: &BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,

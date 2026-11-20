@@ -238,3 +238,117 @@ async fn the_requests_of_one_batch_share_its_deadline() {
         "each batch must go out as three requests"
     );
 }
+
+#[tokio::test]
+async fn an_expired_deadline_sends_nothing_and_keeps_the_stream() {
+    let served = StubVerify::start(Stub::ValidAfter(Duration::from_millis(1)));
+    let client = served.bls_client().await;
+    let long = Duration::from_secs(10);
+    let outcome = client
+        .verify_sets(vec![set(1, true)], Instant::now() + long)
+        .await;
+    assert_eq!(outcome, BlsOutcome::Valid);
+    let link = client.streams.live().await.unwrap();
+    let now = Instant::now();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    for deadline in [Instant::now(), now] {
+        let outcome = client.verify_sets(vec![set(1, true)], deadline).await;
+        assert_eq!(
+            outcome,
+            BlsOutcome::NoVerdict(LATE.into()),
+            "a call out of time must be no verdict"
+        );
+    }
+    assert!(
+        !link.requests.is_closed(),
+        "a call out of time must not close a healthy stream"
+    );
+    let outcome = client
+        .verify_sets(vec![set(1, true)], Instant::now() + long)
+        .await;
+    assert_eq!(outcome, BlsOutcome::Valid, "the stream must still serve");
+    assert_eq!(served.streams_opened(), 1);
+    assert_eq!(
+        served.bls_requests(),
+        2,
+        "a call out of time must send no request"
+    );
+}
+
+/// Polls `call` `polls` times, each time finding it still waiting, then drops it.
+async fn drop_while_pending<F: Future>(call: F, polls: usize)
+where
+    F::Output: std::fmt::Debug,
+{
+    let mut call = std::pin::pin!(call);
+    for poll in 0..polls {
+        tokio::select! {
+            biased;
+            outcome = &mut call => panic!("the call finished at poll {poll}: {outcome:?}"),
+            () = std::future::ready(()) => {}
+        }
+    }
+}
+
+/// One request is in flight. Other calls wait for the send lock, or stop at the seam after
+/// their place in the queue, and go before they take an id. None of them sent a request, so
+/// none may close the stream under the request in flight.
+#[tokio::test]
+async fn a_call_cancelled_before_its_send_keeps_the_stream_of_another_call() {
+    let served = StubVerify::start(Stub::ValidAfter(Duration::from_millis(200)));
+    let client = served.bls_client().await;
+    let long = Duration::from_secs(10);
+    let link = client.streams.live().await.unwrap();
+    let first = client.verify_sets(vec![set(1, true)], Instant::now() + long);
+    let mut first = std::pin::pin!(first);
+    let sent = async {
+        while link.calls.outstanding() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::select! {
+        outcome = &mut first => panic!("the first call must wait for its verdict: {outcome:?}"),
+        () = sent => {}
+    }
+    // Polled once with a free lock, a call stops at the seam after its place in the queue.
+    drop_while_pending(
+        client.verify_sets(vec![set(1, true)], Instant::now() + long),
+        1,
+    )
+    .await;
+    {
+        let _send = link.send.lock().await;
+        drop_while_pending(
+            client.verify_sets(vec![set(1, true)], Instant::now() + long),
+            2,
+        )
+        .await;
+        let outcome = client
+            .verify_sets(
+                vec![set(1, true)],
+                Instant::now() + Duration::from_millis(20),
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            BlsOutcome::NoVerdict(LATE.into()),
+            "a call out of time at the send lock must be no verdict"
+        );
+    }
+    assert!(
+        !link.requests.is_closed(),
+        "a call that sent nothing must not close the stream"
+    );
+    assert_eq!(
+        first.await,
+        BlsOutcome::Valid,
+        "the request in flight must get its verdict"
+    );
+    assert_eq!(link.calls.outstanding(), 0);
+    assert_eq!(served.streams_opened(), 1);
+    assert_eq!(
+        served.bls_requests(),
+        1,
+        "only the first call sent a request"
+    );
+}

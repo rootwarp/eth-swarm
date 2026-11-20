@@ -10,7 +10,8 @@
 //! A block import first takes its deadline: the time of [`ChainCore::with_verify_timeout`]
 //! ([`DEFAULT_VERIFY_TIMEOUT`] if not set) from the start of the import. Then the core checks
 //! the block before any state processing, because the slot loop of the transition costs one
-//! `process_slot` for each slot and the queue senders have no clock and no pre-states:
+//! `process_slot` for each slot and the queue senders have no clock and no pre-states. A check
+//! marked *kept* keeps its refusal of the block root (see [Seen roots](#seen-roots)):
 //!
 //! - no [`PayloadImportGate`] is set: IGNORE. [`ChainCore::from_anchor`] sets none, so a core
 //!   that misses [`ChainCore::with_payload_gate`] commits nothing
@@ -18,30 +19,59 @@
 //! - the block slot is more than [`MAX_FUTURE_SLOTS`] ahead of the slot of the wall clock
 //!   ([`ChainCore::with_clock`], the system clock if not set), or the wall clock is before
 //!   genesis: IGNORE;
-//! - the block is the head, or its post-state is already a pre-state: IGNORE;
+//! - the core committed the block, or it is the anchor: IGNORE;
+//! - the core refused the block before and kept the refusal: the same answer again;
 //! - the parent has no pre-state: IGNORE;
-//! - `proposer_index` is past the registry of the parent pre-state: INVALID.
+//! - the block slot is more than [`PRE_STATE_EPOCHS`] epochs of slots after the slot of the
+//!   parent pre-state: IGNORE, kept. The wall-clock bound does not stop a block at the slot of
+//!   the wall clock on an old pre-state (the anchor stays for good), and the walk from that
+//!   pre-state costs one `process_slot` for each slot;
+//! - `proposer_index` is past the registry of the parent pre-state: INVALID, kept;
+//! - the proposer signature ([`check_proposer_signature`]), with the key of the parent
+//!   pre-state: INVALID on an INVALID verdict (kept for that signature only), IGNORE on no
+//!   verdict.
 //!
 //! Then it runs [`import_block`] on the pre-state of the parent. The core sends the signature
 //! sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the caller, with the
-//! deadline of the import: each VerifyBls call of one import gets the same deadline, and no
-//! verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state root equal
-//! to `block.state_root` and a gate that permits the payload: it makes the parent pre-state the
-//! most recently used, keeps the post-state as a pre-state, and the block becomes the head.
-//! There is no fork choice yet, so the head is the last block the core committed. On any other
-//! outcome the head and the pre-states do not change, their order of use included.
+//! deadline of the import: the proposer set in a first VerifyBls call, the block sets in a
+//! second one during the transition. Each VerifyBls call of one import gets the same deadline,
+//! and no verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state
+//! root equal to `block.state_root` and a gate that permits the payload: it makes the parent
+//! pre-state the most recently used, keeps the post-state as a pre-state, and the block
+//! becomes the head. There is no fork choice yet, so the head is the last block the core
+//! committed. On any other outcome the head and the pre-states do not change, their order of
+//! use included. An INVALID outcome of the transition is kept.
+//!
+//! # Seen roots
+//!
+//! The core keeps the root of each block it committed, and of the anchor, apart from the
+//! pre-states: a block whose pre-state left the LRU is still IGNORE, and the head does not go
+//! back to it. These roots are not bounded until a prune at finality exists: 32 bytes for each
+//! committed block, and the overhead of the set.
+//!
+//! It also keeps the refusals marked *kept*, at most [`MAX_REFUSED_ROOTS`], the first refused
+//! going first. Such a refusal does not change when the block comes again: it depends only on
+//! the block and on the pre-state of its parent. A refusal for the proposer signature holds
+//! only for that signature, as the block root does not commit to it. The core does not keep no
+//! verdict (the block can come again and get a verdict in time), a parent without a pre-state
+//! (it can come), a refused payload, or the wall-clock bound: the same block is in that bound
+//! once its slot comes, and that check costs no slot loop and no VerifyBls call.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
 
-use super::snapshot::{max_pre_states, Snapshots};
-use crate::import::block::{import_block, NotImported, PayloadImportGate};
+use super::seen::Refused;
+use super::snapshot::{max_pre_states, Snapshots, PRE_STATE_EPOCHS};
+use crate::import::block::{
+    check_proposer_signature, import_block, NotImported, PayloadImportGate,
+};
 use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{Root, Slot};
 use ethswarm_proto::verify::BlsSet;
 use network_config::ChainConfig;
 use state_transition::{state_root, Preset, StfError};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -60,6 +90,10 @@ pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(4);
 /// between the core and the proposer. The gossip rule (`MAXIMUM_GOSSIP_CLOCK_DISPARITY`) is
 /// tighter, but it is for gossip validation, and no code reads that config value yet.
 pub const MAX_FUTURE_SLOTS: u64 = 1;
+
+/// The most roots of refused blocks that the core keeps \[est\]. Past it, the root refused
+/// first goes.
+pub const MAX_REFUSED_ROOTS: usize = 1024;
 
 /// The last block the core committed, or the anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +264,10 @@ pub struct ChainCore<E: Preset> {
     /// `genesis_time` of the anchor state, Unix seconds: the start of slot 0.
     genesis_time: u64,
     snapshots: Snapshots<BeaconState<E>>,
+    /// The root of each block the core committed, and of the anchor (see the module docs).
+    committed: HashSet<Root>,
+    /// The kept refusals, by block root (see the module docs).
+    refused: Refused<Outcome>,
     head: Head,
     verify_timeout: Duration,
     /// `None` until [`Self::with_payload_gate`]: no block commits without a gate.
@@ -272,6 +310,8 @@ impl<E: Preset> ChainCore<E> {
             config,
             genesis_time: state.genesis_time,
             snapshots: Snapshots::new(head.block_root, state, max_pre_states::<E>()),
+            committed: HashSet::from([head.block_root]),
+            refused: Refused::new(MAX_REFUSED_ROOTS),
             head,
             verify_timeout: DEFAULT_VERIFY_TIMEOUT,
             gate: None,
@@ -374,8 +414,11 @@ impl<E: Preset> ChainCore<E> {
             return Outcome::Ignored(why);
         }
         let block_root = block.message.tree_hash_root();
-        if block_root == self.head.block_root || self.snapshots.peek(&block_root).is_some() {
+        if self.committed.contains(&block_root) {
             return Outcome::Ignored(format!("block {block_root} is already committed"));
+        }
+        if let Some(refused) = self.refused.get(&block_root, &block.signature) {
+            return refused.clone();
         }
         let parent = block.message.parent_root;
         // A peek: the parent becomes the most recently used only if its child commits, so a
@@ -383,6 +426,14 @@ impl<E: Preset> ChainCore<E> {
         let Some(pre) = self.snapshots.peek(&parent) else {
             return Outcome::Ignored(format!("no pre-state for the parent {parent}"));
         };
+        let window = PRE_STATE_EPOCHS * E::slots_per_epoch();
+        if block.message.slot.saturating_sub(pre.slot) > window {
+            let why = format!(
+                "block slot {} is more than {window} slots after the parent state slot {}",
+                block.message.slot, pre.slot
+            );
+            return self.refused.refuse(block_root, None, Outcome::Ignored(why));
+        }
         // The slot loop can add a validator, but not an active one: its activation waits for
         // the finality of a later epoch than the one that added it, and the loop has no new
         // attestations to finalize that epoch. So an index past the registry of the parent is
@@ -390,9 +441,22 @@ impl<E: Preset> ChainCore<E> {
         // Refused here, it costs no slot loop.
         let proposer = block.message.proposer_index;
         if !usize::try_from(proposer).is_ok_and(|index| index < pre.validators.len()) {
-            return Outcome::Invalid(StfError::UnknownValidator(proposer));
+            let invalid = Outcome::Invalid(StfError::UnknownValidator(proposer));
+            return self.refused.refuse(block_root, None, invalid);
         }
         let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
+        // The gossip order: the signature of the proposer before the slot loop, so that a
+        // block that its proposer did not sign costs one VerifyBls call and no slot loop.
+        match check_proposer_signature(pre, block, &verdict) {
+            Ok(()) => {}
+            Err(NotImported::Invalid(e)) => {
+                let signature = Some(block.signature);
+                return self
+                    .refused
+                    .refuse(block_root, signature, Outcome::Invalid(e));
+            }
+            Err(NotImported::Ignored(why)) => return Outcome::Ignored(why),
+        }
         match import_block(pre, block, &self.config, &verdict, gate) {
             Ok(imported) => {
                 self.head = Head {
@@ -402,12 +466,16 @@ impl<E: Preset> ChainCore<E> {
                 };
                 self.snapshots.promote(&parent);
                 self.snapshots.insert(imported.block_root, imported.post);
+                self.committed.insert(imported.block_root);
                 Outcome::Committed {
                     block_root: imported.block_root,
                     state_root: imported.state_root,
                 }
             }
-            Err(NotImported::Invalid(e)) => Outcome::Invalid(e),
+            // The proposer signature is valid, so the refusal holds for the message.
+            Err(NotImported::Invalid(e)) => {
+                self.refused.refuse(block_root, None, Outcome::Invalid(e))
+            }
             Err(NotImported::Ignored(why)) => Outcome::Ignored(why),
         }
     }
@@ -438,7 +506,8 @@ fn system_clock() -> u128 {
 }
 
 /// The verdict of `verifier` on `sets`, or none by `deadline`. The call runs on `runtime`; the
-/// core thread waits for it.
+/// core thread waits for it. A deadline that passed sends nothing, and a verdict that comes at
+/// or after the deadline is no verdict: a late VALID never commits.
 fn verify<V: BlsVerifier + 'static>(
     runtime: &Handle,
     verifier: &Arc<V>,
@@ -447,14 +516,28 @@ fn verify<V: BlsVerifier + 'static>(
 ) -> BlsOutcome {
     let verifier = Arc::clone(verifier);
     let call = runtime.spawn(async move {
+        if Instant::now() >= deadline {
+            return BlsOutcome::NoVerdict(format!("{NO_VERDICT_IN_TIME}: no time left"));
+        }
         // The deadline of the verifier, not a second timer: it stops only a verifier that does
-        // not keep its deadline, so that a late VALID never commits. `BlsClient` closes its
-        // stream when its call is dropped, so this cannot leave a request in its window.
-        tokio::time::timeout_at(deadline, verifier.verify_sets(sets, deadline))
+        // not keep its deadline. `BlsClient` closes its stream when a call that sent its
+        // request is dropped, so this cannot leave a request in its window.
+        let outcome = tokio::time::timeout_at(deadline, verifier.verify_sets(sets, deadline))
             .await
-            .unwrap_or_else(|_| BlsOutcome::NoVerdict("no verdict by the deadline".into()))
+            .unwrap_or_else(|_| BlsOutcome::NoVerdict(NO_VERDICT_IN_TIME.into()));
+        // `timeout_at` polls the call before its timer, so a verdict that is ready at the
+        // deadline gets through it.
+        match outcome {
+            BlsOutcome::Valid | BlsOutcome::Invalid if Instant::now() >= deadline => {
+                BlsOutcome::NoVerdict(format!("{NO_VERDICT_IN_TIME}: the verdict came at it"))
+            }
+            outcome => outcome,
+        }
     });
     runtime
         .block_on(call)
         .unwrap_or_else(|e| BlsOutcome::NoVerdict(format!("the VerifyBls call failed: {e}")))
 }
+
+/// The no-verdict reason of a VerifyBls call without a verdict before its deadline.
+const NO_VERDICT_IN_TIME: &str = "no verdict by the deadline";

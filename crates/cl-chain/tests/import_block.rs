@@ -1,9 +1,13 @@
 //! Acceptance tests of block import through the chain core.
 //!
 //! The fixture is in [`support`]: the genesis anchor of the pinned minimal Gloas export, its
-//! slot 1 block, and a fake cl-verify behind `BlsVerifier`. Two tests use the production
-//! `BlsClient` instead, one with an in-process cl-verify and one with a silent stub. One test
-//! sets a fake payload gate that refuses each payload.
+//! slot 1 block, and a fake cl-verify behind `BlsVerifier`. Some tests use the production
+//! `BlsClient` instead, with an in-process cl-verify or with a stub. One test sets a fake
+//! payload gate that refuses each payload.
+//!
+//! The core sends the proposer set of a block in a first VerifyBls call, before the slot loop.
+//! The block sets go in a second call, during the transition. So a first call that carries
+//! only the proposer set, with no call after it, shows that the slot loop did not run.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[allow(dead_code)]
@@ -18,12 +22,15 @@ mod verify {
 #[allow(dead_code)]
 mod support;
 
-use cl_chain::core::{queue, ChainCore, Head, Outcome, SubmitError};
+use cl_chain::core::{queue, ChainCore, Head, Outcome, SubmitError, MAX_REFUSED_ROOTS};
 use cl_chain::import::block::{PayloadImportGate, PermitAll};
 use cl_chain::verify::client::{BlsClient, BlsOutcome, BlsVerifier, DEFAULT_MAX_OUTSTANDING};
-use consensus_types::primitives::{Hash32, Root};
-use consensus_types::Minimal;
-use ethswarm_proto::verify::{BlsSet, KeyNamespace};
+use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
+use consensus_types::primitives::{Bytes32, Hash32, Root};
+use consensus_types::signing::{compute_signing_root, DOMAIN_BEACON_PROPOSER};
+use consensus_types::{EthSpec, Minimal};
+use ethswarm_proto::verify::{BlsSet, KeyNamespace, Signer};
+use state_transition::accessors::get_domain;
 use state_transition::StfError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,8 +76,8 @@ async fn valid_block_commits() {
     let calls = verify.calls();
     assert_eq!(
         calls.len(),
-        1,
-        "the block sets must go to cl-verify one time"
+        2,
+        "the proposer set must go to cl-verify first, then the block sets"
     );
     let proposer_set = &calls[0][0];
     let signer = &proposer_set.signers[0];
@@ -204,8 +211,8 @@ async fn refused_payload_gate_ignores() {
     assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
     assert_eq!(
         verify.calls().len(),
-        1,
-        "the block sets must go to cl-verify one time"
+        2,
+        "the proposer set and the block sets must go to cl-verify one time each"
     );
     assert_eq!(
         *calls.lock().unwrap(),
@@ -319,8 +326,8 @@ async fn a_committed_block_again_is_ignored_without_a_transition() {
     );
     assert_eq!(
         verify.calls().len(),
-        1,
-        "a committed block must not run the transition again"
+        2,
+        "a committed block must not reach cl-verify again"
     );
     drop(sender);
     let core = writer.join().unwrap();
@@ -348,25 +355,279 @@ async fn an_out_of_range_proposer_is_invalid_before_the_transition() {
     }
 }
 
-#[tokio::test]
+/// The wait of the fake cl-verify before each answer, in the shared deadline test.
+const STEP: Duration = Duration::from_millis(500);
+
+/// The clock is paused, so only the waits of the fake move it: the import starts at `start`,
+/// the first call comes at `start`, and the second call comes [`STEP`] later. A deadline taken
+/// again for each call is then later than `start + VERIFY_TIMEOUT` for the second call.
+#[tokio::test(start_paused = true)]
 async fn one_verify_deadline_runs_from_the_start_of_the_import() {
     let f = fixture();
-    let (outcome, _, verify) = import_one(f.core, f.block, Answer::Valid).await;
+    let start = Instant::now();
+    let (outcome, _, verify) = import_one(f.core, f.block, Answer::ValidAfter(STEP)).await;
     assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
     let called = verify.called();
-    assert!(!called.is_empty(), "the block sets must go to cl-verify");
+    assert_eq!(
+        called.len(),
+        2,
+        "the import must make two VerifyBls calls: {called:?}"
+    );
+    assert_eq!(called[0].at, start, "{called:?}");
+    assert_eq!(
+        called[1].at,
+        start + STEP,
+        "the second call must come after the answer to the first: {called:?}"
+    );
     for call in &called {
-        // The core starts the deadline before the transition, so the transition time is
-        // already gone when the call comes.
-        assert!(
-            call.deadline < call.at + VERIFY_TIMEOUT,
-            "the deadline must not start at the VerifyBls call: {call:?}"
-        );
         assert_eq!(
-            call.deadline, called[0].deadline,
-            "each call of one import must have the same deadline"
+            call.deadline,
+            start + VERIFY_TIMEOUT,
+            "each call must have the deadline of the start of the import: {call:?}"
         );
     }
+}
+
+/// The proposer set of `block` on `pre`, the state of its parent: the registry key of
+/// `proposer_index`, and the signing root in the proposer domain of the epoch of the block.
+fn proposer_set(pre: &BeaconState<Minimal>, block: &SignedBeaconBlock<Minimal>) -> BlsSet {
+    let proposer = block.message.proposer_index;
+    let key = pre
+        .validators
+        .get(usize::try_from(proposer).unwrap())
+        .unwrap()
+        .pubkey;
+    let epoch = Minimal::epoch_at_slot(block.message.slot);
+    let domain = get_domain(pre, DOMAIN_BEACON_PROPOSER, Some(epoch));
+    BlsSet {
+        signers: vec![Signer {
+            validator_index: proposer,
+            inline_pubkey: key.to_vec(),
+            namespace: KeyNamespace::Validator as i32,
+            builder: None,
+        }],
+        signing_root: compute_signing_root(&block.message, domain).to_vec(),
+        signature: block.signature.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_proposer_signature_is_invalid_before_the_slot_loop() {
+    let f = fixture();
+    let block_root = f.block.message.tree_hash_root();
+    let expected = proposer_set(f.core.state(&f.anchor.block_root).unwrap(), &f.block);
+    let (outcome, core, verify) = import_one(f.core, f.block, Answer::Invalid).await;
+    assert_eq!(outcome, Outcome::Invalid(StfError::InvalidBlockSignature));
+    assert_eq!(
+        verify.calls(),
+        vec![vec![expected]],
+        "only the proposer set must go to cl-verify, before the slot loop"
+    );
+    assert_unchanged(&core, f.anchor, block_root);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_missing_proposer_verdict_is_ignored_before_the_slot_loop() {
+    for answer in [Answer::Never, Answer::Late, Answer::AtDeadline] {
+        let f = fixture();
+        let block_root = f.block.message.tree_hash_root();
+        let expected = proposer_set(f.core.state(&f.anchor.block_root).unwrap(), &f.block);
+        let (outcome, core, verify) = import_one(f.core, f.block, answer).await;
+        assert!(
+            matches!(outcome, Outcome::Ignored(_)),
+            "{answer:?}: {outcome:?}"
+        );
+        assert_eq!(
+            verify.calls(),
+            vec![vec![expected]],
+            "{answer:?}: only the proposer set must go to cl-verify, before the slot loop"
+        );
+        assert_unchanged(&core, f.anchor, block_root);
+    }
+}
+
+/// tokio's `timeout_at` polls the call before its timer. So a VALID that is ready at the
+/// deadline passes through it, and only the check of the core stops it. The VALID at the
+/// deadline comes in the first call (the proposer set) or in the last call (the block sets).
+/// In the last call, nothing after it can stop the import.
+#[tokio::test(start_paused = true)]
+async fn a_valid_verdict_at_the_deadline_does_not_commit() {
+    let late_calls = [
+        vec![Answer::AtDeadline],
+        vec![Answer::Valid, Answer::AtDeadline],
+    ];
+    for answers in late_calls {
+        let f = fixture();
+        let block_root = f.block.message.tree_hash_root();
+        let verify = FakeVerify::answers(answers.clone());
+        let (outcome, core) = import_with(f.core, f.block.clone(), Arc::clone(&verify)).await;
+        assert!(
+            matches!(outcome, Outcome::Ignored(_)),
+            "{answers:?}: a VALID at the deadline must not commit: {outcome:?}"
+        );
+        assert_eq!(verify.calls().len(), answers.len(), "{answers:?}");
+        assert_unchanged(&core, f.anchor, block_root);
+        let (outcome, _, _) = import_one(core, f.block, Answer::Valid).await;
+        assert!(
+            matches!(outcome, Outcome::Committed { .. }),
+            "{answers:?}: a block without a verdict in time must be able to come again: \
+             {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_root_without_a_verdict_can_come_again() {
+    for answer in [Answer::Never, Answer::Late] {
+        let f = fixture();
+        let (outcome, core, _) = import_one(f.core, f.block.clone(), answer).await;
+        assert!(
+            matches!(outcome, Outcome::Ignored(_)),
+            "{answer:?}: {outcome:?}"
+        );
+        let (outcome, _, verify) = import_one(core, f.block, Answer::Valid).await;
+        assert!(
+            matches!(outcome, Outcome::Committed { .. }),
+            "{answer:?}: no verdict must not refuse the root for good: {outcome:?}"
+        );
+        assert_eq!(
+            verify.calls().len(),
+            2,
+            "{answer:?}: the import again must send the proposer set and the block sets"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_root_again_is_refused_before_cl_verify() {
+    // A proposer signature that cl-verify refuses: the refusal holds for that signature only.
+    let f = fixture();
+    let (first, core, _) = import_one(f.core, f.block.clone(), Answer::Invalid).await;
+    assert_eq!(first, Outcome::Invalid(StfError::InvalidBlockSignature));
+    let (again, core, verify) = import_one(core, f.block.clone(), Answer::Valid).await;
+    assert_eq!(again, first, "the same block must get the same answer");
+    assert!(
+        verify.calls().is_empty(),
+        "a refused block must not reach cl-verify again"
+    );
+    let mut signed_again = f.block.clone();
+    signed_again.signature[10] ^= 0x01;
+    let (outcome, _, _) = import_one(core, signed_again, Answer::Valid).await;
+    assert!(
+        matches!(outcome, Outcome::Committed { .. }),
+        "a bad signature on a copy must not refuse the block: {outcome:?}"
+    );
+
+    // An invalid message: the refusal holds for each signature.
+    let f = fixture();
+    let mut block = f.block;
+    block.message.state_root = Root::repeat_byte(0x11);
+    let block_root = block.message.tree_hash_root();
+    let (first, core, _) = import_one(f.core, block.clone(), Answer::Valid).await;
+    assert!(
+        matches!(first, Outcome::Invalid(StfError::StateRootMismatch { .. })),
+        "{first:?}"
+    );
+    let mut signed_again = block.clone();
+    signed_again.signature[10] ^= 0x01;
+    let mut core = core;
+    for copy in [block, signed_again] {
+        let (again, next, verify) = import_one(core, copy, Answer::Valid).await;
+        assert_eq!(again, first, "the same message must get the same answer");
+        assert!(
+            verify.calls().is_empty(),
+            "a refused message must not reach cl-verify again"
+        );
+        core = next;
+    }
+    assert_unchanged(&core, f.anchor, block_root);
+}
+
+/// `block` with graffiti that holds `n`: a block with its own root.
+fn numbered(block: &SignedBeaconBlock<Minimal>, n: usize) -> SignedBeaconBlock<Minimal> {
+    let mut graffiti = [0u8; 32];
+    graffiti[..8].copy_from_slice(&u64::try_from(n).unwrap().to_le_bytes());
+    let mut block = block.clone();
+    block.message.body.graffiti = Bytes32::from(graffiti);
+    block
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_refused_roots_are_bounded_and_the_oldest_goes_first() {
+    let f = fixture();
+    let verify = FakeVerify::new(Answer::Invalid);
+    let (sender, queue) = queue::<Minimal>(QUEUE);
+    let writer = f
+        .core
+        .spawn(queue, Arc::clone(&verify), Handle::current())
+        .unwrap();
+    let import = |block: SignedBeaconBlock<Minimal>| {
+        let reply = sender.import(block).unwrap();
+        async move { reply.await.unwrap().outcome }
+    };
+    let blocks: Vec<_> = (0..=MAX_REFUSED_ROOTS)
+        .map(|n| numbered(&f.block, n))
+        .collect();
+    for block in &blocks {
+        let outcome = import(block.clone()).await;
+        assert_eq!(outcome, Outcome::Invalid(StfError::InvalidBlockSignature));
+    }
+    let sent = verify.calls().len();
+    let outcome = import(blocks[MAX_REFUSED_ROOTS].clone()).await;
+    assert_eq!(outcome, Outcome::Invalid(StfError::InvalidBlockSignature));
+    assert_eq!(
+        verify.calls().len(),
+        sent,
+        "the newest refused root must not reach cl-verify again"
+    );
+    let outcome = import(blocks[0].clone()).await;
+    assert_eq!(outcome, Outcome::Invalid(StfError::InvalidBlockSignature));
+    assert_eq!(
+        verify.calls().len(),
+        sent + 1,
+        "past the bound, the oldest refused root must go first"
+    );
+    drop(sender);
+    let core = writer.join().unwrap();
+    assert_eq!(core.head(), f.anchor, "the head must stay the anchor");
+}
+
+/// A stub cl-verify that answers VALID for each set, behind the production client. An import
+/// whose deadline passed before its first call must send no request and must not close the
+/// stream: the next import uses the same stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_import_out_of_time_sends_no_request_and_keeps_the_stream() {
+    let served = testing::StubVerify::start(testing::Stub::ValidAfter(Duration::from_millis(1)));
+    let client = Arc::new(served.bls_client().await);
+    let f = fixture();
+    let (outcome, _) = import_with(f.core, f.block, Arc::clone(&client)).await;
+    assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+    let requests = served.bls_requests();
+    assert_eq!(served.streams_opened(), 1);
+
+    let f = fixture();
+    let block_root = f.block.message.tree_hash_root();
+    let core = f.core.with_verify_timeout(Duration::ZERO);
+    let (outcome, core) = import_with(core, f.block, Arc::clone(&client)).await;
+    assert!(
+        matches!(outcome, Outcome::Ignored(_)),
+        "an import without time must be IGNORE: {outcome:?}"
+    );
+    assert_unchanged(&core, f.anchor, block_root);
+
+    let f = fixture();
+    let (outcome, _) = import_with(f.core, f.block, client).await;
+    assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+    assert_eq!(
+        served.streams_opened(),
+        1,
+        "an import out of time must not close the stream"
+    );
+    assert_eq!(
+        served.bls_requests(),
+        2 * requests,
+        "an import out of time must send no request"
+    );
 }
 
 /// The deadline of the core in the silent cl-verify test.

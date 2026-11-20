@@ -145,6 +145,8 @@ jobs:
         run: bash scripts/check-bls-features.sh
       - name: cl-chain links only crypto-bls/aggregate, never crypto-bls/verify
         run: bash scripts/tests/check-cl-chain-features.test.sh && bash scripts/check-cl-chain-features.sh
+      - name: No service links testkit/test-support (its fixtures and anchor loader are dev-only)
+        run: bash scripts/tests/check-testkit-features.test.sh && bash scripts/check-testkit-features.sh
       - name: cl-chain builds on its own (no feature unification with spec-tests)
         run: cargo check -p cl-chain --all-targets --locked
       - name: No dependency cycles among workspace crates (cargo metadata, every edge kind)
