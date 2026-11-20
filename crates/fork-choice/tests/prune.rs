@@ -321,6 +321,91 @@ fn a_block_on_a_dropped_branch_is_refused_and_keeps_the_store() {
     assert_eq!(get_head(&f.store), Ok(empty(f.d)));
 }
 
+/// The blocks `b` and `x` of [`finalized`]. The prune drops them.
+fn dropped_branch() -> [SignedBeaconBlock<E>; 2] {
+    let (_, anchor_block) = new_store();
+    let b = child(&anchor_block, 1, 2);
+    let x = child(&b.message, 9, 6);
+    [b, x]
+}
+
+#[test]
+fn a_dropped_block_is_a_known_block_and_keeps_the_store() {
+    let mut f = finalized();
+    tick(&mut f.store, 11);
+    let [b, x] = dropped_branch();
+    assert_eq!([root_of(&b), root_of(&x)], [f.b, f.x]);
+    let before = f.store.clone();
+    // The spec's store keeps every block, and `on_block` returns early for a known block.
+    // The parent of each block is dropped too.
+    for block in [&x, &b] {
+        let root = root_of(block);
+        assert!(f.store.block(root).is_none());
+        assert_eq!(on_block(&mut f.store, &PLAIN, block), Ok(()));
+        assert_eq!(f.store, before);
+        assert!(f.store.block(root).is_none());
+        assert!(f.store.block_or_dropped(root).is_some());
+    }
+    assert_eq!(get_head(&f.store), Ok(empty(f.d)));
+    // A new block on a dropped block is not a known block.
+    let new = child(&x.message, 11, 7);
+    assert_eq!(
+        on_block(&mut f.store, &PLAIN, &new),
+        Err(Error::UnknownParent(f.x))
+    );
+    assert_eq!(f.store, before);
+}
+
+#[test]
+fn a_forgotten_block_stays_a_known_block_and_does_not_go_back_into_the_tree() {
+    let mut f = finalized();
+    // The prune runs in epoch 1. The store keeps the dropped blocks through the end of epoch 3.
+    tick(&mut f.store, 11);
+    tick(&mut f.store, 4 * SLOTS_PER_EPOCH - 1);
+    assert!(f.store.block_or_dropped(f.x).is_some());
+    // The first tick of epoch 4 forgets them.
+    tick(&mut f.store, 4 * SLOTS_PER_EPOCH);
+    let [b, x] = dropped_branch();
+    let before = f.store.clone();
+    for block in [&x, &b] {
+        let root = root_of(block);
+        assert!(f.store.block_or_dropped(root).is_none());
+        assert_eq!(on_block(&mut f.store, &PLAIN, block), Ok(()));
+        assert_eq!(f.store, before);
+        assert!(f.store.block_or_dropped(root).is_none());
+    }
+    // A new block on a forgotten block is not a known block.
+    let new = child(&x.message, 4 * SLOTS_PER_EPOCH, 7);
+    assert_eq!(
+        on_block(&mut f.store, &PLAIN, &new),
+        Err(Error::UnknownParent(f.x))
+    );
+    assert_eq!(f.store, before);
+}
+
+#[test]
+fn a_block_that_the_store_never_had_is_not_a_known_block() {
+    let mut f = finalized();
+    tick(&mut f.store, 11);
+    tick(&mut f.store, 4 * SLOTS_PER_EPOCH);
+    assert!(f.store.block_or_dropped(f.x).is_none());
+    let before = f.store.clone();
+    // The parent of this block is not a block of the store.
+    let unknown = Root::repeat_byte(0x5a);
+    let mut orphan = child(&dropped_branch()[1].message, 4 * SLOTS_PER_EPOCH, 8);
+    orphan.message.parent_root = unknown;
+    assert_eq!(
+        on_block(&mut f.store, &PLAIN, &orphan),
+        Err(Error::UnknownParent(unknown))
+    );
+    assert_eq!(f.store, before);
+    // A new block on a kept block goes into the tree.
+    let d = f.store.block(f.d).unwrap().clone();
+    let new = child(&d, 4 * SLOTS_PER_EPOCH, 8);
+    assert_eq!(on_block(&mut f.store, &PLAIN, &new), Ok(()));
+    assert!(f.store.block(root_of(&new)).is_some());
+}
+
 /// The proposer of the parent block of the boost scenario.
 const PROPOSER: u8 = 9;
 
