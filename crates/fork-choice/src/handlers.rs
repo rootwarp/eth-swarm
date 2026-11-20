@@ -107,6 +107,10 @@ fn update_unrealized_checkpoints<E: Preset>(
 
 /// `on_block` (G L1044-1104).
 ///
+/// A known block returns early and does not change the store. The spec's store keeps every
+/// block, so a block that a prune dropped is a known block too, also after the store forgets
+/// it ([`Store::is_known_block`]).
+///
 /// The spec order of the asserts is kept, the payload assert of G L1058-1061 included: a
 /// block that builds on the FULL payload of its parent fails with
 /// [`Error::ParentPayloadNotVerified`] until that payload is in `store.payloads`. Then the
@@ -119,7 +123,7 @@ pub fn on_block<E: Preset, P: StateProvider<E> + ?Sized>(
 ) -> Result<(), Error> {
     let block = &signed_block.message;
     let block_root = block.tree_hash_root();
-    if store.blocks.contains_key(&block_root) {
+    if store.is_known_block(block_root) {
         return Ok(());
     }
     let parent_state = store
