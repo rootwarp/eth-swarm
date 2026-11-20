@@ -22,6 +22,10 @@
 //! index can take a new key: the set carries the key version of the state at the block slot,
 //! and a pre-state key of another version is no verdict.
 //!
+//! [`check_proposer_signature`] checks the proposer signature alone on the pre-state, through
+//! the same backend, before the slot loop of the transition (the gossip order). The transition
+//! then checks it again with the other sets of the block.
+//!
 //! Before it returns the post-state, the import asks a [`PayloadImportGate`] about the payload
 //! bid of the block. A refusal is IGNORE. The chain core has no gate until one is set, and
 //! commits nothing without one; a later check of the execution status of the payload will plug
@@ -34,6 +38,7 @@ use consensus_types::primitives::{BLSPubkey, Epoch, Hash32, Root};
 use crypto_bls::{eth_aggregate_pubkeys, PublicKey};
 use ethswarm_proto::verify::{BlsSet, KeyNamespace, Signer, VerifyOrigin};
 use network_config::ChainConfig;
+use state_transition::signatures::verify_block_signature;
 use state_transition::{
     state_root, state_transition, AggregationError, BackendError, BlsContext, Preset,
     PubkeyAggregator, SignatureBackend, SignatureSet, SignerRef, StfError,
@@ -136,6 +141,31 @@ pub fn import_block<E: Preset>(
         state_root: computed,
         post,
     })
+}
+
+/// Checks the proposer signature of `block` on `pre`, the post-state of its parent, before the
+/// slot loop: the registry key of `proposer_index` in `pre`, and the proposer domain of the
+/// epoch of the block (`block_proposer_signature_set`). The set goes to cl-verify alone,
+/// through `verdict`. An INVALID verdict is [`StfError::InvalidBlockSignature`]; no verdict is
+/// IGNORE.
+///
+/// `pre` gives the fork version of the domain, so the check is right only while no fork comes
+/// between the parent and the block. The core imports Gloas blocks on Gloas states only.
+pub fn check_proposer_signature<E: Preset>(
+    pre: &BeaconState<E>,
+    block: &SignedBeaconBlock<E>,
+    verdict: &dyn Fn(Vec<BlsSet>) -> BlsOutcome,
+) -> Result<(), NotImported> {
+    let backend = ClVerify {
+        keys: pre,
+        builders: BuilderFeed::new(),
+        verdict,
+    };
+    match verify_block_signature(pre, block, &backend) {
+        Ok(()) => Ok(()),
+        Err(e) if e.proves_invalid() => Err(NotImported::Invalid(e)),
+        Err(e) => Err(NotImported::Ignored(e.to_string())),
+    }
 }
 
 /// The signature backend of an import: each batch goes to cl-verify through `verdict`.

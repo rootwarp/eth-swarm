@@ -24,12 +24,15 @@
 //!   parent pre-state: IGNORE. The wall-clock bound does not stop a block at the slot of the
 //!   wall clock on an old pre-state (the anchor stays for good), and the walk from that
 //!   pre-state costs one `process_slot` for each slot;
-//! - `proposer_index` is past the registry of the parent pre-state: INVALID.
+//! - `proposer_index` is past the registry of the parent pre-state: INVALID;
+//! - the proposer signature ([`check_proposer_signature`]), with the key of the parent
+//!   pre-state: INVALID on an INVALID verdict, IGNORE on no verdict.
 //!
 //! Then it runs [`import_block`] on the pre-state of the parent. The core sends the signature
 //! sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the caller, with the
-//! deadline of the import: each VerifyBls call of one import gets the same deadline, and no
-//! verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state root equal
+//! deadline of the import: the proposer set in a first VerifyBls call, the block sets in a
+//! second one during the transition. Each VerifyBls call of one import gets the same deadline,
+//! and no verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state root equal
 //! to `block.state_root` and a gate that permits the payload: it makes the parent pre-state the
 //! most recently used, keeps the post-state as a pre-state, and the block becomes the head.
 //! There is no fork choice yet, so the head is the last block the core committed. On any other
@@ -39,7 +42,9 @@
 //! IGNORE and changes nothing.
 
 use super::snapshot::{max_pre_states, Snapshots, PRE_STATE_EPOCHS};
-use crate::import::block::{import_block, NotImported, PayloadImportGate};
+use crate::import::block::{
+    check_proposer_signature, import_block, NotImported, PayloadImportGate,
+};
 use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{Root, Slot};
@@ -408,6 +413,11 @@ impl<E: Preset> ChainCore<E> {
             return Outcome::Invalid(StfError::UnknownValidator(proposer));
         }
         let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
+        // The gossip order: the signature of the proposer before the slot loop, so that a
+        // block that its proposer did not sign costs one VerifyBls call and no slot loop.
+        if let Err(e) = check_proposer_signature(pre, block, &verdict) {
+            return refused(e);
+        }
         match import_block(pre, block, &self.config, &verdict, gate) {
             Ok(imported) => {
                 self.head = Head {
@@ -422,8 +432,7 @@ impl<E: Preset> ChainCore<E> {
                     state_root: imported.state_root,
                 }
             }
-            Err(NotImported::Invalid(e)) => Outcome::Invalid(e),
-            Err(NotImported::Ignored(why)) => Outcome::Ignored(why),
+            Err(e) => refused(e),
         }
     }
 
@@ -442,6 +451,14 @@ impl<E: Preset> ChainCore<E> {
             ));
         }
         Ok(())
+    }
+}
+
+/// The outcome of a block that did not import.
+fn refused(e: NotImported) -> Outcome {
+    match e {
+        NotImported::Invalid(e) => Outcome::Invalid(e),
+        NotImported::Ignored(why) => Outcome::Ignored(why),
     }
 }
 
