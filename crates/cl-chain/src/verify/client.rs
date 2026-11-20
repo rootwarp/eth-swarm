@@ -26,9 +26,9 @@
 //! reserving its frame's place on the stream until the frame is sent, and only then waits for its
 //! verdict. It takes its id only once that place is reserved, and sends without waiting: a call
 //! that is cancelled, or runs out of time, before its send holds no id. A call whose deadline
-//! passed sends nothing. A call dropped after its
-//! send keeps its id until cl-verify's answer settles it, as one past its deadline does; cl-verify
-//! answers every request it reads (`DEADLINE_EXCEEDED` when too late). A reader task delivers the
+//! passed sends nothing. A call dropped after its send keeps its id until cl-verify's answer
+//! settles it, as one past its deadline does; cl-verify answers every request it reads
+//! (`DEADLINE_EXCEEDED` when too late). A reader task delivers the
 //! responses; when the stream ends, errs or breaks the contract, every call on it fails as no
 //! verdict and the next call opens a new stream. At most [`DEFAULT_MAX_OUTSTANDING`] requests are
 //! in flight on a stream; a call past that is no verdict, never queued without bound. On a
