@@ -1,7 +1,8 @@
-//! The chain core: the single writer of cl-chain's chain state ([`actor`]), and its
-//! pre-states ([`snapshot`]).
+//! The chain core: the single writer of cl-chain's chain state ([`actor`]), its pre-states
+//! ([`snapshot`]) and the blocks it refused (`seen`).
 
 pub mod actor;
+mod seen;
 pub mod snapshot;
 
 pub use actor::{
