@@ -52,18 +52,25 @@ pub struct Called {
     pub deadline: Instant,
 }
 
-/// A fake cl-verify. It gives one answer to each call and keeps the sets and the deadline of
-/// each call.
+/// A fake cl-verify. It answers each call and keeps the sets and the deadline of each call.
 pub struct FakeVerify {
-    answer: Answer,
+    /// The answer to each call in order. The last answer is also the answer to each later call.
+    answers: Vec<Answer>,
     calls: Mutex<Vec<Vec<BlsSet>>>,
     called: Mutex<Vec<Called>>,
 }
 
 impl FakeVerify {
+    /// A fake that gives `answer` to each call.
     pub fn new(answer: Answer) -> Arc<Self> {
+        Self::answers(vec![answer])
+    }
+
+    /// A fake that gives `answers` to its calls in order, and the last one to each later call.
+    pub fn answers(answers: Vec<Answer>) -> Arc<Self> {
+        assert!(!answers.is_empty(), "the fake needs an answer");
         Arc::new(Self {
-            answer,
+            answers,
             calls: Mutex::default(),
             called: Mutex::default(),
         })
@@ -82,12 +89,16 @@ impl FakeVerify {
 
 impl BlsVerifier for FakeVerify {
     async fn verify_sets(&self, sets: Vec<BlsSet>, deadline: Instant) -> BlsOutcome {
-        self.called.lock().unwrap().push(Called {
-            at: Instant::now(),
-            deadline,
-        });
+        let call = {
+            let mut called = self.called.lock().unwrap();
+            called.push(Called {
+                at: Instant::now(),
+                deadline,
+            });
+            called.len() - 1
+        };
         self.calls.lock().unwrap().push(sets);
-        match self.answer {
+        match self.answers[call.min(self.answers.len() - 1)] {
             Answer::Valid => BlsOutcome::Valid,
             Answer::Invalid => BlsOutcome::Invalid,
             Answer::Never => std::future::pending().await,

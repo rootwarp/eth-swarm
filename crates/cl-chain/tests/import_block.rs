@@ -447,23 +447,33 @@ async fn a_missing_proposer_verdict_is_ignored_before_the_slot_loop() {
 }
 
 /// tokio's `timeout_at` polls the call before its timer. So a VALID that is ready at the
-/// deadline passes through it, and only the check of the core stops it.
+/// deadline passes through it, and only the check of the core stops it. The VALID at the
+/// deadline comes in the first call (the proposer set) or in the last call (the block sets).
+/// In the last call, nothing after it can stop the import.
 #[tokio::test(start_paused = true)]
 async fn a_valid_verdict_at_the_deadline_does_not_commit() {
-    let f = fixture();
-    let block_root = f.block.message.tree_hash_root();
-    let (outcome, core, verify) = import_one(f.core, f.block.clone(), Answer::AtDeadline).await;
-    assert!(
-        matches!(outcome, Outcome::Ignored(_)),
-        "a VALID at the deadline must not commit: {outcome:?}"
-    );
-    assert_eq!(verify.calls().len(), 1);
-    assert_unchanged(&core, f.anchor, block_root);
-    let (outcome, _, _) = import_one(core, f.block, Answer::Valid).await;
-    assert!(
-        matches!(outcome, Outcome::Committed { .. }),
-        "a block without a verdict in time must be able to come again: {outcome:?}"
-    );
+    let late_calls = [
+        vec![Answer::AtDeadline],
+        vec![Answer::Valid, Answer::AtDeadline],
+    ];
+    for answers in late_calls {
+        let f = fixture();
+        let block_root = f.block.message.tree_hash_root();
+        let verify = FakeVerify::answers(answers.clone());
+        let (outcome, core) = import_with(f.core, f.block.clone(), Arc::clone(&verify)).await;
+        assert!(
+            matches!(outcome, Outcome::Ignored(_)),
+            "{answers:?}: a VALID at the deadline must not commit: {outcome:?}"
+        );
+        assert_eq!(verify.calls().len(), answers.len(), "{answers:?}");
+        assert_unchanged(&core, f.anchor, block_root);
+        let (outcome, _, _) = import_one(core, f.block, Answer::Valid).await;
+        assert!(
+            matches!(outcome, Outcome::Committed { .. }),
+            "{answers:?}: a block without a verdict in time must be able to come again: \
+             {outcome:?}"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
