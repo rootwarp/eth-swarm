@@ -27,6 +27,7 @@ members = [
     "crates/node-key",
     "crates/state-transition",
     "crates/fork-choice",
+    "crates/gossip-validation",
     "crates/cl-node",
     "crates/engine-api",
 ]

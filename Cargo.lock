@@ -2687,6 +2687,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gossip-validation"
+version = "0.1.0"
+dependencies = [
+ "consensus-types",
+ "ethereum_ssz",
+ "fork-choice",
+ "ssz_types",
+ "state-transition",
+ "tree_hash",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

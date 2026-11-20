@@ -7,12 +7,16 @@
 //! - [`attestations`]: [`on_attestation`] and [`on_attester_slashing`].
 //! - [`weights`]: [`get_head`], the filtered node tree, [`get_weight`] and the payload
 //!   tiebreaker.
+//! - [`envelope`]: [`on_execution_payload_envelope`] and
+//!   [`verify_execution_payload_envelope`].
 //!
 //! The crate does no I/O and links no BLS library. The state transition of a block comes
-//! from the caller through a [`StateProvider`], and the BLS verdicts of an attestation through
-//! a [`SignatureVerifier`]. `on_execution_payload_envelope` and
-//! `on_payload_attestation_message` from the wire are not here yet. Until they are, only the
-//! test seam `testing::mark_payload_verified` (tests only) fills `store.payloads`.
+//! from the caller through a [`StateProvider`], and the BLS verdicts of an attestation or an
+//! envelope through a [`SignatureVerifier`]. Data availability and the answer of the execution
+//! engine for an envelope come through a [`DataAvailabilityCheck`] and an [`ExecutionEngine`].
+//! [`on_execution_payload_envelope`] fills `store.payloads`. The test seam
+//! `testing::mark_payload_verified` (tests only) also does, without the checks of the
+//! handler. `on_payload_attestation_message` from the wire is not here yet.
 //!
 //! The spec's store keeps every block. Here [`on_tick`] still drops the blocks that do not
 //! descend from the finalized checkpoint block once finality moves, from the kept set that
@@ -31,11 +35,17 @@
 //! `phase0/fork-choice.md`, P0b `phase0/beacon-chain.md`.
 
 pub mod attestations;
+pub mod envelope;
 pub mod handlers;
 pub mod store;
 pub mod weights;
 
 pub use attestations::{on_attestation, on_attester_slashing, SignatureVerifier};
+pub use envelope::{
+    execution_payload_envelope_signature_set, on_execution_payload_envelope,
+    verify_execution_payload_envelope, DataAvailability, DataAvailabilityCheck, ExecutionEngine,
+    NewPayloadRequestRef, PayloadImport,
+};
 pub use handlers::{on_block, on_tick, store_target_checkpoint_state, StateProvider};
 pub use store::{
     compute_slots_since_epoch_start, get_ancestor, get_checkpoint_block, get_current_slot,
@@ -48,8 +58,10 @@ pub use weights::{
     get_filtered_node_tree, get_head, get_node_children, get_weight, is_valid_dependent_root,
 };
 
-use consensus_types::primitives::{CommitteeIndex, Epoch, Root, Slot, ValidatorIndex};
-use state_transition::StfError;
+use consensus_types::primitives::{
+    BuilderIndex, Bytes32, CommitteeIndex, Epoch, Hash32, Root, Slot, ValidatorIndex,
+};
+use state_transition::{BackendError, StfError};
 
 /// `BASIS_POINTS` (P0 L126).
 pub const BASIS_POINTS: u64 = 10_000;
@@ -166,6 +178,132 @@ pub enum Error {
     /// state or the signature backend failed (no verdict, never a proof).
     #[error("indexed attestation: {0}")]
     IndexedAttestation(StfError),
+    /// `on_execution_payload_envelope` or `verify_execution_payload_envelope` failed a spec
+    /// `assert` on the envelope.
+    #[error("invalid execution payload envelope: {0}")]
+    InvalidEnvelope(EnvelopeError),
+    /// `is_data_available` is false for the block of an envelope. The envelope can pass later,
+    /// when the data is available: this is not a proof.
+    #[error("the data of block {0} is not available")]
+    DataUnavailable(Root),
+    /// The answer of the execution engine does not permit the import of the payload of the
+    /// block: INVALID, INVALID_BLOCK_HASH, no answer, or a gate of the caller. This is not a
+    /// proof that the envelope is invalid.
+    #[error("the execution engine refused the payload of block {0}")]
+    PayloadRefused(Root),
+    /// The signature verifier gave no verdict on an envelope: never a proof.
+    #[error("no signature verdict: {0}")]
+    NoSignatureVerdict(BackendError),
+}
+
+/// The spec `assert` that an execution payload envelope failed, in the order of
+/// `on_execution_payload_envelope` (G L1113-1135) and `verify_execution_payload_envelope`
+/// (G L683-728).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EnvelopeError {
+    /// The block of the envelope must be in `store.block_states`.
+    #[error("beacon block {0} is not in the store")]
+    UnknownBeaconBlock(Root),
+    /// `state.builders[builder_index]` must exist for a builder envelope.
+    #[error("builder {0} is not in the registry")]
+    UnknownBuilder(BuilderIndex),
+    /// `verify_execution_payload_envelope_signature` is false.
+    #[error("the envelope signature is not valid")]
+    InvalidSignature,
+    /// `beacon_block_root` must be the root of the latest block header of the state.
+    #[error("beacon block root {envelope} is not the block root {block} of the state")]
+    BeaconBlockRoot {
+        /// `envelope.beacon_block_root`.
+        envelope: Root,
+        /// The root of the latest block header, with the state root.
+        block: Root,
+    },
+    /// `parent_beacon_block_root` must be the parent root of the latest block header.
+    #[error("parent beacon block root {envelope} is not {state}")]
+    ParentBeaconBlockRoot {
+        /// `envelope.parent_beacon_block_root`.
+        envelope: Root,
+        /// `state.latest_block_header.parent_root`.
+        state: Root,
+    },
+    /// `builder_index` must be the builder of the committed bid.
+    #[error("builder index {envelope} is not the bid builder {bid}")]
+    BuilderIndex {
+        /// `envelope.builder_index`.
+        envelope: BuilderIndex,
+        /// `bid.builder_index`.
+        bid: BuilderIndex,
+    },
+    /// `payload.prev_randao` must be the one of the bid.
+    #[error("prev_randao {payload} is not the bid prev_randao {bid}")]
+    PrevRandao {
+        /// `payload.prev_randao`.
+        payload: Bytes32,
+        /// `bid.prev_randao`.
+        bid: Bytes32,
+    },
+    /// `payload.gas_limit` must be the one of the bid.
+    #[error("gas limit {payload} is not the bid gas limit {bid}")]
+    GasLimit {
+        /// `payload.gas_limit`.
+        payload: u64,
+        /// `bid.gas_limit`.
+        bid: u64,
+    },
+    /// `payload.block_hash` must be the one of the bid.
+    #[error("block hash {payload} is not the bid block hash {bid}")]
+    BlockHash {
+        /// `payload.block_hash`.
+        payload: Hash32,
+        /// `bid.block_hash`.
+        bid: Hash32,
+    },
+    /// The root of the execution requests must be the one of the bid.
+    #[error("execution requests root {envelope} is not the bid root {bid}")]
+    ExecutionRequestsRoot {
+        /// `hash_tree_root(envelope.execution_requests)`.
+        envelope: Root,
+        /// `bid.execution_requests_root`.
+        bid: Root,
+    },
+    /// `payload.slot_number` must be the slot of the state.
+    #[error("payload slot {payload} is not the state slot {state}")]
+    Slot {
+        /// `payload.slot_number`.
+        payload: Slot,
+        /// `state.slot`.
+        state: Slot,
+    },
+    /// `payload.parent_hash` must be the latest block hash of the state.
+    #[error("parent hash {payload} is not the latest block hash {state}")]
+    ParentHash {
+        /// `payload.parent_hash`.
+        payload: Hash32,
+        /// `state.latest_block_hash`.
+        state: Hash32,
+    },
+    /// `payload.timestamp` must be the time of the slot of the state.
+    #[error("timestamp {payload} is not the slot time {expected}")]
+    Timestamp {
+        /// `payload.timestamp`.
+        payload: u64,
+        /// `compute_time_at_slot(state.genesis_time, state.slot)`.
+        expected: u64,
+    },
+    /// The withdrawals of the payload must be the expected withdrawals of the state.
+    #[error("withdrawals root {payload} is not the expected root {expected}")]
+    WithdrawalsRoot {
+        /// `hash_tree_root(payload.withdrawals)`.
+        payload: Root,
+        /// `hash_tree_root(state.payload_expected_withdrawals)`.
+        expected: Root,
+    },
+}
+
+impl From<EnvelopeError> for Error {
+    fn from(e: EnvelopeError) -> Self {
+        Self::InvalidEnvelope(e)
+    }
 }
 
 /// The spec `assert` that an attestation or an attester slashing failed.
@@ -257,8 +395,9 @@ impl From<AttestationError> for Error {
 
 /// Test seams. Only tests may enable them: the feature `testing` is for dev-dependencies.
 /// They change the store without the checks of the handlers that they stand for:
-/// `mark_payload_verified` stands for `on_execution_payload_envelope`, which is not here yet,
-/// and the others let a test set a weight without the committees of an attestation.
+/// `mark_payload_verified` stands for `on_execution_payload_envelope`, so that a test needs
+/// no envelope, and the others let a test set a weight without the committees of an
+/// attestation.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use crate::{LatestMessage, Store};

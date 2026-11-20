@@ -22,6 +22,8 @@ state-transition = { path = "../state-transition" }
 ssz_types.workspace = true
 tree_hash.workspace = true
 thiserror = "2"
+# kzg_commitment_to_versioned_hash of verify_execution_payload_envelope.
+sha2 = "0.10"
 
 [dev-dependencies]
 fork-choice = { path = ".", features = ["testing"] }
@@ -33,7 +35,6 @@ testkit = { path = "../testkit" }
 network-config = { path = "../network-config" }
 milhouse.workspace = true
 ethereum_ssz.workspace = true
-sha2 = "0.10"
 toml = "0.8"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }

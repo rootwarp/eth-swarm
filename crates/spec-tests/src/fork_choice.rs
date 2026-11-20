@@ -2,8 +2,9 @@
 //! through the `fork-choice` crate (`tests/formats/fork_choice/README.md` at v1.7.0-beta.4).
 //!
 //! A case holds `anchor_state.ssz_snappy`, `anchor_block.ssz_snappy`, `steps.yaml`, the
-//! `block_<root>.ssz_snappy`, `attestation_<root>.ssz_snappy` and
-//! `attester_slashing_<root>.ssz_snappy` files that its steps name, an optional `meta.yaml`
+//! `block_<root>.ssz_snappy`, `attestation_<root>.ssz_snappy`,
+//! `attester_slashing_<root>.ssz_snappy` and `execution_payload_envelope_<root>.ssz_snappy`
+//! files that its steps name, an optional `meta.yaml`
 //! (`description`, `bls_setting`), an optional `config.yaml` and `manifest.yaml` (the suite
 //! checks it). [`run`] makes the store with `get_forkchoice_store` and the `SLOT_DURATION_MS`
 //! of the preset config, and then runs each step in sequence:
@@ -24,6 +25,9 @@
 //!   votes the vector expects.
 //! - `attestation`: `on_attestation(..., is_from_block=False)`, the default of the format.
 //! - `attester_slashing`: `on_attester_slashing`.
+//! - `execution_payload`: `on_execution_payload_envelope`, with the BLS backend of the block
+//!   step. The step has no data availability input, and the pyspec engine accepts each
+//!   payload, so the data is available and the engine answer is VALID.
 //! - `checks`: `head` (the slot, root and payload status of `get_head`), `time`,
 //!   `genesis_time`, `justified_checkpoint`, `finalized_checkpoint`, `proposer_boost_root` and
 //!   `viable_for_head_roots_and_weights`. A `checks` step with no check fails, and so does a
@@ -39,12 +43,14 @@ use crate::fixture;
 use crate::plan::Case;
 use ::fork_choice::{
     get_filtered_node_tree, get_forkchoice_store, get_head, get_node_children, get_weight,
-    milliseconds_to_seconds, on_attestation, on_attester_slashing, on_block, on_tick,
-    seconds_to_milliseconds, Error, ForkChoiceNode, PayloadStatus, SignatureVerifier,
-    StateProvider, Store,
+    milliseconds_to_seconds, on_attestation, on_attester_slashing, on_block,
+    on_execution_payload_envelope, on_tick, seconds_to_milliseconds, DataAvailability,
+    DataAvailabilityCheck, Error, ExecutionEngine, ForkChoiceNode, NewPayloadRequestRef,
+    PayloadImport, PayloadStatus, SignatureVerifier, StateProvider, Store,
 };
 use consensus_types::gloas::{
     Attestation, AttesterSlashing, BeaconBlock, BeaconState, Checkpoint, SignedBeaconBlock,
+    SignedExecutionPayloadEnvelope,
 };
 use consensus_types::primitives::{Root, Slot};
 use consensus_types::{Mainnet, Minimal};
@@ -59,7 +65,7 @@ use tree_hash::TreeHash;
 use yaml_rust2::Yaml;
 
 /// The Gloas handler directories that this runner runs.
-pub const RUNNABLE: [&str; 9] = [
+pub const RUNNABLE: [&str; 11] = [
     "on_block",
     "get_head",
     "get_parent_payload_status",
@@ -69,15 +75,15 @@ pub const RUNNABLE: [&str; 9] = [
     "reorg",
     "withholding",
     "should_apply_proposer_boost",
+    "on_execution_payload_envelope",
+    "deposit_with_reorg",
 ];
 
 /// The Gloas handler directories of v1.7.0-beta.4 that this runner does not run: each case
-/// needs an `execution_payload` or a `payload_attestation_message` step, or payload vote
-/// checks. `testing/skip.toml` skips them.
-pub const NOT_RUN: [&str; 5] = [
-    "on_execution_payload_envelope",
+/// needs a `payload_attestation_message` step or payload vote checks. `testing/skip.toml`
+/// skips them.
+pub const NOT_RUN: [&str; 3] = [
     "on_payload_attestation_message",
-    "deposit_with_reorg",
     "payload_timeliness",
     "payload_data_availability",
 ];
@@ -231,6 +237,21 @@ impl<E: Preset> SignatureVerifier<E> for Transition<'_> {
     }
 }
 
+/// The vectors run with all data available: the format has no availability input for an
+/// `execution_payload` step.
+impl DataAvailabilityCheck for Transition<'_> {
+    fn is_data_available(&self, _: Root) -> DataAvailability {
+        DataAvailability::Available
+    }
+}
+
+/// The engine of the pyspec (`NoopExecutionEngine`) accepts each payload.
+impl<E: Preset> ExecutionEngine<E> for Transition<'_> {
+    fn verify_and_notify_new_payload(&self, _: &NewPayloadRequestRef<'_, E>) -> PayloadImport {
+        PayloadImport::Valid
+    }
+}
+
 /// Runs one entry of `steps.yaml`, and gives the number of checks that it ran.
 fn apply_step<E: Preset>(
     reads: &Reads,
@@ -277,6 +298,14 @@ fn apply_step<E: Preset>(
             on_attester_slashing(store, provider, &slashing)
         })
         .map(|()| 0)
+    } else if keys.contains(&"execution_payload") {
+        only("execution_payload", &["execution_payload", "valid"])?;
+        let envelope: SignedExecutionPayloadEnvelope<E> =
+            object(reads, case, &step["execution_payload"])?;
+        run_handler(store, "on_execution_payload_envelope", valid, |store| {
+            on_execution_payload_envelope(store, provider, &envelope)
+        })
+        .map(|()| 0)
     } else if keys == ["checks"] {
         let checks = step["checks"]
             .as_hash()
@@ -291,7 +320,7 @@ fn apply_step<E: Preset>(
         Ok(checks.len())
     } else {
         Err(format!(
-            "unsupported step {keys:?}: the runner has only tick, block, attestation, attester_slashing and checks"
+            "unsupported step {keys:?}: the runner has only tick, block, attestation, attester_slashing, execution_payload and checks"
         ))
     }
 }
@@ -395,7 +424,8 @@ fn proves_invalid(e: &Error) -> bool {
         | Error::FutureBlock { .. }
         | Error::NotAfterFinalized { .. }
         | Error::NotFinalizedDescendant { .. }
-        | Error::InvalidAttestation(_) => true,
+        | Error::InvalidAttestation(_)
+        | Error::InvalidEnvelope(_) => true,
         Error::StateTransition(e) | Error::IndexedAttestation(e) => e.proves_invalid(),
         _ => false,
     }

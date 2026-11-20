@@ -24,9 +24,9 @@ use std::collections::BTreeSet;
 /// The BLS checks of fork choice. Fork choice links no BLS library, so the caller verifies the
 /// sets with its own backend.
 ///
-/// Each signer of `sets` is a validator index of `state`, the state that the spec checks the
-/// signature against. Before finality, two branches can give one index different keys, so
-/// the keys must come from `state`.
+/// Each signer of `sets` is a validator index or, for an execution payload envelope, a builder
+/// index of `state`, the state that the spec checks the signature against. Before finality,
+/// two branches can give one index different keys, so the keys must come from `state`.
 pub trait SignatureVerifier<E: Preset> {
     /// `Ok(true)` if every set is valid and `Ok(false)` if one is not, as
     /// [`SignatureBackend::verify_signature_sets`] says. `Err` is no verdict, never a proof.

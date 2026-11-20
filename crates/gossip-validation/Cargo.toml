@@ -1,0 +1,21 @@
+[package]
+name = "gossip-validation"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Gloas gossip validation as pure functions of a Seen set and the fork-choice store: the execution_payload topic. No I/O and no BLS: a signature leaves as a signature set."
+
+[dependencies]
+consensus-types = { path = "../consensus-types" }
+fork-choice = { path = "../fork-choice" }
+# get_domain, builder_key_version and the signature-set types. No blst.
+state-transition = { path = "../state-transition" }
+ssz_types.workspace = true
+tree_hash.workspace = true
+
+[dev-dependencies]
+# Test states, blocks and builders (dev-only: scripts/check-stf-testing.sh).
+state-transition = { path = "../state-transition", features = ["testing"] }
+ethereum_ssz.workspace = true

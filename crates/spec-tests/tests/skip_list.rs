@@ -666,21 +666,14 @@ fn gloas_fork_choice_attestation_cases_are_not_skipped() {
     }
 }
 
-/// The cases of the run handlers with an `execution_payload` step, by preset and handler.
-/// The envelope item removes their skip.
-const PAYLOAD_STEP_CASES: [(&str, &str, &[&str]); 4] = [
+/// The cases of the run handlers whose steps are `tick`, `block`, `attestation`,
+/// `execution_payload` and `checks`, by preset and handler. The runner gives each envelope to
+/// `on_execution_payload_envelope`.
+const ENVELOPE_STEP_CASES: [(&str, &str, &[&str]); 3] = [
     (
         "*",
         "on_block",
         &["on_block_parent_full_accepts_verified_payload"],
-    ),
-    (
-        "*",
-        "get_head",
-        &[
-            "get_head_full_payload_tiebreak",
-            "get_head_empty_payload_tiebreak",
-        ],
     ),
     (
         "*",
@@ -703,9 +696,39 @@ const PAYLOAD_STEP_CASES: [(&str, &str, &[&str]); 4] = [
 ];
 
 #[test]
-fn gloas_fork_choice_cases_with_payload_steps_stay_skipped() {
+fn gloas_fork_choice_cases_with_envelope_steps_are_not_skipped() {
     let skips = committed();
-    for (preset, handler, cases) in PAYLOAD_STEP_CASES {
+    for (preset, handler, cases) in ENVELOPE_STEP_CASES {
+        let presets: &[&str] = if preset == "*" {
+            &["minimal", "mainnet"]
+        } else {
+            &[preset]
+        };
+        for preset in presets {
+            for case in cases {
+                let k = fork_choice_case(preset, handler, case);
+                let skip = skips.skipped_by(&k);
+                assert!(skip.is_none(), "{k} is skipped: {skip:?}");
+            }
+        }
+    }
+}
+
+/// The cases of the run handlers that also need payload attestations from the wire or payload
+/// vote checks, which the runner does not have.
+const PAYLOAD_VOTE_CASES: [(&str, &str, &[&str]); 1] = [(
+    "*",
+    "get_head",
+    &[
+        "get_head_full_payload_tiebreak",
+        "get_head_empty_payload_tiebreak",
+    ],
+)];
+
+#[test]
+fn gloas_fork_choice_cases_with_payload_votes_stay_skipped() {
+    let skips = committed();
+    for (preset, handler, cases) in PAYLOAD_VOTE_CASES {
         let presets: &[&str] = if preset == "*" {
             &["minimal", "mainnet"]
         } else {
@@ -725,10 +748,8 @@ fn other_fork_choice_handlers_and_forks_stay_skipped() {
     let skips = committed();
     for (preset, handler, want) in [
         ("*", "on_payload_attestation_message", "5.14a"),
-        ("*", "on_execution_payload_envelope", "5.14a"),
         ("*", "payload_timeliness", "5.14a"),
         ("*", "payload_data_availability", "5.14a"),
-        ("minimal", "deposit_with_reorg", "5.14a"),
     ] {
         let presets: &[&str] = if preset == "*" {
             &["minimal", "mainnet"]
@@ -772,6 +793,9 @@ fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
             "reorg",
             "withholding",
             "should_apply_proposer_boost",
+            "filter_node_tree_variants",
+            "on_execution_payload_envelope",
+            "deposit_with_reorg",
         ] {
             let k = CaseKey {
                 case: "pyspec_tests/a_new_case".into(),
