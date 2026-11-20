@@ -20,6 +20,10 @@
 //!   genesis: IGNORE;
 //! - the block is the head, or its post-state is already a pre-state: IGNORE;
 //! - the parent has no pre-state: IGNORE;
+//! - the block slot is more than [`PRE_STATE_EPOCHS`] epochs of slots after the slot of the
+//!   parent pre-state: IGNORE. The wall-clock bound does not stop a block at the slot of the
+//!   wall clock on an old pre-state (the anchor stays for good), and the walk from that
+//!   pre-state costs one `process_slot` for each slot;
 //! - `proposer_index` is past the registry of the parent pre-state: INVALID.
 //!
 //! Then it runs [`import_block`] on the pre-state of the parent. The core sends the signature
@@ -34,7 +38,7 @@
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
 
-use super::snapshot::{max_pre_states, Snapshots};
+use super::snapshot::{max_pre_states, Snapshots, PRE_STATE_EPOCHS};
 use crate::import::block::{import_block, NotImported, PayloadImportGate};
 use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
@@ -387,6 +391,13 @@ impl<E: Preset> ChainCore<E> {
         let Some(pre) = self.snapshots.peek(&parent) else {
             return Outcome::Ignored(format!("no pre-state for the parent {parent}"));
         };
+        let window = PRE_STATE_EPOCHS * E::slots_per_epoch();
+        if block.message.slot.saturating_sub(pre.slot) > window {
+            return Outcome::Ignored(format!(
+                "block slot {} is more than {window} slots after the parent state slot {}",
+                block.message.slot, pre.slot
+            ));
+        }
         // The slot loop can add a validator, but not an active one: its activation waits for
         // the finality of a later epoch than the one that added it, and the loop has no new
         // attestations to finalize that epoch. So an index past the registry of the parent is
