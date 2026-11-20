@@ -6,5 +6,5 @@ pub mod snapshot;
 
 pub use actor::{
     queue, AnchorError, ChainCore, CoreQueue, CoreSender, Head, Outcome, Served, SubmitError,
-    DEFAULT_VERIFY_TIMEOUT, MAX_FUTURE_SLOTS,
+    DEFAULT_VERIFY_TIMEOUT, MAX_FUTURE_SLOTS, MAX_REFUSED_ROOTS,
 };

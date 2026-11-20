@@ -3,16 +3,20 @@
 //! A test clock sets the time of the core ([`ChainCore::with_clock`]). The anchor is the
 //! genesis of the pinned minimal Gloas export, so the slot of the wall clock is
 //! `(now - genesis_time) / SLOT_DURATION_MS`. The core must IGNORE a block more than one slot
-//! ahead of that slot, before the slot loop of the transition.
+//! ahead of that slot, before the slot loop of the transition. It must also IGNORE a block more
+//! than `PRE_STATE_EPOCHS` epochs of slots after the slot of its parent state, before the slot
+//! loop, also when the block slot is the slot of the wall clock.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[allow(dead_code)]
 mod support;
 
+use cl_chain::core::snapshot::PRE_STATE_EPOCHS;
 use cl_chain::core::{queue, ChainCore, Head, Outcome};
 use cl_chain::verify::client::UnixClock;
 use consensus_types::gloas::SignedBeaconBlock;
-use consensus_types::Minimal;
+use consensus_types::{EthSpec, Minimal};
+use state_transition::StfError;
 use std::sync::Arc;
 use std::time::Duration;
 use support::{assert_unchanged, fixture, import_one, Answer, FakeVerify, Fixture, QUEUE};
@@ -120,5 +124,69 @@ async fn before_genesis_a_block_is_ignored() {
         "a block before genesis must be IGNORE: {outcome:?}"
     );
     assert!(verify.calls().is_empty());
+    assert_unchanged(&core, anchor, block_root);
+}
+
+/// The anchor is at slot 0, and the wall clock is at the block slot, 2^40. Without a bound on
+/// the distance to the parent, the slot loop runs 2^40 slots, and the core cannot answer in
+/// [`AT_ONCE`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_far_from_its_parent_is_ignored_without_the_slot_loop() {
+    /// The time the core has to answer.
+    const AT_ONCE: Duration = Duration::from_secs(20);
+    let far = 1 << 40;
+    let (core, anchor, mut block) = core_at(|f| slot_start(f, far));
+    block.message.slot = far;
+    let verify = FakeVerify::new(Answer::Valid);
+    let (sender, queue) = queue::<Minimal>(QUEUE);
+    let writer = core
+        .spawn(queue, Arc::clone(&verify), Handle::current())
+        .unwrap();
+    let reply = sender.import(block).unwrap();
+    let served = tokio::time::timeout(AT_ONCE, reply)
+        .await
+        .expect("the core must answer at once: it must not run the slot loop")
+        .unwrap();
+    assert!(
+        matches!(served.outcome, Outcome::Ignored(_)),
+        "a block at the wall-clock slot far from its parent must be IGNORE: {:?}",
+        served.outcome
+    );
+    assert!(
+        verify.calls().is_empty(),
+        "the block must not reach cl-verify"
+    );
+    drop(sender);
+    let core = writer.join().unwrap();
+    assert_eq!(core.head(), anchor, "the head must stay the anchor");
+}
+
+/// At the bound, the block goes on to the proposer check: cl-verify refuses its signature. One
+/// slot past the bound, the core refuses the block before cl-verify.
+#[tokio::test]
+async fn the_parent_distance_bound_is_the_pre_state_window() {
+    let bound = PRE_STATE_EPOCHS * Minimal::slots_per_epoch();
+    let (core, _, mut block) = core_at(|f| slot_start(f, bound));
+    block.message.slot = bound;
+    let (outcome, _, verify) = import_one(core, block, Answer::Invalid).await;
+    assert_eq!(
+        outcome,
+        Outcome::Invalid(StfError::InvalidBlockSignature),
+        "a block at the bound must reach the proposer check"
+    );
+    assert_eq!(verify.calls().len(), 1);
+
+    let (core, anchor, mut block) = core_at(|f| slot_start(f, bound + 1));
+    block.message.slot = bound + 1;
+    let block_root = block.message.tree_hash_root();
+    let (outcome, core, verify) = import_one(core, block, Answer::Valid).await;
+    assert!(
+        matches!(outcome, Outcome::Ignored(_)),
+        "a block one slot past the bound must be IGNORE: {outcome:?}"
+    );
+    assert!(
+        verify.calls().is_empty(),
+        "the block must not reach cl-verify"
+    );
     assert_unchanged(&core, anchor, block_root);
 }

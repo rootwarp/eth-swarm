@@ -61,6 +61,10 @@ pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(4);
 /// tighter, but it is for gossip validation, and no code reads that config value yet.
 pub const MAX_FUTURE_SLOTS: u64 = 1;
 
+/// The most roots of refused blocks that the core keeps \[est\]. Past it, the root refused
+/// first goes.
+pub const MAX_REFUSED_ROOTS: usize = 1024;
+
 /// The last block the core committed, or the anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Head {

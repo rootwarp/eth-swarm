@@ -37,6 +37,10 @@ pub enum Answer {
     Never,
     /// `VERIFY_STATUS_VALID`, but only after two deadlines.
     Late,
+    /// `VERIFY_STATUS_VALID` after this wait, for each call.
+    ValidAfter(Duration),
+    /// `VERIFY_STATUS_VALID` at the deadline of the call, not before.
+    AtDeadline,
 }
 
 /// One call to the fake cl-verify: when it came, and its deadline.
@@ -89,6 +93,14 @@ impl BlsVerifier for FakeVerify {
             Answer::Never => std::future::pending().await,
             Answer::Late => {
                 tokio::time::sleep(VERIFY_TIMEOUT * 2).await;
+                BlsOutcome::Valid
+            }
+            Answer::ValidAfter(wait) => {
+                tokio::time::sleep(wait).await;
+                BlsOutcome::Valid
+            }
+            Answer::AtDeadline => {
+                tokio::time::sleep_until(deadline).await;
                 BlsOutcome::Valid
             }
         }
