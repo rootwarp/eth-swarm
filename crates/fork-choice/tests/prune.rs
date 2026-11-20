@@ -406,6 +406,66 @@ fn a_block_that_the_store_never_had_is_not_a_known_block() {
     assert!(f.store.block(root_of(&new)).is_some());
 }
 
+/// A comb on the finalized block `a` of slot 1, all in slot 13 of epoch 1. The branch `f5` of
+/// slot 5, `f9` on `f5`, and two leaves of slot 10 on `f9` come first. Their checkpoint block
+/// of epoch 1 is `f5`, not `a`, so they are not viable. Then `c` of slot 9 on `a` justifies and
+/// finalizes epoch 1 with `a`. Then a spine of slots 10 to 13 on `c` has one more leaf on each
+/// spine block. The leaves share their ancestors, so a walk of a leaf passes blocks that the
+/// walk of an earlier leaf passed.
+#[test]
+fn the_leaves_of_a_comb_share_ancestors_and_keep_the_filtered_tree_and_the_head() {
+    let (mut store, anchor_block) = new_store();
+    tick(&mut store, 1);
+    let a = child(&anchor_block, 1, 1);
+    on_block(&mut store, &PLAIN, &a).unwrap();
+    tick(&mut store, 13);
+    let f5 = child(&a.message, 5, 2);
+    let f9 = child(&f5.message, 9, 2);
+    let f10 = [child(&f9.message, 10, 2), child(&f9.message, 10, 3)];
+    for block in [&f5, &f9, &f10[0], &f10[1]] {
+        on_block(&mut store, &PLAIN, block).unwrap();
+    }
+    let checkpoint = Checkpoint {
+        epoch: 1,
+        root: root_of(&a),
+    };
+    let c = child(&a.message, 9, 4);
+    on_block(&mut store, &finalizing(checkpoint.clone()), &c).unwrap();
+    assert_eq!(store.finalized_checkpoint(), &checkpoint);
+    store_target_checkpoint_state(&mut store, &PLAIN, &checkpoint).unwrap();
+    let mut spine = vec![c];
+    let mut leaves = Vec::new();
+    for slot in 10..=13 {
+        let parent = spine.last().unwrap().message.clone();
+        let next = child(&parent, slot, 5);
+        let leaf = child(&parent, slot, 6);
+        for block in [&next, &leaf] {
+            on_block(&mut store, &PLAIN, block).unwrap();
+        }
+        spine.push(next);
+        leaves.push(leaf);
+    }
+    let tip = root_of(spine.last().unwrap());
+    assert_eq!(store.proposer_boost_root(), tip);
+    // The viable nodes are `a`, the spine and its leaves, not the branch on `f5`.
+    let viable: std::collections::HashSet<ForkChoiceNode> = [&a]
+        .into_iter()
+        .chain(&spine)
+        .chain(&leaves)
+        .flat_map(|block| [pending(root_of(block)), empty(root_of(block))])
+        .collect();
+    assert_eq!(get_filtered_node_tree(&store), Ok(viable.clone()));
+    assert_eq!(get_head(&store), Ok(empty(tip)));
+    let before = head_and_weights(&store);
+    // The prune drops the anchor only. The walks then stop at `a`.
+    let time = store.time_ms();
+    on_tick(&mut store, time).unwrap();
+    assert!(store.block(anchor_block.tree_hash_root()).is_none());
+    assert!(store.block(root_of(&f10[1])).is_some());
+    assert_eq!(get_filtered_node_tree(&store), Ok(viable));
+    assert_eq!(head_and_weights(&store), before);
+}
+
 /// The proposer of the parent block of the boost scenario.
 const PROPOSER: u8 = 9;
 
