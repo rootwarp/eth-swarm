@@ -113,6 +113,33 @@ crate "$ws" $stf
 check fail "feature missing (the check would be vacuous)" "$script" "$(workspace missing $stf)" \
   "no testing feature"
 
+# A path crate outside the workspace directory is not a workspace member, but cargo builds it.
+ws="$tmp/outside"
+crate "$ws" $stf "$feature" "$defined"
+crate "$ws" user '[dependencies]' 'helper = { path = "../../outside-ext/helper" }'
+crate "$tmp/outside-ext" helper '[dependencies]' \
+  'state-transition = { path = "../../outside/state-transition", features = ["testing"] }'
+check fail "a path crate outside the workspace enables it" "$script" \
+  "$(workspace outside $stf user)" "enabled by helper (normal dependency)"
+
+ws="$tmp/outside-forward"
+crate "$ws" $stf "$feature" "$defined"
+crate "$ws" user '[dependencies]' 'helper = { path = "../../outside-forward-ext/helper" }'
+crate "$tmp/outside-forward-ext" helper '[dependencies]' \
+  'state-transition = { path = "../../outside-forward/state-transition" }' \
+  '[features]' 'default = ["state-transition/testing"]'
+check fail "a path crate outside the workspace forwards it" "$script" \
+  "$(workspace outside-forward $stf user)" "enabled by helper (feature default)"
+
+ws="$tmp/outside-chain"
+crate "$ws" $stf "$feature" "$defined"
+crate "$ws" user '[dev-dependencies]' 'helper = { path = "../../outside-chain-ext/helper" }'
+crate "$tmp/outside-chain-ext" helper '[build-dependencies]' 'inner = { path = "../inner" }'
+crate "$tmp/outside-chain-ext" inner '[dependencies]' \
+  'state-transition = { path = "../../outside-chain/state-transition", features = ["testing"] }'
+check fail "a path crate outside the workspace enables it through another one" "$script" \
+  "$(workspace outside-chain $stf user)" "enabled by inner (normal dependency)"
+
 check pass "real workspace" "$script" "$repo/Cargo.toml" "testing OK"
 
 echo "# $passed passed, $failed failed"
