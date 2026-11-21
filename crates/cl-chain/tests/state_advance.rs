@@ -389,6 +389,9 @@ async fn a_later_import_starts_from_a_kept_state_of_its_parent() {
         .expect("the walk must keep the state at the end of its last full epoch");
     assert!(late_slot - kept.slot <= cap());
 
+    // The walk of the second import spends the admission budget of its slot. The third import
+    // comes one slot later.
+    let core = core.with_clock(wall.at(late_slot + 1));
     let (outcome, core, verify) = import_one(core, late.clone(), Answer::Valid).await;
     assert_eq!(
         outcome,
@@ -733,6 +736,138 @@ async fn a_deadline_before_the_walk_is_ignored_and_not_kept() {
         committed(&block),
         "the block must be able to come again"
     );
+}
+
+#[tokio::test]
+async fn one_slot_of_the_core_clock_admits_eight_epochs_of_walk() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    // A walk of eight epochs from the anchor. The next block then needs one more epoch from the
+    // state that the walk keeps at slot 63.
+    let first_slot = cap();
+    let next_slot = cap() + 1;
+    let (first, _) = moved(&f.block, &anchor, first_slot, &f.config);
+    let (next, _) = moved(&f.block, &anchor, next_slot, &f.config);
+    let next_root = next.message.tree_hash_root();
+    let core = f.core.with_clock(wall.at(first_slot));
+    let (outcome, core, _) = import_one(core, first.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&first));
+
+    let verify = FakeVerify::new(Answer::Valid);
+    let watched = import_watched(
+        core,
+        next.clone(),
+        Arc::clone(&verify),
+        &verify,
+        &Waiting::default(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(watched.outcome, Some(Outcome::Ignored(_))),
+        "the budget of the clock slot is spent: {:?}",
+        watched.outcome
+    );
+    assert!(watched.walk.is_empty(), "the core must not start the walk");
+    assert_eq!(
+        verify.calls(),
+        vec![vec![early_set(&anchor, &next, &f.config)]],
+        "only the proposer set before the walk must go to cl-verify"
+    );
+    let core = watched.core;
+    assert!(
+        !core.is_refused(&next_root),
+        "the core must not keep the refusal of a spent budget"
+    );
+    assert_eq!(core.head(), head_of(&first));
+
+    // One slot later, the budget is full again.
+    let core = core.with_clock(wall.at(next_slot));
+    let (outcome, core, _) = import_one(core, next.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&next));
+    assert_eq!(core.head(), head_of(&next));
+}
+
+#[tokio::test]
+async fn two_walks_of_four_epochs_spend_the_admission_budget_of_one_slot() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    let now = 4 * epoch_slots() + 1;
+    let core = f.core.with_clock(wall.at(now));
+    // An import in the pre-state window takes nothing from the budget.
+    let first = f.block.clone();
+    let first_root = first.message.tree_hash_root();
+    let (outcome, core, _) = import_one(core, first.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&first));
+    let parent = core.state(&first_root).unwrap().clone();
+    // Four epochs from the anchor, and four epochs from the slot 1 block.
+    let (from_anchor, _) = moved(&f.block, &anchor, 4 * epoch_slots(), &f.config);
+    let (from_first, _) = moved(&export_block(2), &parent, now, &f.config);
+    // One epoch from the state that the second walk keeps at slot 31.
+    let (last, _) = moved(&export_block(2), &parent, now + 1, &f.config);
+    let last_root = last.message.tree_hash_root();
+    let (outcome, core, _) = import_one(core, from_anchor.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&from_anchor));
+    let (outcome, core, _) = import_one(core, from_first.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&from_first));
+    assert!(core.advanced_state(&first_root, 4).is_some());
+
+    let verify = FakeVerify::new(Answer::Valid);
+    let watched = import_watched(
+        core,
+        last.clone(),
+        Arc::clone(&verify),
+        &verify,
+        &Waiting::default(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(watched.outcome, Some(Outcome::Ignored(_))),
+        "the budget of the clock slot is spent: {:?}",
+        watched.outcome
+    );
+    assert!(watched.walk.is_empty(), "the core must not start the walk");
+    assert_eq!(verify.calls().len(), 1, "only the proposer set");
+    let core = watched.core;
+    assert!(!core.is_refused(&last_root));
+    assert_eq!(core.head(), head_of(&from_first));
+
+    // One slot later, the budget is full again.
+    let core = core.with_clock(wall.at(now + 1));
+    let (outcome, _, _) = import_one(core, last.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&last));
+}
+
+#[tokio::test]
+async fn a_block_past_the_cap_or_with_a_bad_signature_spends_no_admission_budget() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    let mut core = f.core.with_clock(wall.at(cap()));
+    // Past the cap from the anchor: IGNORE before cl-verify.
+    let mut far = f.block.clone();
+    far.message.slot = cap() + 1;
+    for _ in 0..3 {
+        let (outcome, next, verify) = import_one(core, far.clone(), Answer::Valid).await;
+        assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+        assert!(verify.calls().is_empty());
+        core = next;
+    }
+    // A bad signature: INVALID before the walk.
+    let (block, _) = moved(&f.block, &anchor, cap(), &f.config);
+    for byte in 1..4 {
+        let mut bad = block.clone();
+        bad.signature[10] ^= byte;
+        let (outcome, next, _) = import_one(core, bad, Answer::Invalid).await;
+        assert_eq!(outcome, Outcome::Invalid(StfError::InvalidBlockSignature));
+        core = next;
+    }
+    // The full budget of the slot is still there: a walk of eight epochs.
+    let (outcome, _, _) = import_one(core, block.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&block));
 }
 
 /// The fixture with an anchor state that `edit` changed. The anchor block gets the new state
