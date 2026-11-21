@@ -18,6 +18,7 @@ mod el;
 #[allow(dead_code)]
 mod support;
 
+use cl_chain::core::snapshot::max_pre_states;
 use cl_chain::core::{ChainCore, Head, Outcome};
 use cl_chain::engine::client::FcuSender;
 use cl_chain::engine::fcu::{
@@ -31,7 +32,9 @@ use el::{
     block_item, commit_all, envelope, full_child, hash, invalid_on, payload_block, ready, root,
     step, Block, El,
 };
-use fork_choice::testing::set_finalized_checkpoint;
+use fork_choice::get_head;
+use fork_choice::testing::{remove_checkpoint_state, set_finalized_checkpoint};
+use std::cmp::Reverse;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{fixture, Answer, FakeVerify, Fixture};
@@ -243,6 +246,148 @@ async fn no_forkchoice_update_is_sent_while_the_head_safe_and_finalized_hashes_s
     assert_eq!(core.head(), head_of(&c, PayloadStatus::Empty));
     assert_eq!(sink.sent().len(), 2, "nothing changed for the EL");
     assert_eq!(core.forkchoice_sent(), sent);
+}
+
+/// When `get_head` fails, the head stays and no forkchoiceUpdated is sent: the old head with the
+/// safe and finalized hashes that the store has now is no fork choice of the store. Here test
+/// seams take the state of the justified checkpoint out of the store, which `get_head` reads,
+/// and finalize `c`, before the envelope of `c` imports. The prune at finality reads only the
+/// finalized checkpoint, so it still runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_forkchoice_update_is_sent_when_fork_choice_gives_no_head() {
+    let el = El::start().await;
+    let f = fixture();
+    let (p, p_post) = payload_block(&f, 0x51, 1);
+    let (c, c_post) = full_child(&f, &p, &p_post, 0x52);
+    let Fixture { core, config, .. } = f;
+    let sink = Sink::default();
+    let verify = FakeVerify::new(Answer::Valid);
+    let core = ready(core, &el).with_forkchoice_sink(sink.clone(), CUSTODY);
+    let core = commit_all(core, &[&p], &verify).await;
+    let (outcome, core) = step(core, envelope(&config, &p, &p_post), &verify).await;
+    assert!(
+        matches!(outcome, Outcome::PayloadVerified { .. }),
+        "{outcome:?}"
+    );
+    let core = commit_all(core, &[&c], &verify).await;
+    let head = core.head();
+    assert_eq!(head, head_of(&c, PayloadStatus::Empty));
+    let sent = sink.sent();
+    assert_eq!(sent.len(), 2, "the commit of p and its envelope");
+    let forkchoice_sent = core.forkchoice_sent();
+    assert_eq!(forkchoice_sent.as_ref(), sent.last());
+
+    let justified = core.fork_choice().justified_checkpoint().clone();
+    let finalized = Checkpoint {
+        epoch: 1,
+        root: root(&c),
+    };
+    let core = core.with_fork_choice(|store| {
+        remove_checkpoint_state(store, &justified);
+        set_finalized_checkpoint(store, finalized);
+    });
+    assert!(
+        get_head(core.fork_choice()).is_err(),
+        "fork choice must give no head"
+    );
+    let (outcome, core) = step(core, envelope(&config, &c, &c_post), &verify).await;
+    assert_eq!(
+        outcome,
+        Outcome::PayloadVerified {
+            block_root: root(&c)
+        }
+    );
+    assert_eq!(core.head(), head, "the head stays");
+    assert_eq!(
+        sink.sent(),
+        sent,
+        "no forkchoiceUpdated may pair the old head with the new finalized hash"
+    );
+    assert_eq!(core.forkchoice_sent(), forkchoice_sent);
+    assert_eq!(
+        core.execution_statuses().status(&hash(0x51)),
+        None,
+        "the prune at the new finalized checkpoint runs"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A head whose pre-state left the LRU.
+
+/// `get_head` reads the fork choice store, not the pre-state LRU of the core, so the head can be
+/// a block whose pre-state the LRU dropped. The store still holds that post-state, and the core
+/// reads it from there: the envelope of the head imports and moves the head to its FULL node,
+/// and a child on that payload commits and becomes the head. The head block sent again is still
+/// IGNORE, and its envelope sent again does not reach the EL again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_head_whose_pre_state_left_the_lru_imports_its_envelope_and_a_child() {
+    let el = El::start().await;
+    let f = fixture();
+    // One sibling on the anchor's FULL payload more than the LRU holds besides the anchor. With
+    // no votes and no proposer boost (the system clock is far past slot 1), the highest root
+    // wins: committed first, it is the least recently used when the last sibling commits.
+    let lru = u8::try_from(max_pre_states::<Minimal>()).unwrap();
+    let mut siblings: Vec<_> = (1..=lru)
+        .map(|graffiti| payload_block(&f, 0x41, graffiti))
+        .collect();
+    siblings.sort_by_cached_key(|(block, _)| Reverse(root(block)));
+    let (head, head_post) = siblings[0].clone();
+    let (child, _) = full_child(&f, &head, &head_post, 0x42);
+    let Fixture { core, config, .. } = f;
+    let sink = Sink::default();
+    let verify = FakeVerify::new(Answer::Valid);
+    let core = ready(core, &el).with_forkchoice_sink(sink.clone(), CUSTODY);
+    let blocks: Vec<&Block> = siblings.iter().map(|(block, _)| block).collect();
+    let core = commit_all(core, &blocks, &verify).await;
+    assert_eq!(core.head(), head_of(&head, PayloadStatus::Empty));
+    assert!(
+        core.state(&root(&head)).is_none(),
+        "the LRU dropped the pre-state of the head"
+    );
+    assert!(
+        core.fork_choice().block_state(root(&head)).is_some(),
+        "the fork choice store still holds it"
+    );
+
+    let (outcome, core) = step(core, block_item(&head), &verify).await;
+    assert!(
+        matches!(outcome, Outcome::Ignored(_)),
+        "a committed block sent again must be IGNORE: {outcome:?}"
+    );
+    // Both steps read the pre-state of the head, which only the store holds.
+    let (verified, core) = step(core, envelope(&config, &head, &head_post), &verify).await;
+    let full_head = core.head();
+    let el_head = sink.sent().last().map(|args| args.head_block_hash);
+    let (committed, core) = step(core, block_item(&child), &verify).await;
+    assert_eq!(
+        [verified, committed],
+        [
+            Outcome::PayloadVerified {
+                block_root: root(&head)
+            },
+            Outcome::Committed {
+                block_root: root(&child),
+                state_root: child.message.state_root
+            },
+        ],
+        "the envelope of the head and a child on its payload must import"
+    );
+    assert_eq!(full_head, head_of(&head, PayloadStatus::Full));
+    assert_eq!(el_head, Some(hash(0x41)), "the EL head is its payload");
+    assert_eq!(core.head(), head_of(&child, PayloadStatus::Empty));
+
+    let payloads = el.new_payloads().len();
+    let (outcome, core) = step(core, envelope(&config, &head, &head_post), &verify).await;
+    assert!(
+        matches!(outcome, Outcome::Ignored(_)),
+        "a verified payload: {outcome:?}"
+    );
+    assert_eq!(
+        el.new_payloads().len(),
+        payloads,
+        "its envelope sent again must not reach the EL"
+    );
+    assert_eq!(core.head(), head_of(&child, PayloadStatus::Empty));
 }
 
 // ---------------------------------------------------------------------------------------------
