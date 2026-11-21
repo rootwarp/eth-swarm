@@ -895,6 +895,65 @@ async fn a_block_past_the_cap_or_with_a_bad_signature_spends_no_admission_budget
     assert_eq!(outcome, committed(&block));
 }
 
+/// Commits `block` on `core` with a fake cl-verify that answers VALID.
+async fn commit(core: ChainCore<Minimal>, block: &Block) -> ChainCore<Minimal> {
+    let (outcome, core, _) = import_one(core, block.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(block));
+    core
+}
+
+#[tokio::test]
+async fn the_kept_states_of_a_parent_go_when_its_pre_state_goes() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    let now = window() + 6;
+    let core = f.core.with_clock(wall.at(now));
+    // A walk from the slot 1 block, and a walk from the anchor. Each keeps the states at the
+    // ends of epochs 0 and 1.
+    let first = f.block.clone();
+    let first_root = first.message.tree_hash_root();
+    let core = commit(core, &first).await;
+    let parent = core.state(&first_root).unwrap().clone();
+    let (child, _) = moved(&export_block(2), &parent, now, &f.config);
+    let core = commit(core, &child).await;
+    let (far, _) = moved(&f.block, &anchor, window() + 4, &f.config);
+    let mut core = commit(core, &far).await;
+    for epoch in 1..=2 {
+        assert!(core.advanced_state(&first_root, epoch).is_some());
+        assert!(core.advanced_state(&f.anchor.block_root, epoch).is_some());
+    }
+
+    // Children of the anchor in the pre-state window fill the pre-states. The pre-state of the
+    // slot 1 block is the least recently used, so it goes first.
+    let mut gone = false;
+    for slot in 2..=window() {
+        let (block, _) = moved(&f.block, &anchor, slot, &f.config);
+        core = commit(core, &block).await;
+        if core.state(&first_root).is_none() {
+            gone = true;
+            break;
+        }
+        for epoch in 1..=2 {
+            assert!(
+                core.advanced_state(&first_root, epoch).is_some(),
+                "slot {slot}: the kept states of a parent with a pre-state must stay"
+            );
+        }
+    }
+    assert!(gone, "the pre-state of the slot 1 block must go");
+    for epoch in 1..=2 {
+        assert!(
+            core.advanced_state(&first_root, epoch).is_none(),
+            "epoch {epoch}: a kept state of a parent without a pre-state must go"
+        );
+        assert!(
+            core.advanced_state(&f.anchor.block_root, epoch).is_some(),
+            "epoch {epoch}: the kept states of the anchor must stay"
+        );
+    }
+}
+
 /// The fixture with an anchor state that `edit` changed. The anchor block gets the new state
 /// root, and the slot 1 block has the new anchor as its parent.
 fn anchor_with(edit: impl FnOnce(&mut State)) -> Fixture {
