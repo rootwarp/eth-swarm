@@ -29,12 +29,13 @@ use cl_chain::engine::fcu::{
 };
 use cl_chain::engine::verdict::ExecutionStatus;
 use consensus_types::gloas::{BeaconState, Checkpoint};
-use consensus_types::primitives::Hash32;
+use consensus_types::primitives::{Bytes32, Hash32};
 use consensus_types::Minimal;
 use el::{
     block_item, commit_all, envelope, full_child, hash, invalid_on, payload_block, ready, root,
-    step, Block, El, Item,
+    sealed, step, Block, El, Item,
 };
+use ethswarm_proto::engine as pb;
 use fork_choice::testing::{remove_checkpoint_state, set_finalized_checkpoint};
 use fork_choice::{get_head, is_payload_verified};
 use std::cmp::Reverse;
@@ -52,12 +53,14 @@ const WAIT: Duration = Duration::from_secs(20);
 const QUIET: Duration = Duration::from_millis(300);
 
 /// Records each forkchoiceUpdated the core sends and whether the core halted it, and forwards
-/// both to an `FcuSender` if it has one. The core takes the sender's answers through it.
+/// both to an `FcuSender` if it has one. The core takes the sender's answers through it, after
+/// an answer a test gives it ([`Sink::script`]).
 #[derive(Clone, Default)]
 struct Sink {
     sent: Arc<Mutex<Vec<ForkchoiceArgs>>>,
     halted: Arc<AtomicBool>,
     fcu: Option<Arc<FcuSender>>,
+    script: Arc<Mutex<Option<FcuOutcome>>>,
 }
 
 impl Sink {
@@ -75,6 +78,11 @@ impl Sink {
 
     fn halted(&self) -> bool {
         self.halted.load(Ordering::SeqCst)
+    }
+
+    /// The answer the core takes next, once: one the mock EL cannot give.
+    fn script(&self, outcome: FcuOutcome) {
+        *self.script.lock().unwrap() = Some(outcome);
     }
 
     /// Waits until the sender has the EL's answer to `args`.
@@ -99,6 +107,9 @@ impl ForkchoiceSink for Sink {
     }
 
     fn take_outcome(&self) -> Option<FcuOutcome> {
+        if let Some(outcome) = self.script.lock().unwrap().take() {
+            return Some(outcome);
+        }
         self.fcu.as_ref()?.take_outcome()
     }
 
@@ -146,6 +157,18 @@ fn anchor_bid(core: &ChainCore<Minimal>, anchor: &Head) -> Bid {
         block_hash: bid.block_hash,
         parent_block_hash: bid.parent_block_hash,
     }
+}
+
+/// A sibling of `block` with the same bid and so the same payload: another graffiti, on the same
+/// parent, whose post-state is `parent_post`. Sealed, with its post-state.
+fn sibling(
+    config: &network_config::ChainConfig,
+    block: &Block,
+    parent_post: &BeaconState<Minimal>,
+) -> (Block, BeaconState<Minimal>) {
+    let mut block = block.clone();
+    block.message.body.graffiti = Bytes32::repeat_byte(0x5c);
+    sealed(parent_post, block, config)
 }
 
 /// The head node of `block` with `payload_status`.
@@ -926,6 +949,185 @@ async fn an_invalid_below_the_finalized_execution_hash_is_an_el_contradiction() 
         "the invalid payload stays recorded"
     );
     assert!(t.sink.halted());
+    assert_eq!(seen(&core, &t.sink), before, "the head and the store stay");
+    assert!(is_payload_verified(core.fork_choice(), root(p)));
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(t.el.forkchoice_updates().len(), updates);
+}
+
+/// The `later` core with `c` committed, and its payload `0x32`, which the EL takes
+/// optimistically, imported. With `twin`, a sibling of `c` with the same payload is committed
+/// with `c`, and returned. If the head is the FULL node of `c`, the EL answers `fcu_answer` to its
+/// forkchoiceUpdated, and the core has not taken the answer yet. Then fork choice finalizes `c`
+/// (a test seam stands for a finalizing chain): the finalized execution hash, the
+/// `finalizedBlockHash` the core sends, is the payload of `p`, `0x31`.
+async fn finalized_on_the_payload_of_p(
+    fcu_answer: Reply,
+    twin: bool,
+) -> (Later, Option<(Block, BeaconState<Minimal>)>) {
+    let mut t = later(Reply::Syncing, |_| Reply::Syncing).await;
+    let (c, c_post) = &t.c;
+    let twin = twin.then(|| sibling(&t.config, c, &t.p.1));
+    let blocks: Vec<&Block> = [c]
+        .into_iter()
+        .chain(twin.as_ref().map(|(block, _)| block))
+        .collect();
+    let core = commit_all(t.core, &blocks, &t.verify).await;
+    t.el.answer(hash(0x32), Reply::Syncing);
+    t.el.mock.on_forkchoice_updated(hash(0x32).0, fcu_answer);
+    let (outcome, core) = step(core, envelope(&t.config, c, c_post), &t.verify).await;
+    assert_eq!(
+        outcome,
+        Outcome::PayloadVerified {
+            block_root: root(c)
+        }
+    );
+    if core.head() == head_of(c, PayloadStatus::Full) {
+        let full = *t.sink.sent().last().unwrap();
+        assert_eq!(full.head_block_hash, hash(0x32));
+        t.sink.answered(&full).await;
+    }
+    let finalized = Checkpoint {
+        epoch: 1,
+        root: root(c),
+    };
+    t.core = core.with_fork_choice(|store| set_finalized_checkpoint(store, finalized));
+    assert_eq!(
+        bid(c).parent_block_hash,
+        hash(0x31),
+        "the finalized execution hash"
+    );
+    (t, twin)
+}
+
+/// After an INVALID whose `latestValidHash` is the finalized execution hash `0x31`: no EL
+/// contradiction and no halt, the payload of `c` is Invalid and the store no longer has it
+/// verified, the head moves from `before` to the EMPTY node of `c`, and the core sends one
+/// forkchoiceUpdated with it after the `sent` before, which reaches the EL.
+async fn moved_off_the_payload_of_c(
+    el: &El,
+    sink: &Sink,
+    c: &Block,
+    core: &ChainCore<Minimal>,
+    before: Head,
+    sent: usize,
+) {
+    let statuses = core.execution_statuses();
+    assert!(
+        !statuses.el_contradiction(),
+        "a latestValidHash equal to the finalized execution hash is honest"
+    );
+    assert!(!sink.halted(), "the sender must not halt");
+    assert_eq!(statuses.status(&hash(0x32)), Some(ExecutionStatus::Invalid));
+    assert!(
+        !is_payload_verified(core.fork_choice(), root(c)),
+        "the store must no longer have the payload of c verified"
+    );
+    assert_ne!(core.head(), before, "the head moves");
+    assert_eq!(core.head(), head_of(c, PayloadStatus::Empty));
+    let all = sink.sent();
+    assert_eq!(all.len(), sent + 1, "one forkchoiceUpdated: {all:?}");
+    let last = all[sent];
+    assert_eq!(
+        (last.head_block_hash, last.finalized_block_hash),
+        (hash(0x31), hash(0x31))
+    );
+    assert_eq!(core.forkchoice_sent(), Some(last));
+    el_sees(el, &last).await;
+}
+
+/// The EL answers INVALID to the forkchoiceUpdated of the FULL head `c`, with the finalized
+/// execution hash `0x31` as `latestValidHash`. That is the ordinary boundary: the payload of `c`,
+/// above it, is invalid, and finality is not contradicted. At its next turn the core records it,
+/// and the head moves off the payload of `c` with one forkchoiceUpdated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_fcu_invalid_whose_latest_valid_hash_is_the_finalized_execution_hash_moves_the_head() {
+    let at_finalized = Reply::Invalid {
+        lvh: Some(hash(0x31).0),
+    };
+    let (t, _) = finalized_on_the_payload_of_p(at_finalized, false).await;
+    let (c, _) = &t.c;
+    let before = t.core.head();
+    assert_eq!(before, head_of(c, PayloadStatus::Full));
+    let sent = t.sink.sent().len();
+
+    let (outcome, core) = step(t.core, Item::Gossip, &t.verify).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    moved_off_the_payload_of_c(&t.el, &t.sink, c, &core, before, sent).await;
+}
+
+/// The same boundary through newPayload. A sibling of `c` with the same payload `0x32` is
+/// committed with `c`. The newPayload of its envelope is INVALID with the finalized execution
+/// hash `0x31` as `latestValidHash`: the envelope is refused, and the head moves off the payload
+/// of `c` with one forkchoiceUpdated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_payload_invalid_whose_latest_valid_hash_is_the_finalized_execution_hash_moves_the_head(
+) {
+    let (t, twin) = finalized_on_the_payload_of_p(Reply::Syncing, true).await;
+    let (c, _) = &t.c;
+    let (twin, twin_post) = twin.unwrap();
+    assert_eq!(bid(&twin), bid(c), "the same payload");
+    assert_ne!(root(&twin), root(c));
+    let before = t.core.head();
+    let sent = t.sink.sent().len();
+
+    t.el.answer(
+        hash(0x32),
+        Reply::Invalid {
+            lvh: Some(hash(0x31).0),
+        },
+    );
+    let (outcome, core) = step(t.core, envelope(&t.config, &twin, &twin_post), &t.verify).await;
+    assert!(
+        matches!(outcome, Outcome::InvalidEnvelope(_)),
+        "{outcome:?}"
+    );
+    moved_off_the_payload_of_c(&t.el, &t.sink, c, &core, before, sent).await;
+}
+/// INVALID_BLOCK_HASH is a newPayload status, which a forkchoiceUpdated must not answer. Here
+/// the answer to the forkchoiceUpdated of the FULL head `p` is INVALID_BLOCK_HASH (the mock EL
+/// gives no such answer, so the test sink does): a protocol fault, and so an EL contradiction.
+/// At its next turn the core halts the sender and changes nothing. It records nothing for the
+/// head hash (the payload of `p` stays Optimistic), the store still has that payload verified,
+/// the head stays, and no forkchoiceUpdated is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_fcu_invalid_block_hash_is_a_protocol_fault_that_halts_and_records_nothing() {
+    let t = later(Reply::Syncing, |_| Reply::Syncing).await;
+    let (p, _) = &t.p;
+    let fcu = t.sink.fcu.as_ref().unwrap();
+    let mut answer = fcu
+        .take_outcome()
+        .expect("the answer to the forkchoiceUpdated of p");
+    assert_eq!(answer.args.head_block_hash, hash(0x31));
+    answer.response.status = Some(pb::PayloadStatus {
+        status: pb::PayloadStatusKind::InvalidBlockHash as i32,
+        latest_valid_hash: Vec::new(),
+        validation_error: String::new(),
+    });
+    t.sink.script(answer);
+    let recorded = t.core.execution_statuses().len();
+    assert_eq!(
+        t.core.execution_statuses().status(&hash(0x31)),
+        Some(ExecutionStatus::Optimistic)
+    );
+    el_sees(&t.el, t.sink.sent().last().unwrap()).await;
+    let updates = t.el.forkchoice_updates().len();
+    let before = seen(&t.core, &t.sink);
+
+    let (outcome, core) = step(t.core, Item::Gossip, &t.verify).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    let statuses = core.execution_statuses();
+    assert!(
+        statuses.el_contradiction(),
+        "INVALID_BLOCK_HASH to a forkchoiceUpdated is a protocol fault"
+    );
+    assert!(t.sink.halted(), "the fault halts the sender");
+    assert_eq!(
+        statuses.status(&hash(0x31)),
+        Some(ExecutionStatus::Optimistic),
+        "nothing is recorded for the head hash"
+    );
+    assert_eq!(statuses.len(), recorded);
     assert_eq!(seen(&core, &t.sink), before, "the head and the store stay");
     assert!(is_payload_verified(core.fork_choice(), root(p)));
     tokio::time::sleep(QUIET).await;

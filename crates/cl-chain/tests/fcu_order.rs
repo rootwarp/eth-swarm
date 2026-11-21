@@ -1,7 +1,8 @@
 //! [`FcuSender`] against a mock `ethswarm.engine.v1` server on a Unix socket: latest wins after
 //! a stall, `seq` keeps increasing across a reconnect, the request carries the custody bits and
-//! no payload attributes, a halted sender sends nothing more, and the caller takes each answer
-//! once. Also the `[chain.engine]` config of its socket.
+//! no payload attributes, a halted sender sends nothing more, the caller takes each answer once,
+//! and a later answer does not replace an unread INVALID. Also the `[chain.engine]` config of its
+//! socket.
 
 use cl_chain::engine::client::{EngineSeq, FcuErrorKind, FcuMetrics, FcuSender, BACKOFF_MIN};
 use cl_chain::engine::fcu::{custody_column_bits, ForkchoiceArgs, ForkchoiceSink};
@@ -11,6 +12,7 @@ use consensus_types::primitives::{Hash32, U256};
 use ethswarm_proto::engine as pb;
 use pb::engine_service_server::{EngineService, EngineServiceServer};
 use prometheus_client::registry::Registry;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,12 +24,14 @@ use tonic::{Request, Response, Status};
 const WAIT: Duration = Duration::from_secs(20);
 
 /// A mock engine.v1 server: it records each `ForkchoiceUpdated` request, reports it on
-/// `arrived`, and answers VALID once `gate` gives it a permit (a stalled EL until then).
+/// `arrived`, and answers once `gate` gives it a permit (a stalled EL until then): VALID, or the
+/// status [`MockEngine::answer`] set for the head hash.
 #[derive(Clone)]
 struct MockEngine {
     seen: Arc<Mutex<Vec<pb::ForkchoiceUpdatedRequest>>>,
     arrived: mpsc::UnboundedSender<pb::ForkchoiceUpdatedRequest>,
     gate: Arc<Semaphore>,
+    statuses: Arc<Mutex<HashMap<Vec<u8>, pb::PayloadStatusKind>>>,
 }
 
 impl MockEngine {
@@ -37,8 +41,14 @@ impl MockEngine {
             seen: Arc::default(),
             arrived,
             gate: Arc::new(Semaphore::new(permits)),
+            statuses: Arc::default(),
         };
         (mock, rx)
+    }
+
+    /// Answers `status` to a call with the head `head`. INVALID carries a `latestValidHash`.
+    fn answer(&self, head: Hash32, status: pb::PayloadStatusKind) {
+        self.statuses.lock().unwrap().insert(head.to_vec(), status);
     }
 
     fn heads(&self) -> Vec<Vec<u8>> {
@@ -64,11 +74,22 @@ impl EngineService for MockEngine {
         self.seen.lock().unwrap().push(req.clone());
         let _ = self.arrived.send(req.clone());
         self.gate.acquire().await.unwrap().forget();
+        let status = self
+            .statuses
+            .lock()
+            .unwrap()
+            .get(&req.head_block_hash)
+            .copied();
+        let (status, latest_valid_hash) = match status.unwrap_or(pb::PayloadStatusKind::Valid) {
+            pb::PayloadStatusKind::Valid => (pb::PayloadStatusKind::Valid, req.head_block_hash),
+            pb::PayloadStatusKind::Invalid => (pb::PayloadStatusKind::Invalid, hash(0x0f).to_vec()),
+            other => (other, Vec::new()),
+        };
         Ok(Response::new(pb::ForkchoiceUpdatedResponse {
             seq: req.seq,
             status: Some(pb::PayloadStatus {
-                status: pb::PayloadStatusKind::Valid as i32,
-                latest_valid_hash: req.head_block_hash,
+                status: status as i32,
+                latest_valid_hash,
                 validation_error: String::new(),
             }),
             payload_id: Vec::new(),
@@ -331,6 +352,44 @@ async fn the_caller_takes_each_answer_once() {
         let taken = sender.take_outcome().expect("a new answer");
         assert_eq!((taken.seq, taken.args), (call.seq, args(n)));
         assert_eq!(sender.take_outcome(), None, "the same answer again");
+    }
+    server.stop().await;
+}
+
+/// An INVALID or INVALID_BLOCK_HASH answer that the caller has not taken yet stays until it is
+/// taken: a later answer (VALID, SYNCING) that comes first does not replace it. The caller takes
+/// it first, then the later answer, the latest, and then none.
+#[tokio::test]
+async fn a_later_answer_does_not_replace_an_unread_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine.sock");
+    let (mock, mut arrived) = MockEngine::new(Semaphore::MAX_PERMITS);
+    mock.answer(hash(1), pb::PayloadStatusKind::Invalid);
+    mock.answer(hash(3), pb::PayloadStatusKind::InvalidBlockHash);
+    mock.answer(hash(4), pb::PayloadStatusKind::Syncing);
+    let server = Server::start(&path, mock);
+    let (sender, _metrics, _registry) = sender(&path);
+    for (bad, kind, later) in [
+        (1, pb::PayloadStatusKind::Invalid, 2),
+        (3, pb::PayloadStatusKind::InvalidBlockHash, 4),
+    ] {
+        let mut seqs = Vec::new();
+        for n in [bad, later] {
+            sender.send(args(n));
+            let call = next(&mut arrived).await;
+            answered(&sender, call.seq).await;
+            seqs.push(call.seq);
+        }
+        let taken = sender.take_outcome().expect("the unread answer");
+        assert_eq!(
+            (taken.seq, taken.args),
+            (seqs[0], args(bad)),
+            "the later answer replaced the unread {kind:?}"
+        );
+        assert_eq!(taken.response.status.unwrap().status, kind as i32);
+        let taken = sender.take_outcome().expect("the latest answer");
+        assert_eq!((taken.seq, taken.args), (seqs[1], args(later)));
+        assert_eq!(sender.take_outcome(), None, "each answer once");
     }
     server.stop().await;
 }
