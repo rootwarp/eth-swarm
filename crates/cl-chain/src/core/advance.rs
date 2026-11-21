@@ -13,7 +13,9 @@
 //! slot of the wall clock on an old pre-state, so:
 //!
 //! - a start more than [`MAX_ADVANCE_EPOCHS`] epochs of slots before the block is IGNORE at
-//!   once, with no `process_slots`;
+//!   once, with no `process_slots` (`walk_slots`, before the proposer signature of the block);
+//! - the chain core checks the proposer signature before the walk, so a block that its
+//!   proposer did not sign costs no `process_slots`;
 //! - before the walk, and before each epoch boundary, the walk checks the deadline of the
 //!   import, and that the caller of the import still waits for the answer. The deposit
 //!   verdicts of an epoch boundary go to cl-verify with that deadline.
@@ -27,10 +29,13 @@
 //! No refusal of the walk is a proof about the block: each is IGNORE, and the core does not
 //! keep it. The block can import later from a nearer state, or with more time.
 //!
+//! After the walk, `block_proposer` gives the proposer of the block slot from the lookahead of
+//! the advanced state.
+//!
 //! [`PRE_STATE_EPOCHS`]: super::snapshot::PRE_STATE_EPOCHS
 
 use consensus_types::gloas::BeaconState;
-use consensus_types::primitives::{Epoch, Root, Slot};
+use consensus_types::primitives::{Epoch, Root, Slot, ValidatorIndex};
 use state_transition::Preset;
 
 /// The most epochs of slots between the start of a walk and the block \[est\]: 64 slots on
@@ -74,16 +79,20 @@ impl<S> Advanced<S> {
 
     /// The state of `parent` with the latest epoch up to `epoch`, now the most recently used.
     pub fn latest(&mut self, parent: &Root, epoch: Epoch) -> Option<&S> {
-        let at = self
-            .entries
+        let at = self.latest_at(parent, epoch)?;
+        let entry = self.entries.remove(at);
+        self.entries.push(entry);
+        self.entries.last().map(|(_, state)| state)
+    }
+
+    /// The place in `entries` of the state of `parent` with the latest epoch up to `epoch`.
+    fn latest_at(&self, parent: &Root, epoch: Epoch) -> Option<usize> {
+        self.entries
             .iter()
             .enumerate()
             .filter(|(_, ((root, kept), _))| root == parent && *kept <= epoch)
             .max_by_key(|(_, ((_, kept), _))| *kept)
-            .map(|(at, _)| at)?;
-        let entry = self.entries.remove(at);
-        self.entries.push(entry);
-        self.entries.last().map(|(_, state)| state)
+            .map(|(at, _)| at)
     }
 
     /// Keeps `state` as the state of `parent` at the last slot of epoch `epoch - 1`, the most
@@ -106,6 +115,55 @@ impl<S> Advanced<S> {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// The slots between the best start of a walk from `pre`, the pre-state of block `parent`, and
+/// a block at `slot`: the latest state that `advanced` keeps for `parent` before the block,
+/// else `pre`. The order of use does not change. `Err` (why, for the log) if that is more than
+/// [`MAX_ADVANCE_EPOCHS`] epochs of slots: IGNORE, with no walk.
+pub(crate) fn walk_slots<E: Preset>(
+    advanced: &Advanced<BeaconState<E>>,
+    parent: Root,
+    pre: &BeaconState<E>,
+    slot: Slot,
+) -> Result<u64, String> {
+    let epoch_slots = E::slots_per_epoch();
+    let start = advanced
+        .latest_at(&parent, slot / epoch_slots)
+        .map_or(pre.slot, |at| advanced.entries[at].1.slot);
+    let cap = MAX_ADVANCE_EPOCHS.saturating_mul(epoch_slots);
+    let gap = slot.saturating_sub(start);
+    if gap > cap {
+        return Err(format!(
+            "block slot {slot} is more than {cap} slots after the state at slot {start} of the \
+             parent {parent}"
+        ));
+    }
+    Ok(gap)
+}
+
+/// The proposer of the block at `slot` on `state`, a state of the walk before that slot in
+/// the same epoch, or at the last slot of the epoch before. `get_beacon_proposer_index` on
+/// `state` is the proposer of `state.slot`, not of `slot`. So the entry is `slot` minus the
+/// first slot of the epoch of `state`, in `state.proposer_lookahead`. When the block opens an
+/// epoch, that is the entry `SLOTS_PER_EPOCH`: the first proposer of the next epoch, which
+/// `process_epoch` moves to entry 0. `Err` (why, for the log) if `slot` is not after the state,
+/// or the lookahead has no such entry: a fault of the state, not of the block.
+pub(crate) fn block_proposer<E: Preset>(
+    state: &BeaconState<E>,
+    slot: Slot,
+) -> Result<ValidatorIndex, String> {
+    let epoch_start = state.slot - state.slot % E::slots_per_epoch();
+    slot.checked_sub(epoch_start)
+        .filter(|_| slot > state.slot)
+        .and_then(|at| usize::try_from(at).ok())
+        .and_then(|at| state.proposer_lookahead.get(at).copied())
+        .ok_or_else(|| {
+            format!(
+                "the proposer lookahead of the state at slot {} has no proposer of slot {slot}",
+                state.slot
+            )
+        })
 }
 
 /// Advances `pre`, the pre-state of block `parent`, toward a block at `slot` (see the module

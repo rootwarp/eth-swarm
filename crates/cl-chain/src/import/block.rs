@@ -26,6 +26,12 @@
 //! the same backend, before the slot loop of the transition (the gossip order). The transition
 //! then checks it again with the other sets of the block.
 //!
+//! Before the walk of the chain core toward a block far after its parent,
+//! [`check_proposer_signature_in`] checks the proposer signature with the key of the post-state
+//! of the parent and the proposer domain of [`schedule_proposer_domain`]: the fork version that
+//! the network schedule gives for the epoch of the block. It reads no proposer of that state,
+//! and not its `fork`, which a fork in the empty slots would change.
+//!
 //! The pre-state is the post-state of the parent, or that state after [`process_empty_slots`]
 //! to a slot before the block: the walk of the chain core toward a block far after its parent.
 //! The walk sends its deposit verdicts through the same backend.
@@ -38,7 +44,8 @@
 use crate::verify::client::BlsOutcome;
 use crate::verify::pubkey_feed::{builder_signer, BuilderFeed};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{BLSPubkey, Epoch, Hash32, Root, Slot};
+use consensus_types::primitives::{BLSPubkey, Domain, Epoch, Hash32, Root, Slot};
+use consensus_types::signing::{compute_domain, compute_signing_root, DOMAIN_BEACON_PROPOSER};
 use crypto_bls::{eth_aggregate_pubkeys, PublicKey};
 use ethswarm_proto::verify::{BlsSet, KeyNamespace, Signer, VerifyOrigin};
 use network_config::ChainConfig;
@@ -160,6 +167,50 @@ pub fn check_proposer_signature<E: Preset>(
         Ok(()) => Ok(()),
         Err(e) if e.proves_invalid() => Err(NotImported::Invalid(e)),
         Err(e) => Err(NotImported::Ignored(e.to_string())),
+    }
+}
+
+/// `compute_domain(DOMAIN_BEACON_PROPOSER, fork_version, genesis_validators_root)`, where
+/// `fork_version` is the version of the fork that the schedule of `config` gives for `epoch`.
+/// `None` before the first fork of the schedule (Fulu).
+pub fn schedule_proposer_domain(
+    config: &ChainConfig,
+    epoch: Epoch,
+    genesis_validators_root: Root,
+) -> Option<Domain> {
+    let schedule = config.fork_schedule();
+    let fork = schedule.fork_at(epoch)?;
+    Some(compute_domain(
+        DOMAIN_BEACON_PROPOSER,
+        schedule.fork_version(fork),
+        genesis_validators_root,
+    ))
+}
+
+/// Checks the proposer signature of `block` alone, through `verdict`: the registry key of
+/// `proposer_index` in `keys`, over the signing root of the block in `domain`. It reads no
+/// proposer and no fork of `keys`. An INVALID verdict is [`StfError::InvalidBlockSignature`];
+/// no verdict, or an index past the registry of `keys`, is IGNORE.
+pub fn check_proposer_signature_in<E: Preset>(
+    keys: &BeaconState<E>,
+    block: &SignedBeaconBlock<E>,
+    domain: Domain,
+    verdict: &dyn Fn(Vec<BlsSet>) -> BlsOutcome,
+) -> Result<(), NotImported> {
+    let set = SignatureSet::single(
+        SignerRef::Validator(block.message.proposer_index),
+        compute_signing_root(&block.message, domain),
+        block.signature,
+    );
+    let backend = ClVerify {
+        keys,
+        builders: BuilderFeed::new(),
+        verdict,
+    };
+    match backend.verify_signature_sets(std::slice::from_ref(&set)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(NotImported::Invalid(StfError::InvalidBlockSignature)),
+        Err(e) => Err(NotImported::Ignored(e.0)),
     }
 }
 
