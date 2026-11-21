@@ -3,7 +3,8 @@
 //! A test clock sets the time of the core ([`ChainCore::with_clock`]). The anchor is the
 //! genesis of the pinned minimal Gloas export, so the slot of the wall clock is
 //! `(now - genesis_time) / SLOT_DURATION_MS`. The core must IGNORE a block more than one slot
-//! ahead of that slot, before the slot loop of the transition. A block far after the slot of
+//! ahead of that slot, before the slot loop of the transition. Fork choice then refuses a block
+//! one slot ahead, and the core commits nothing. A block far after the slot of
 //! its parent state, at the slot of the wall clock, must also be IGNORE before the slot loop.
 //! The core must not keep that refusal. A block past the pre-state window, but near its parent
 //! state, goes on to the proposer check (`tests/state_advance.rs` has the tests of that walk).
@@ -39,21 +40,63 @@ fn core_at(now: impl FnOnce(&Fixture) -> u128) -> (ChainCore<Minimal>, Head, Blo
     (f.core.with_clock(clock), f.anchor, f.block)
 }
 
+/// A block one slot ahead of the wall clock passes the wall-clock bound of the core, cl-verify
+/// and the transition, and then fork choice refuses it: `on_block` takes no block of a slot
+/// after the current slot of the store. The store and the core take a block both or neither, so
+/// the core commits nothing and keeps no refusal. At its slot the same block commits in both.
 #[tokio::test]
-async fn a_block_one_slot_ahead_of_the_wall_clock_commits() {
-    let times: [Now; 3] = [
-        |f| slot_start(f, 0),
-        |f| slot_start(f, 1) - 1,
-        |f| slot_start(f, 1),
-    ];
+async fn a_block_ahead_of_the_fork_choice_clock_is_refused_by_the_store_and_commits_nothing() {
+    let times: [Now; 2] = [|f| slot_start(f, 0), |f| slot_start(f, 1) - 1];
     for now in times {
-        let (core, _, block) = core_at(now);
-        let (outcome, _, _) = import_one(core, block, Answer::Valid).await;
+        let f = fixture();
+        let at_slot = clock_at(slot_start(&f, 1));
+        let ahead = clock_at(now(&f));
+        let Fixture {
+            core,
+            anchor,
+            block,
+            ..
+        } = f;
+        let block_root = block.message.tree_hash_root();
+        let (outcome, core, verify) =
+            import_one(core.with_clock(ahead), block.clone(), Answer::Valid).await;
+        assert!(
+            matches!(outcome, Outcome::Ignored(_)),
+            "fork choice must refuse a slot 1 block before slot 1: {outcome:?}"
+        );
+        assert!(
+            !verify.calls().is_empty(),
+            "the block must pass the wall-clock bound of the core and reach cl-verify"
+        );
+        assert_unchanged(&core, anchor, block_root);
+        assert!(!core.is_committed(&block_root));
+        assert!(
+            !core.is_refused(&block_root),
+            "the refusal must not be kept"
+        );
+        assert!(
+            core.fork_choice().block(block_root).is_none(),
+            "the store must not hold the block"
+        );
+
+        let (outcome, core, _) = import_one(core.with_clock(at_slot), block, Answer::Valid).await;
         assert!(
             matches!(outcome, Outcome::Committed { .. }),
-            "a slot 1 block must commit from the start of slot 0: {outcome:?}"
+            "at its slot the block must commit: {outcome:?}"
         );
+        assert!(core.fork_choice().block(block_root).is_some());
+        assert_eq!(core.head().block_root, block_root);
     }
+}
+
+#[tokio::test]
+async fn a_block_at_the_slot_of_the_wall_clock_commits() {
+    let (core, _, block) = core_at(|f| slot_start(f, 1));
+    let (outcome, _, _) = import_one(core, block, Answer::Valid).await;
+    assert!(
+        matches!(outcome, Outcome::Committed { .. }),
+        "a slot 1 block must commit at the start of slot 1: {outcome:?}"
+    );
 }
 
 #[tokio::test]

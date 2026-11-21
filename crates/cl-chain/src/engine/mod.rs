@@ -11,8 +11,9 @@
 //!   of each payload, with the optimistic-sync rules, pruning at finality and a bound on the
 //!   `Invalid` payloads it keeps. Pure.
 //!
-//! The chain core ([`crate::core`]) calls newPayload on envelope import and keeps the execution
-//! statuses. Nothing calls the sender on head changes yet: there is no fork choice store.
+//! The chain core ([`crate::core`]) calls newPayload on envelope import, keeps the execution
+//! statuses, and sends forkchoiceUpdated through a [`fcu::ForkchoiceSink`] (the sender) when
+//! the arguments of its fork choice head change.
 
 pub mod client;
 pub mod fcu;

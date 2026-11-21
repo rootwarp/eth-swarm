@@ -433,13 +433,31 @@ impl From<AttestationError> for Error {
 /// Test seams. Only tests may enable them: the feature `testing` is for dev-dependencies.
 /// They change the store without the checks of the handlers that they stand for:
 /// `mark_payload_verified` stands for `on_execution_payload_envelope`, so that a test needs
-/// no envelope, and the others let a test set a weight without the committees of an
-/// attestation.
+/// no envelope, `set_finalized_checkpoint` for a finalizing chain, `remove_checkpoint_state`
+/// for a checkpoint state that `store_target_checkpoint_state` did not store, and the others
+/// let a test set a weight without the committees of an attestation.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use crate::{LatestMessage, Store};
+    use consensus_types::gloas::Checkpoint;
     use consensus_types::primitives::{Root, ValidatorIndex};
     use state_transition::Preset;
+
+    /// Sets `store.finalized_checkpoint` to `checkpoint`, as `update_checkpoints` does when a
+    /// chain finalizes it.
+    pub fn set_finalized_checkpoint<E: Preset>(store: &mut Store<E>, checkpoint: Checkpoint) {
+        store.finalized_checkpoint = checkpoint;
+    }
+
+    /// Removes `store.checkpoint_states[checkpoint]`, as a store where
+    /// `store_target_checkpoint_state` did not store it. For the justified checkpoint,
+    /// `get_head` then fails ([`crate::Error::MissingCheckpointState`]) wherever it weighs a
+    /// node.
+    pub fn remove_checkpoint_state<E: Preset>(store: &mut Store<E>, checkpoint: &Checkpoint) {
+        store
+            .checkpoint_states
+            .remove(&crate::store::key(checkpoint));
+    }
 
     /// Puts `root` in `store.payloads`, as `on_execution_payload_envelope` does after it
     /// verifies the envelope of the block.

@@ -16,7 +16,7 @@ test-config = []
 # The crash-injection seam of persist::durable (`FileSet::open_crashing`, `Step`,
 # `Error::Crashed`): at a named step of a durable write an injected crash returns early and
 # leaves the disk as it is. Also the chain core's seams (`ChainCore::with_walk_hook`,
-# `with_advanced_state`, `with_payload_verified`). Only cl-chain's own dev-dependency turns it on.
+# `with_advanced_state`, `with_fork_choice`). Only cl-chain's own dev-dependency turns it on.
 test-hooks = []
 
 # The test binary of the service, built only with test-config. Its unit tests are cl-chain's.
@@ -110,6 +110,9 @@ p2p-wire = { path = "../p2p-wire", features = ["testkit"] }
 cl-verify = { path = "../cl-verify" }
 # tests/kzg_fixture.rs: the fixture blobs' cells and proofs, from the pinned setup.
 crypto-kzg = { path = "../crypto-kzg" }
+# The seams of the fork choice store that `ChainCore::with_fork_choice` edits in the core tests
+# (a verified anchor payload, a finalized checkpoint).
+fork-choice = { path = "../fork-choice", features = ["testing"] }
 # The reference-API fixture server (testkit::collector::testing::FixtureServer), and the
 # scriptable mock EL behind an in-process cl-engine (tests/envelope_import.rs).
 testkit = { path = "../testkit", features = ["test-support", "mock-el"] }

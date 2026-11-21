@@ -9,8 +9,9 @@ description = "The pure Gloas fork choice: the Store, on_tick, on_block and get_
 
 [features]
 # Dev-only: the seams of `testing`, which change the store without the checks of a handler:
-# `mark_payload_verified` (a root in `store.payloads` without an envelope), `set_latest_message`
-# and `add_equivocating_index`. Only a dev-dependency may enable it
+# `mark_payload_verified` (a root in `store.payloads` without an envelope),
+# `set_finalized_checkpoint`, `set_latest_message` and `add_equivocating_index`. Only a
+# dev-dependency may enable it
 # (scripts/check-fork-choice-testing.sh).
 testing = []
 
