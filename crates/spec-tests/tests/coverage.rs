@@ -750,13 +750,13 @@ fn fork_choice_case_runs_through_the_suite_and_every_file_is_read() {
 
 #[test]
 fn fork_choice_handler_directories_must_be_known() {
-    // A known handler that the runner does not run needs a skip entry.
+    // A case of a known handler runs, and a skip entry for it makes it a skip.
     let tree = minimal_tree();
     fork_choice_case(tree.path(), "payload_timeliness", "case_0");
     let name = "gloas_fork_choice_minimal::payload_timeliness::pyspec_tests::case_0";
     let suite = build(tree.path(), &value_yaml_excused(), "minimal").unwrap();
     let trial = suite.trials.iter().find(|t| t.name == name).unwrap();
-    assert!(matches!(trial.outcome, Outcome::Unaccounted), "{name}");
+    assert!(matches!(trial.outcome, Outcome::Run(_)), "{name}");
     let skip = entry(
         "consensus-specs",
         "gloas",

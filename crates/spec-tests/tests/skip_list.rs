@@ -714,19 +714,54 @@ fn gloas_fork_choice_cases_with_envelope_steps_are_not_skipped() {
     }
 }
 
-/// The cases of the run handlers that also need payload attestations from the wire or payload
-/// vote checks, which the runner does not have.
-const PAYLOAD_VOTE_CASES: [(&str, &str, &[&str]); 1] = [(
-    "*",
-    "get_head",
-    &[
-        "get_head_full_payload_tiebreak",
-        "get_head_empty_payload_tiebreak",
-    ],
-)];
+/// The cases whose steps are `tick`, `block`, `execution_payload`,
+/// `payload_attestation_message` and `checks` with payload vote checks, by preset and handler.
+/// The runner gives each message to `on_payload_attestation_message`, and the payload
+/// attestations of each block to it after `on_block`.
+const PAYLOAD_VOTE_CASES: [(&str, &str, &[&str]); 4] = [
+    (
+        "*",
+        "get_head",
+        &[
+            "get_head_full_payload_tiebreak",
+            "get_head_empty_payload_tiebreak",
+        ],
+    ),
+    (
+        "*",
+        "on_payload_attestation_message",
+        &[
+            "on_payload_attestation_message_current_slot_and_signature",
+            "on_payload_attestation_message_from_block",
+            "on_payload_attestation_message_multiple_ptc_members_vote_independently",
+            "on_payload_attestation_message_not_ptc_member",
+            "on_payload_attestation_message_slot_mismatch",
+            "on_payload_attestation_message_unknown_block_root",
+            "on_payload_attestation_message_valid",
+        ],
+    ),
+    (
+        "*",
+        "payload_timeliness",
+        &[
+            "payload_timeliness_above_threshold_returns_true",
+            "payload_timeliness_at_threshold_returns_false",
+            "payload_timeliness_single_vote_returns_false",
+        ],
+    ),
+    (
+        "*",
+        "payload_data_availability",
+        &[
+            "payload_data_availability_above_threshold_returns_true",
+            "payload_data_availability_at_threshold_returns_false",
+            "payload_data_availability_single_vote_returns_false",
+        ],
+    ),
+];
 
 #[test]
-fn gloas_fork_choice_cases_with_payload_votes_stay_skipped() {
+fn gloas_fork_choice_cases_with_payload_votes_are_not_skipped() {
     let skips = committed();
     for (preset, handler, cases) in PAYLOAD_VOTE_CASES {
         let presets: &[&str] = if preset == "*" {
@@ -737,37 +772,26 @@ fn gloas_fork_choice_cases_with_payload_votes_stay_skipped() {
         for preset in presets {
             for case in cases {
                 let k = fork_choice_case(preset, handler, case);
-                assert_eq!(issue_of(&skips, &k), "5.14a", "{k}");
+                let skip = skips.skipped_by(&k);
+                assert!(skip.is_none(), "{k} is skipped: {skip:?}");
             }
         }
     }
 }
 
 #[test]
-fn other_fork_choice_handlers_and_forks_stay_skipped() {
+fn other_fork_choice_forks_stay_skipped() {
     let skips = committed();
-    for (preset, handler, want) in [
-        ("*", "on_payload_attestation_message", "5.14a"),
-        ("*", "payload_timeliness", "5.14a"),
-        ("*", "payload_data_availability", "5.14a"),
-    ] {
-        let presets: &[&str] = if preset == "*" {
-            &["minimal", "mainnet"]
-        } else {
-            &[preset]
-        };
-        for preset in presets {
-            let k = consensus("gloas", preset, "fork_choice", handler);
-            let e = skips
-                .skipped_by(&k)
-                .unwrap_or_else(|| panic!("{k} is not skipped"));
-            assert_eq!(e.issue, want, "{k}");
-            assert!(!e.reason.trim().is_empty(), "{k}");
-        }
-    }
     // Fork choice is Gloas only: the Fulu cases have no runner, and heze is out of scope.
     for preset in ["minimal", "mainnet"] {
-        for handler in ["on_block", "get_head", "ex_ante"] {
+        for handler in [
+            "on_block",
+            "get_head",
+            "ex_ante",
+            "on_payload_attestation_message",
+            "payload_timeliness",
+            "payload_data_availability",
+        ] {
             let k = consensus("fulu", preset, "fork_choice", handler);
             assert_eq!(issue_of(&skips, &k), "none", "{k}");
             let k = consensus("heze", preset, "fork_choice", handler);
@@ -796,6 +820,9 @@ fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
             "filter_node_tree_variants",
             "on_execution_payload_envelope",
             "deposit_with_reorg",
+            "on_payload_attestation_message",
+            "payload_timeliness",
+            "payload_data_availability",
         ] {
             let k = CaseKey {
                 case: "pyspec_tests/a_new_case".into(),

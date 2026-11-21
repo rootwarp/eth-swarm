@@ -11,7 +11,7 @@ use consensus_types::common::AttestationData;
 use consensus_types::gloas::{
     Attestation, AttesterSlashing, BeaconBlock, BeaconState, Checkpoint, ExecutionPayload,
     ExecutionPayloadEnvelope, IndexedAttestation, PayloadAttestation, PayloadAttestationData,
-    SignedBeaconBlock, SignedExecutionPayloadEnvelope,
+    PayloadAttestationMessage, SignedBeaconBlock, SignedExecutionPayloadEnvelope,
 };
 use consensus_types::primitives::{Gwei, Root, Slot, ValidatorIndex, U256};
 use consensus_types::Minimal;
@@ -20,7 +20,7 @@ use spec_tests::fork_choice::{handler_runs, run, supported, NOT_RUN, RUNNABLE};
 use spec_tests::plan::{Case, CaseFile, CaseKey};
 use ssz::{BitVector, Encode, ProgressiveBitList};
 use ssz_types::ProgressiveVariableList;
-use state_transition::caches::CommitteeCache;
+use state_transition::caches::{get_ptc, CommitteeCache};
 use state_transition::per_slot::process_slots;
 use state_transition::preset::BUILDER_INDEX_SELF_BUILD;
 use state_transition::testing::{
@@ -254,6 +254,9 @@ fn runner_takes_the_gloas_handlers_of_its_steps() {
             "should_apply_proposer_boost",
             "on_execution_payload_envelope",
             "deposit_with_reorg",
+            "on_payload_attestation_message",
+            "payload_timeliness",
+            "payload_data_availability",
         ]
         .as_slice()
     );
@@ -265,17 +268,8 @@ fn runner_takes_the_gloas_handlers_of_its_steps() {
         assert!(!supported("heze", "minimal", handler));
         assert!(!supported("gloas", "general", handler));
     }
-    // Each case of these handlers has a payload_attestation_message step or payload vote
-    // checks.
-    assert_eq!(
-        NOT_RUN.as_slice(),
-        [
-            "on_payload_attestation_message",
-            "payload_timeliness",
-            "payload_data_availability",
-        ]
-        .as_slice()
-    );
+    // Every Gloas handler directory of v1.7.0-beta.4 runs.
+    assert_eq!(NOT_RUN, [""; 0]);
     for handler in NOT_RUN {
         assert_eq!(handler_runs(handler), Ok(false));
         assert!(!supported("gloas", "minimal", handler));
@@ -468,12 +462,21 @@ fn steps_and_checks_that_the_runner_does_not_have_fail_closed() {
         ),
         (
             "- payload_attestation_message: payload_attestation_message_0x00\n".to_owned(),
-            "payload_attestation_message",
+            "payload_attestation_message_0x00",
         ),
         (
-            "- checks:\n    payload_timeliness_vote: {block_root: '0x00', votes: []}\n"
+            "- payload_attestation_message: payload_attestation_message_0x00\n  extra: 1\n"
                 .to_owned(),
-            "payload_timeliness_vote",
+            "extra",
+        ),
+        (
+            "- checks:\n    payload_timeliness_vote: {block_root: '0x00', votes: [], extra: 1}\n"
+                .to_owned(),
+            "extra",
+        ),
+        (
+            "- checks:\n    payload_data_availability_vote: {votes: []}\n".to_owned(),
+            "block_root",
         ),
         (
             "- checks:\n    viable_for_head_roots_and_weights: [{root: '0x00', weight: 0, payload_status: 0, extra: 1}]\n"
@@ -512,9 +515,9 @@ fn a_case_of_another_preset_or_handler_fails() {
     other.key.preset = "general".into();
     let err = run(&Reads::default(), &other).unwrap_err();
     assert!(err.contains("general"), "{err}");
-    let other = case.case("payload_timeliness");
+    let other = case.case("on_tick");
     let err = run(&Reads::default(), &other).unwrap_err();
-    assert!(err.contains("payload_timeliness"), "{err}");
+    assert!(err.contains("on_tick"), "{err}");
 }
 
 #[test]
@@ -564,8 +567,9 @@ fn post_state(state: &BeaconState<E>, block: &SignedBeaconBlock<E>) -> BeaconSta
 }
 
 /// [`block_on`] with a payload attestation of every PTC member for the block of `state`, which
-/// must be of the slot before `slot`.
-fn block_with_ptc_votes(state: &BeaconState<E>, slot: Slot) -> SignedBeaconBlock<E> {
+/// must be of the slot before `slot`. Each member votes `present` for the payload and for its
+/// data.
+fn block_with_ptc_votes(state: &BeaconState<E>, slot: Slot, present: bool) -> SignedBeaconBlock<E> {
     let mut at_slot = state.clone();
     process_slots(&mut at_slot, slot, &no_bls()).unwrap();
     let mut block = block_at_state_slot(&at_slot);
@@ -578,8 +582,8 @@ fn block_with_ptc_votes(state: &BeaconState<E>, slot: Slot) -> SignedBeaconBlock
     let data = PayloadAttestationData {
         beacon_block_root: block.message.parent_root,
         slot: slot - 1,
-        payload_present: true,
-        blob_data_available: true,
+        payload_present: present,
+        blob_data_available: present,
     };
     block
         .message
@@ -596,35 +600,222 @@ fn block_with_ptc_votes(state: &BeaconState<E>, slot: Slot) -> SignedBeaconBlock
     block
 }
 
+/// A `payload_timeliness_vote` and a `payload_data_availability_vote` check of `root`, each
+/// with `votes`.
+fn vote_checks(root: Root, votes: &[Option<bool>]) -> String {
+    let votes: Vec<&str> = votes
+        .iter()
+        .map(|v| match v {
+            None => "null",
+            Some(true) => "true",
+            Some(false) => "false",
+        })
+        .collect();
+    let votes = votes.join(", ");
+    let root = hex_root(root);
+    format!(
+        "- checks:\n    payload_timeliness_vote: {{block_root: {root}, votes: [{votes}]}}\n    \
+         payload_data_availability_vote: {{block_root: {root}, votes: [{votes}]}}\n"
+    )
+}
+
 #[test]
-fn a_repeated_block_with_payload_attestations_fails_closed() {
-    let (state, anchor_block) = anchor();
-    let anchor = anchor_block.tree_hash_root();
+fn a_block_gives_the_votes_of_its_payload_attestations_also_when_the_store_has_it() {
+    let (state, _) = anchor();
     let first = block_on(&state, 1);
-    let second = block_with_ptc_votes(&post_state(&state, &first), 2);
-    let root = second.message.tree_hash_root();
-    let once = format!(
+    let first_root = first.message.tree_hash_root();
+    let post_first = post_state(&state, &first);
+    let timely = block_with_ptc_votes(&post_first, 2, true);
+    let late = block_with_ptc_votes(&post_first, 2, false);
+    let prefix = format!(
         "- tick: {}\n- block: {}\n- block: {}\n",
         time_at(2),
         block_name(&first),
-        block_name(&second)
+        block_name(&timely)
     );
-    let repeat = format!("- block: {}\n", block_name(&second));
-    // The spec's on_block runs again for a known block and gives its PTC votes to the store
-    // again, but fork_choice::on_block returns early, so the runner must refuse the step.
-    for (steps, want) in [
-        (once.clone(), None),
-        (once + &repeat, Some("payload attestations")),
+    let all = |v: bool| vec![Some(v); PTC_SIZE];
+    // `late` sets every vote of `first` to false. The test format then gives the votes of
+    // `timely` again after `on_block`, also though the store has it: every vote is true again.
+    let steps = prefix.clone()
+        + &vote_checks(first_root, &all(true))
+        + &format!("- block: {}\n", block_name(&late))
+        + &vote_checks(first_root, &all(false))
+        + &format!("- block: {}\n", block_name(&timely))
+        + &vote_checks(first_root, &all(true));
+    let mut case = CaseDir::new(BLS_OFF);
+    for block in [&first, &timely, &late] {
+        case.block(block);
+    }
+    case.steps(&steps);
+    assert_eq!(case.run_as("payload_timeliness"), Ok(()));
+
+    // A vote check that differs from the store fails.
+    let mut case = CaseDir::new(BLS_OFF);
+    for block in [&first, &timely] {
+        case.block(block);
+    }
+    case.steps(&(prefix + &vote_checks(first_root, &all(false))));
+    let err = case.run_as("payload_timeliness").unwrap_err();
+    assert!(err.contains("payload_timeliness_vote"), "{err}");
+}
+
+/// The positions of `validator` in `ptc`.
+fn positions(ptc: &[ValidatorIndex], validator: ValidatorIndex) -> Vec<usize> {
+    ptc.iter()
+        .enumerate()
+        .filter(|(_, member)| **member == validator)
+        .map(|(position, _)| position)
+        .collect()
+}
+
+/// A message of `validator` for `root` at `slot` that votes the payload present and its data
+/// not available.
+fn ptc_message(validator: ValidatorIndex, root: Root, slot: Slot) -> PayloadAttestationMessage {
+    PayloadAttestationMessage {
+        validator_index: validator,
+        data: PayloadAttestationData {
+            beacon_block_root: root,
+            slot,
+            payload_present: true,
+            blob_data_available: false,
+        },
+        signature: [0x11; 96],
+    }
+}
+
+/// The two vote checks of `root` after one message of a member at `positions`: true and false
+/// there, and null at the other positions.
+fn member_vote_checks(root: Root, positions: &[usize]) -> String {
+    let votes = |value: bool| -> Vec<String> {
+        (0..PTC_SIZE)
+            .map(|i| {
+                if positions.contains(&i) {
+                    value.to_string()
+                } else {
+                    "null".to_owned()
+                }
+            })
+            .collect()
+    };
+    let root = hex_root(root);
+    format!(
+        "- checks:\n    payload_timeliness_vote: {{block_root: {root}, votes: [{}]}}\n    \
+         payload_data_availability_vote: {{block_root: {root}, votes: [{}]}}\n",
+        votes(true).join(", "),
+        votes(false).join(", ")
+    )
+}
+
+#[test]
+fn a_payload_attestation_message_step_sets_the_votes_of_its_validator() {
+    let (state, _) = anchor();
+    let block = block_on(&state, 1);
+    let root = block.message.tree_hash_root();
+    let ptc = get_ptc(&post_state(&state, &block), 1).unwrap().to_vec();
+    let member = ptc[0];
+    let message = ptc_message(member, root, 1);
+    let mut case = CaseDir::new(BLS_OFF);
+    case.block(&block);
+    let name = case.object("payload_attestation_message", &message);
+    let prefix = format!("- tick: {}\n- block: {}\n", time_at(1), block_name(&block));
+    let steps = prefix.clone()
+        + &member_vote_checks(root, &[])
+        + &format!("- payload_attestation_message: {name}\n")
+        + &member_vote_checks(root, &positions(&ptc, member));
+    case.steps(&steps);
+    assert_eq!(case.run_as("on_payload_attestation_message"), Ok(()));
+
+    // A valid message that the vector expects to fail fails the case.
+    case.steps(&(prefix + &format!("- payload_attestation_message: {name}\n  valid: false\n")));
+    let err = case.run_as("on_payload_attestation_message").unwrap_err();
+    assert!(err.contains("accepted"), "{err}");
+}
+
+#[test]
+fn a_payload_attestation_message_step_must_have_the_verdict_of_the_vector() {
+    let (state, _) = anchor();
+    let block = block_on(&state, 1);
+    let root = block.message.tree_hash_root();
+    let ptc = get_ptc(&post_state(&state, &block), 1).unwrap().to_vec();
+    let outsider = (0..64).find(|v| !ptc.contains(v)).unwrap();
+    let unknown_block = ptc_message(ptc[0], Root::repeat_byte(0x42), 1);
+    let not_in_ptc = ptc_message(outsider, root, 1);
+    for (message, valid, outcome) in [
+        // A message that the spec refuses passes with `valid: false`, and the votes stay null.
+        (&unknown_block, "false", None),
+        (&not_in_ptc, "false", None),
+        (&unknown_block, "true", Some("refused a valid step")),
+        (&not_in_ptc, "true", Some("refused a valid step")),
     ] {
         let mut case = CaseDir::new(BLS_OFF);
-        case.block(&first);
-        case.block(&second);
-        case.steps(&(steps + &checks(time_at(2), anchor, root, 2, root)));
-        match (case.run(), want) {
+        case.block(&block);
+        let name = case.object("payload_attestation_message", message);
+        let steps = format!(
+            "- tick: {}\n- block: {}\n- payload_attestation_message: {name}\n  valid: {valid}\n",
+            time_at(1),
+            block_name(&block)
+        ) + &member_vote_checks(root, &[]);
+        case.steps(&steps);
+        match (case.run_as("on_payload_attestation_message"), outcome) {
             (Ok(()), None) => {}
             (Err(err), Some(needle)) => assert!(err.contains(needle), "{needle}: {err}"),
-            (got, want) => panic!("got {got:?}, want {want:?}"),
+            (got, want) => panic!("{message:?} valid: {valid}: got {got:?}, want {want:?}"),
         }
+    }
+}
+
+#[test]
+fn a_payload_attestation_message_step_checks_the_signature_unless_bls_is_off() {
+    // The anchor is a block of slot 0, so a message of slot 0 needs no tick. The keys of the
+    // anchor state do not decode, so with BLS on the signature is invalid.
+    let (state, anchor_block) = anchor();
+    let anchor = anchor_block.tree_hash_root();
+    let ptc = get_ptc(&state, 0).unwrap().to_vec();
+    let message = ptc_message(ptc[0], anchor, 0);
+    for (meta, valid, ok) in [
+        (BLS_OFF, "true", true),
+        (None, "false", true),
+        (None, "true", false),
+    ] {
+        let mut case = CaseDir::new(meta);
+        let name = case.object("payload_attestation_message", &message);
+        case.steps(&format!(
+            "- payload_attestation_message: {name}\n  valid: {valid}\n- checks:\n    time: {GENESIS_TIME}\n"
+        ));
+        assert_eq!(
+            case.run_as("on_payload_attestation_message").is_ok(),
+            ok,
+            "{meta:?} valid: {valid}"
+        );
+    }
+}
+
+#[test]
+fn payload_vote_checks_must_list_a_vote_for_each_ptc_position() {
+    let (_, anchor_block) = anchor();
+    let anchor = anchor_block.tree_hash_root();
+    let short = vec![None; PTC_SIZE - 1];
+    let long = vec![None; PTC_SIZE + 1];
+    let root = hex_root(anchor);
+    let not_a_vote =
+        format!("- checks:\n    payload_timeliness_vote: {{block_root: {root}, votes: [1]}}\n");
+    for (steps, ok) in [
+        (vote_checks(anchor, &[None; PTC_SIZE]), true),
+        (vote_checks(anchor, &short), false),
+        (vote_checks(anchor, &long), false),
+        (
+            vote_checks(Root::repeat_byte(0x42), &[None; PTC_SIZE]),
+            false,
+        ),
+        (not_a_vote, false),
+    ] {
+        let mut case = CaseDir::new(BLS_OFF);
+        case.steps(&steps);
+        assert_eq!(
+            case.run_as("payload_data_availability").is_ok(),
+            ok,
+            "{steps}"
+        );
     }
 }
 
