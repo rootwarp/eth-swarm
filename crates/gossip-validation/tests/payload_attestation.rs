@@ -1059,6 +1059,98 @@ fn a_message_of_a_pruned_slot_must_ignore_also_at_an_earlier_time() {
     assert!(seen.has_payload_attestation(2, v));
 }
 
+#[test]
+fn a_prune_with_an_earlier_time_or_slot_does_not_lower_the_floor() {
+    let (chain, r) = chain_at_slot_2();
+    let store = &chain.store;
+    let [v, _] = two_of_slot_2(store);
+    let edge = time_at(2) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS;
+    let mut seen = Seen::default();
+    assert_eq!(seen.min_payload_attestation_slot(), 0);
+    assert_eq!(
+        accept_at(&mut seen, store, &message(10, chain.p, 1), mid_slot_1()),
+        Verdict::Accept
+    );
+    assert_eq!(
+        accept_at(&mut seen, store, &message(v, r, 2), time_at(2)),
+        Verdict::Accept
+    );
+    assert_eq!(seen.min_payload_attestation_slot(), 1);
+    seen.prune_payload_attestations(store, edge + 1);
+    assert_eq!(seen.min_payload_attestation_slot(), 2);
+    let pruned = seen.clone();
+
+    // An earlier time, an earlier slot, or the same slot changes nothing.
+    seen.prune_payload_attestations(store, edge);
+    seen.prune_payload_attestations(store, mid_slot_1());
+    for slot in [0, 1, 2] {
+        seen.prune_payload_attestations_before(slot);
+    }
+    assert_eq!(seen, pruned);
+    assert_eq!(seen.min_payload_attestation_slot(), 2);
+    // The key of slot 1 stays removed, and the key of slot 2 stays.
+    assert!(!seen.has_payload_attestation(1, 10));
+    assert!(seen.has_pruned_payload_attestation(1, 10));
+    assert!(seen.has_payload_attestation(2, v));
+}
+
+#[test]
+fn seen_keeps_the_keys_of_the_last_pruned_slot_until_the_floor_moves_again() {
+    let (chain, r) = chain_at_slot_2();
+    let store = &chain.store;
+    let [v, _] = two_of_slot_2(store);
+    let m1 = message(10, chain.p, 1);
+    let m2 = message(v, r, 2);
+    let mut seen = Seen::default();
+    // Two copies of each message pass validation at the start of slot 2. The first copies
+    // accept.
+    let [(_, m1_first), (_, m1_second)] =
+        [(); 2].map(|()| pending(validate_at(&seen, store, &m1, time_at(2))));
+    let [(_, m2_first), (_, m2_second)] =
+        [(); 2].map(|()| pending(validate_at(&seen, store, &m2, time_at(2))));
+    assert_eq!(seen.resolve(m1_first, Ok(true)), Verdict::Accept);
+    assert_eq!(seen.resolve(m2_first, Ok(true)), Verdict::Accept);
+
+    // The floor moves to 2. The record has the key of slot 1.
+    seen.prune_payload_attestations_before(2);
+    assert!(seen.has_pruned_payload_attestation(1, 10));
+    assert!(!seen.has_pruned_payload_attestation(2, v));
+    assert!(!seen.has_pruned_payload_attestation(1, 11));
+    let at_floor_2 = seen.clone();
+
+    // The floor moves to 3. The record has the key of slot 2 only.
+    seen.prune_payload_attestations_before(3);
+    assert!(!seen.has_pruned_payload_attestation(1, 10));
+    assert!(seen.has_pruned_payload_attestation(2, v));
+    assert!(!seen.has_payload_attestation(2, v));
+    let at_floor_3 = seen.clone();
+    assert_eq!(
+        seen.resolve(m2_second.clone(), Ok(true)),
+        Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+            slot: 2,
+            validator_index: v
+        })
+    );
+    assert_eq!(
+        seen.resolve(m1_second.clone(), Ok(true)),
+        Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot: 1 })
+    );
+    assert_eq!(seen, at_floor_3);
+
+    // From the floor 2, a move to 4 removes the record: slot 3 has no key.
+    let mut jumped = at_floor_2;
+    jumped.prune_payload_attestations_before(4);
+    assert!(!jumped.has_pruned_payload_attestation(1, 10));
+    assert!(!jumped.has_pruned_payload_attestation(2, v));
+    assert_eq!(jumped.payload_attestation_count(), 0);
+    for (key, slot) in [(m1_second, 1), (m2_second, 2)] {
+        assert_eq!(
+            jumped.resolve(key, Ok(true)),
+            Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot })
+        );
+    }
+}
+
 /// A view with a block of each slot from 1 to `slots` and a slot duration of 1 ms. Each block
 /// is `p` with another slot. Each block has the post-state of `p`, which is also the head
 /// state. At the genesis time, the clock disparity of 500 ms makes each of these slots
@@ -1390,4 +1482,34 @@ fn seen_equality_does_not_depend_on_the_order_of_the_keys() {
         );
     }
     assert_eq!(first, second);
+}
+
+#[test]
+fn seen_equality_depends_on_the_validators_of_each_slot() {
+    let chain = chain();
+    let seen_of = |validators: &[ValidatorIndex]| {
+        let mut seen = Seen::default();
+        for validator in validators {
+            let m = message(*validator, chain.p, 1);
+            assert_eq!(
+                accept_at(&mut seen, &chain.store, &m, mid_slot_1()),
+                Verdict::Accept
+            );
+        }
+        seen
+    };
+    let first = seen_of(&[10, 11, 12]);
+    // The same slot, the same floor and the same number of keys, but one other validator.
+    let other = seen_of(&[10, 11, 13]);
+    assert_eq!(
+        first.payload_attestation_count(),
+        other.payload_attestation_count()
+    );
+    assert_eq!(
+        first.min_payload_attestation_slot(),
+        other.min_payload_attestation_slot()
+    );
+    assert_ne!(first, other);
+    // Fewer validators in the same slot.
+    assert_ne!(first, seen_of(&[10, 11]));
 }
