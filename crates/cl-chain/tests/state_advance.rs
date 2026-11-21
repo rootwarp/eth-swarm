@@ -1811,6 +1811,9 @@ async fn an_import_whose_caller_stops_waiting_before_the_walk_is_ignored_and_not
         "the walk must stop at its first check"
     );
 
+    // The walk took its epochs before its first check, and gives nothing back. The block can
+    // come again in the next clock slot.
+    let core = core.with_clock(wall.at(slot + 1));
     let (outcome, _, _) = import_one(core, block.clone(), Answer::Valid).await;
     assert_eq!(
         outcome,
@@ -1875,6 +1878,29 @@ async fn an_import_whose_caller_stops_waiting_at_an_epoch_boundary_keeps_the_sta
         "the walk must not keep a state after the stop"
     );
 
+    // The stopped walk keeps its charge, and its proposer has no second walk in the clock slot:
+    // the same block in the same slot is IGNORE, with no walk.
+    let verify = FakeVerify::new(Answer::Valid);
+    let watched = import_watched(
+        core,
+        block.clone(),
+        Arc::clone(&verify),
+        &verify,
+        &Waiting::default(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(watched.outcome, Some(Outcome::Ignored(_))),
+        "a stopped walk gives nothing back: {:?}",
+        watched.outcome
+    );
+    assert!(watched.walk.is_empty(), "the core must not start the walk");
+    let core = watched.core;
+    assert!(!core.is_refused(&block_root));
+
+    // In the next clock slot, the block comes again.
+    let core = core.with_clock(wall.at(slot + 1));
     let verify = FakeVerify::new(Answer::Valid);
     let watched = import_watched(
         core,
@@ -1933,6 +1959,8 @@ async fn an_import_whose_caller_stops_waiting_after_the_walk_sends_no_block_sets
         "the walk must keep the states that it reached"
     );
 
+    // The walk is charged. The block can come again in the next clock slot.
+    let core = core.with_clock(wall.at(slot + 1));
     let (outcome, _, _) = import_one(core, block.clone(), Answer::Valid).await;
     assert_eq!(
         outcome,
@@ -2024,7 +2052,9 @@ async fn an_import_whose_caller_stops_waiting_during_the_block_sets_does_not_com
         "the core must not keep the refusal of a stopped import"
     );
 
-    // A committed root comes back as IGNORE before cl-verify. Two calls show a full import.
+    // The walk is charged. The block can come again in the next clock slot. A committed root
+    // comes back as IGNORE before cl-verify, so two calls show a full import.
+    let core = core.with_clock(wall.at(slot + 1));
     let (outcome, core, verify) = import_one(core, block.clone(), Answer::Valid).await;
     assert_eq!(
         outcome,
@@ -2080,6 +2110,10 @@ async fn an_invalid_verdict_after_the_caller_stops_waiting_is_not_kept() {
             "call {on_call}: the core must not keep an INVALID verdict of a stopped import"
         );
 
+        // A stop in the proposer check comes before the charge of the walk: the block can come
+        // again in the same clock slot. After the walk, it can come again in the next one.
+        let again = if on_call == 1 { slot } else { slot + 1 };
+        let core = core.with_clock(wall.at(again));
         let (outcome, _, _) = import_one(core, block.clone(), Answer::Valid).await;
         assert_eq!(
             outcome,
