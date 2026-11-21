@@ -1,14 +1,19 @@
-//! The hooks of `verify_execution_payload_envelope` in an envelope import of the chain core
-//! ([`EnvelopeHooks`]): the envelope signature goes to cl-verify, and the payload to the EL
-//! through the core's [`NewPayload`] call. The core's [`ExecutionStatuses`] records the verdict.
+//! The hooks of `on_execution_payload_envelope` in an envelope import of the chain core
+//! ([`EnvelopeHooks`]): the core's data availability check, the envelope signature to
+//! cl-verify, and the payload to the EL through the core's [`NewPayload`] call. The core's
+//! [`ExecutionStatuses`] records the verdict.
 
 use crate::engine::client::NewPayload;
 use crate::engine::verdict::{ElVerdict, ExecutionStatuses, Reason};
 use crate::import::block::verify_sets;
 use crate::verify::client::BlsOutcome;
 use consensus_types::gloas::{BeaconState, ExecutionPayloadBid, ExecutionPayloadEnvelope};
+use consensus_types::primitives::Root;
 use ethswarm_proto::verify::BlsSet;
-use fork_choice::{ExecutionEngine, NewPayloadRequestRef, PayloadImport, SignatureVerifier};
+use fork_choice::{
+    DataAvailability, DataAvailabilityCheck, ExecutionEngine, NewPayloadRequestRef, PayloadImport,
+    SignatureVerifier,
+};
 use state_transition::{BackendError, Preset, SignatureSet};
 use std::cell::{Cell, RefCell};
 use std::time::Duration;
@@ -19,6 +24,7 @@ pub(super) struct EnvelopeHooks<'a, E: Preset> {
     /// One VerifyBls call, with the deadline of the import.
     pub(super) verdict: &'a dyn Fn(Vec<BlsSet>) -> BlsOutcome,
     pub(super) engine: &'a dyn NewPayload<E>,
+    pub(super) data: &'a dyn DataAvailabilityCheck,
     /// The runtime of the core: the newPayload call runs on it, and the core thread waits.
     pub(super) runtime: &'a Handle,
     /// The wait for the EL's verdict, from the start of the call.
@@ -29,6 +35,12 @@ pub(super) struct EnvelopeHooks<'a, E: Preset> {
     pub(super) statuses: RefCell<&'a mut ExecutionStatuses>,
     /// The EL's verdict, once the call is made.
     pub(super) el: Cell<Option<ElVerdict>>,
+}
+
+impl<E: Preset> DataAvailabilityCheck for EnvelopeHooks<'_, E> {
+    fn is_data_available(&self, beacon_block_root: Root) -> DataAvailability {
+        self.data.is_data_available(beacon_block_root)
+    }
 }
 
 impl<E: Preset> SignatureVerifier<E> for EnvelopeHooks<'_, E> {

@@ -59,7 +59,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{
     assert_unchanged, clock_at, export_block, fixture, import_one, proposer_set, proposer_set_in,
-    slot_start, Answer, FakeVerify, Fixture, QUEUE, VERIFY_TIMEOUT,
+    slot_start, Answer, FakeVerify, Fixture, PayloadVerified, QUEUE, VERIFY_TIMEOUT,
 };
 use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
 use testkit::anchor::load_anchor;
@@ -376,6 +376,24 @@ fn head_of(block: &Block) -> Head {
     }
 }
 
+/// The head of fork choice after the commits of `blocks`, each on the FULL node of the anchor
+/// `anchor` or on the EMPTY node of one of `blocks`, with no votes and no proposer boost (no
+/// block comes at the start of its own slot): at each node from the anchor, the child of the
+/// highest root.
+fn fork_choice_head(anchor: Root, blocks: &[&Block]) -> Head {
+    let mut head = None;
+    let mut at = anchor;
+    while let Some(child) = blocks
+        .iter()
+        .filter(|block| block.message.parent_root == at)
+        .max_by_key(|block| block.message.tree_hash_root())
+    {
+        at = child.message.tree_hash_root();
+        head = Some(head_of(child));
+    }
+    head.expect("a block on the anchor")
+}
+
 /// The committed outcome of `block`.
 fn committed(block: &Block) -> Outcome {
     Outcome::Committed {
@@ -539,7 +557,11 @@ async fn a_later_import_starts_from_a_kept_state_of_its_parent() {
         "the walk must start from the kept state"
     );
     assert_eq!(verify.calls().len(), 2);
-    assert_eq!(core.head(), head_of(&late));
+    // Two children of the anchor.
+    assert_eq!(
+        core.head(),
+        fork_choice_head(f.anchor.block_root, &[&early, &late])
+    );
 }
 
 #[tokio::test]
@@ -1294,7 +1316,11 @@ async fn one_proposer_has_one_walk_in_each_slot_of_the_core_clock() {
         !core.is_refused(&a_again_root),
         "the core must not keep the refusal of a spent budget"
     );
-    assert_eq!(core.head(), head_of(&a_first));
+    let anchor_root = f.anchor.block_root;
+    assert_eq!(
+        core.head(),
+        fork_choice_head(anchor_root, &[&first, &a_first])
+    );
 
     // B: eight epochs do not fit in the four that are left.
     let verify = FakeVerify::new(Answer::Valid);
@@ -1318,11 +1344,17 @@ async fn one_proposer_has_one_walk_in_each_slot_of_the_core_clock() {
 
     // B: four epochs fit.
     let core = commit(core, &b_four).await;
-    assert_eq!(core.head(), head_of(&b_four));
+    assert_eq!(
+        core.head(),
+        fork_choice_head(anchor_root, &[&first, &a_first, &b_four])
+    );
 
     // One slot later, A can walk again.
     let core = commit(core.with_clock(wall.at(now + 1)), &a_again).await;
-    assert_eq!(core.head(), head_of(&a_again));
+    assert_eq!(
+        core.head(),
+        fork_choice_head(anchor_root, &[&first, &a_first, &b_four, &a_again])
+    );
 }
 
 /// A fake cl-verify that gives the answers of `inner`. At the end of call `on_call` (1 is the
@@ -1400,12 +1432,16 @@ async fn a_walk_takes_the_budget_of_the_clock_slot_after_the_proposer_check() {
     assert!(watched.walk.is_empty(), "the core must not start the walk");
     let core = watched.core;
     assert!(!core.is_refused(&other_root));
-    assert_eq!(core.head(), head_of(&full));
+    let anchor_root = f.anchor.block_root;
+    assert_eq!(core.head(), fork_choice_head(anchor_root, &[&first, &full]));
 
     // One slot later, the budget is full again.
     clock.set(wall.ms(now + 2));
     let core = commit(core, &other).await;
-    assert_eq!(core.head(), head_of(&other));
+    assert_eq!(
+        core.head(),
+        fork_choice_head(anchor_root, &[&first, &full, &other])
+    );
 }
 
 /// The clock of the core goes back during the VerifyBls call of the proposer set: before

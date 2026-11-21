@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{
     anchored, assert_unchanged, fixture, import_one, import_with, proposer_set, some_envelope,
-    ungated_fixture, Answer, FakeVerify, QUEUE, VERIFY_TIMEOUT,
+    ungated_fixture, Answer, FakeVerify, PayloadVerified, QUEUE, VERIFY_TIMEOUT,
 };
 use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
 use testkit::anchor::load_anchor;

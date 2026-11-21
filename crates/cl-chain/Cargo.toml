@@ -16,7 +16,7 @@ test-config = []
 # The crash-injection seam of persist::durable (`FileSet::open_crashing`, `Step`,
 # `Error::Crashed`): at a named step of a durable write an injected crash returns early and
 # leaves the disk as it is. Also the chain core's seams (`ChainCore::with_walk_hook`,
-# `with_advanced_state`, `with_payload_verified`). Only cl-chain's own dev-dependency turns it on.
+# `with_advanced_state`, `with_fork_choice`). Only cl-chain's own dev-dependency turns it on.
 test-hooks = []
 
 # The test binary of the service, built only with test-config. Its unit tests are cl-chain's.
