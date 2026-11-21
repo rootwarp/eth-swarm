@@ -5,8 +5,8 @@
 //!   [`validate_execution_payload_envelope_gossip`] (L811-885).
 //! - [`payload_attestation`]: the `payload_attestation_message` topic,
 //!   [`validate_payload_attestation_message_gossip`] (L891-954).
-//! - [`seen`]: the spec's `Seen` (L188-219), for the topics of this crate, with bounds on the
-//!   payload attestation keys.
+//! - [`seen`]: the spec's `Seen` (L188-219), for the topics of this crate, with bounds by slot
+//!   on the envelope keys and payloads and on the payload attestation keys.
 //! - [`verdict`]: the [`Verdict`] of a message, and why it is IGNORE or REJECT.
 //!
 //! The crate does no I/O and links no BLS library. A validation function runs each check that
@@ -34,7 +34,8 @@ pub use payload_attestation::{
     MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS,
 };
 pub use seen::{
-    Seen, SeenKey, SeenPayload, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT,
+    Seen, SeenKey, SeenPayload, MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT,
+    MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT,
     MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS,
 };
 pub use verdict::{IgnoreReason, RejectReason, RequestKind, Verdict};
@@ -82,6 +83,11 @@ pub trait StoreView<E: Preset> {
     /// `store.block_states[get_head(store).root]`, or `None` if the store cannot give it: a
     /// fault of the store.
     fn head_state(&self) -> Option<&BeaconState<E>>;
+
+    /// `store.time_ms`: the time of the last tick of the store. The envelope topic reads it
+    /// only for the bound of [`Seen`] ([`oldest_current_slot`]), and the spec's function reads
+    /// no clock. A time that decreases does not lower the floor of [`Seen`].
+    fn time_ms(&self) -> u64;
 }
 
 impl<E: Preset> StoreView<E> for Store<E> {
@@ -109,5 +115,9 @@ impl<E: Preset> StoreView<E> for Store<E> {
         // The head is a block of the store, so `Store::block_state` has its post-state.
         let head = fork_choice::get_head(self).ok()?;
         Store::block_state(self, head.root)
+    }
+
+    fn time_ms(&self) -> u64 {
+        Store::time_ms(self)
     }
 }

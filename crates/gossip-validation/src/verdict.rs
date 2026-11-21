@@ -48,6 +48,14 @@ pub enum IgnoreReason {
     /// The builder of a validated block is not in its post-state: a fault of the store, not a
     /// proof against the message.
     UnknownBuilder(BuilderIndex),
+    /// `Seen` keeps the most envelope keys for this slot
+    /// ([`crate::MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT`]). A new envelope of the slot is
+    /// IGNORE, and each envelope that `Seen` keeps stays a duplicate. Not a proof against the
+    /// message.
+    ExecutionPayloadEnvelopeSlotFull {
+        /// `payload.slot_number`.
+        slot: Slot,
+    },
     /// The signature verifier gave no verdict.
     NoSignatureVerdict,
     /// A valid payload attestation message of this slot from this validator is already seen.
@@ -65,10 +73,13 @@ pub enum IgnoreReason {
         /// `data.slot`.
         slot: Slot,
     },
-    /// The slot of the message is not the current slot, with `MAXIMUM_GOSSIP_CLOCK_DISPARITY`
-    /// on both ends.
+    /// The slot of the message is not current. For a payload attestation message: the slot is
+    /// not the current slot, with `MAXIMUM_GOSSIP_CLOCK_DISPARITY` on both ends, or it is
+    /// before the floor of the payload attestation keys of `Seen`. For an envelope: the slot is
+    /// before the floor of the envelope keys of `Seen`, the oldest slot that `Seen` keeps (not
+    /// a spec check). A slot before a floor is not current also for a clock that went back.
     NotCurrentSlot {
-        /// `data.slot`.
+        /// `data.slot`, or `payload.slot_number` of an envelope.
         slot: Slot,
     },
     /// The block of the message is not of the slot of the message.

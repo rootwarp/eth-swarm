@@ -410,6 +410,10 @@ impl StoreView<E> for NoPostStates<'_> {
     fn head_state(&self) -> Option<&BeaconState<E>> {
         StoreView::head_state(self.0)
     }
+
+    fn time_ms(&self) -> u64 {
+        self.0.time_ms()
+    }
 }
 
 #[test]
@@ -469,6 +473,10 @@ impl StoreView<E> for Head<'_> {
 
     fn head_state(&self) -> Option<&BeaconState<E>> {
         self.head
+    }
+
+    fn time_ms(&self) -> u64 {
+        self.store.time_ms()
     }
 }
 
@@ -1232,6 +1240,10 @@ impl StoreView<E> for ManySlots<'_> {
 
     fn head_state(&self) -> Option<&BeaconState<E>> {
         Some(self.chain.head_state())
+    }
+
+    fn time_ms(&self) -> u64 {
+        self.genesis_time_ms()
     }
 }
 

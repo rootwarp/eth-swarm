@@ -1,5 +1,9 @@
 # Gossip: a head state with no PTC of the message slot is IGNORE
 
+This record also has the bounds of `Seen` in `crates/gossip-validation`: the payload
+attestation keys of a slot with head changes, and the envelope keys and payloads (the last two
+sections).
+
 `validate_payload_attestation_message_gossip` (`specs/gloas/p2p-interface.md` L891–954,
 consensus-specs v1.7.0-beta.4) reads the PTC of the message slot from the head state,
 `state = store.block_states[get_head(store).root]`:
@@ -135,3 +139,92 @@ The only public prune is `Seen::prune_payload_attestations(store, current_time_m
 by the oldest current slot of the time, and an earlier time does nothing: the floor, the keys
 and the record of the last pruned slot stay as they are. The prune by slot is private to
 `seen.rs`, so no caller can give a floor that is not from the clock.
+
+## Deviation: a bounded `Seen` for envelopes
+
+`validate_execution_payload_envelope_gossip` (`specs/gloas/p2p-interface.md` L817-885) adds
+each valid envelope to `seen.execution_payload_envelopes` and keeps its payload in
+`seen.execution_payloads` (L881-883). The spec does not prune them, and the only slot check of
+the topic is the finalized slot (L846-849). A prune by the finalized slot has no bound while the
+chain does not finalize: each slot adds a key and a payload, and a proposer that equivocates
+adds more.
+
+**What.** `Seen` in `crates/gossip-validation/src/seen.rs` keeps the envelope keys and the
+payloads by `payload.slot_number`: `execution_payload_envelopes: BTreeMap<Slot, SlotEnvelopes>`,
+where `SlotEnvelopes` has the keys `(block_root, builder_index)` and the payloads by
+`block_hash`. `Seen::has_execution_payload_envelope` and `Seen::execution_payload` read each
+kept slot. The bounds are those of the payload attestation keys:
+
+- **Floor.** The key of an envelope carries `oldest_current_slot(store, store.time_ms())`
+  (`StoreView::time_ms` is `store.time_ms`, the time of the last tick). `Seen::resolve` removes
+  each slot before it with its payloads, and `Seen::prune_execution_payload_envelopes(store,
+  current_time_ms)` does the same with no envelope. The floor
+  (`Seen::min_execution_payload_envelope_slot`) does not decrease: an earlier time changes
+  nothing.
+- **Below the floor.** `Seen` keeps the keys of the last slot before the floor, but not its
+  payloads, until the floor moves again (`Seen::has_pruned_execution_payload_envelope`). An
+  envelope or a key of a slot before the floor is IGNORE, never ACCEPT: `EnvelopeAlreadySeen`
+  if that record has its key, else `NotCurrentSlot`. In the validation the record is part of
+  the duplicate check, the first check, and the floor check comes after the finalized slot
+  check and before the block slot check. Thus `UnknownBlock`, `BlockNotValid` and
+  `BeforeFinalizedSlot` keep their spec order. `Seen::resolve` does the same checks, so two
+  copies that were pending across a prune do not both accept. A clock of the store that goes
+  back does not change this.
+- **Slots.** At most `MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS` (8). A new slot past the limit
+  removes the oldest slot and moves the floor past it, with the record, so the removed slot is
+  never ACCEPT again.
+- **Keys of a slot.** At most `MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT` (16). The bid of a
+  block names one builder, so a slot has one key for each of its blocks, and more than one
+  block only if its proposer equivocates. At the limit, a valid envelope of a new block is
+  IGNORE (`ExecutionPayloadEnvelopeSlotFull { slot }`) and `Seen` does not change, for the
+  reasons of a full payload attestation slot above.
+- Only a valid signature (`Ok(true)` in `Seen::resolve`) changes `Seen`. An invalid signature,
+  a signature with no verdict, and each IGNORE or REJECT before the signature leave the keys,
+  the payloads, the floor and the record as they are.
+
+**Why.** `Seen` must have a bound also while the chain does not finalize, and the finalized
+slot gives none then. The clock gives one: on a healthy network the envelope of a slot comes in
+that slot, and the payload attestation topic already ends a slot at
+`end(s) + MAXIMUM_GOSSIP_CLOCK_DISPARITY`. The limits keep the bound for a clock that jumps and
+for a proposer that equivocates.
+
+**What differs.**
+
+- The spec accepts a valid envelope that is not seen, of any slot from the finalized slot.
+  Here an envelope of a slot before the floor is IGNORE. Such an envelope can still come by
+  req/resp (`ExecutionPayloadEnvelopesByRange`, `ExecutionPayloadEnvelopesByRoot`), which does
+  not read `Seen`.
+- A valid envelope of a new block in a full slot is IGNORE.
+- An envelope whose key the spec has seen, but `Seen` no longer keeps, and whose
+  `payload.slot_number` is at or after the floor but not the slot of its block, is REJECT
+  (`SlotMismatch`) where the spec gives IGNORE as a duplicate. The mismatch is a proven
+  violation.
+- The validation compares the slot with the floor of `Seen`, not with the clock. An envelope
+  of a slot before the oldest current slot, but not before the floor, goes to the signature
+  check, and `Seen::resolve` then gives IGNORE (`NotCurrentSlot`).
+- `seen.execution_payloads` has only the payloads of the kept slots. The
+  `execution_payload_bid` topic (L1029-1038) reads the payload of `bid.parent_block_hash`.
+  That topic is not in this crate yet. When it comes, a bid whose parent payload is before the
+  floor finds no payload here, where the spec's `Seen` has it: that change must read the
+  parent payload from another source, for example the store, or IGNORE the bid.
+
+No envelope is ACCEPT that the spec does not accept, and IGNORE does not penalize the peer.
+
+**Tests.** In `crates/gossip-validation/tests/execution_payload.rs`:
+
+- `an_envelope_slot_stays_through_the_clock_disparity_and_a_valid_envelope_then_removes_it`
+  and `an_explicit_prune_removes_an_envelope_slot_only_after_the_clock_disparity`: at
+  `end(1) + 500 ms` slot 1 and its payload stay, and at `end(1) + 501 ms` a valid envelope of
+  slot 2 (at the time of `on_tick`) or an explicit prune removes both.
+- `a_pending_duplicate_envelope_across_a_prune_must_ignore` and
+  `pending_envelopes_that_resolve_only_after_a_prune_must_ignore`: with each kind of prune, the
+  first copy accepts and the second is `EnvelopeAlreadySeen`, and copies that resolve only after
+  the prune are `NotCurrentSlot`.
+- `an_envelope_of_a_pruned_slot_must_ignore_also_at_an_earlier_time`: the validation and the
+  commit IGNORE a slot before the floor while the clock of the store goes back, and a prune with
+  an earlier time changes nothing.
+- `seen_keeps_the_envelopes_of_the_last_pruned_slot_until_the_floor_moves_again`.
+- `seen_keeps_at_most_the_envelope_slot_limit_and_a_removed_slot_must_not_accept_again` and
+  `a_full_envelope_slot_keeps_each_envelope_and_ignores_a_new_block`: the two limits.
+- `an_invalid_or_unverified_envelope_does_not_prune_seen`, and the invalid copies in the two
+  limit tests: they change nothing.
