@@ -219,10 +219,11 @@ pub fn ready(core: ChainCore<Minimal>, el: &El) -> ChainCore<Minimal> {
         .with_engine_timeout(ENGINE_TIMEOUT)
 }
 
-/// An item of one step.
+/// An item of one step. A gossip commit item changes nothing: it is a turn of the core.
 pub enum Item {
     Block(Box<Block>),
     Envelope(Box<Envelope>),
+    Gossip,
 }
 
 /// Serves `item` on `core`, whose VerifyBls calls go to `verify`. Returns the outcome and the
@@ -236,6 +237,7 @@ pub async fn step(
     let reply = match item {
         Item::Block(block) => sender.import(*block),
         Item::Envelope(envelope) => sender.envelope(*envelope),
+        Item::Gossip => sender.gossip(),
     }
     .expect("the queue must have room");
     let writer = core

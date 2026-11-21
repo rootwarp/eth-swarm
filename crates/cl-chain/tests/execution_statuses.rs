@@ -559,6 +559,31 @@ fn invalid_block_hash_records_nothing_and_moves_no_boundary() {
     assert!(!statuses.el_contradiction());
 }
 
+/// INVALID_BLOCK_HASH is a newPayload status: a forkchoiceUpdated must not answer it. As the
+/// answer to a forkchoiceUpdated it is a protocol fault, so an EL contradiction, and it records
+/// nothing: the recorded head 2 keeps its status, and the head 9 that has none gets none.
+#[test]
+fn an_fcu_invalid_block_hash_is_an_el_contradiction_that_records_nothing() {
+    for head in [2, 9] {
+        let mut statuses = ExecutionStatuses::new();
+        chain(&mut statuses, &[(1, 0, VALID), (2, 1, OPT)]);
+        let verdict = reply(ValidationStatus::InvalidBlockHash, None, hash(head));
+        assert_eq!(
+            statuses.record_head(hash(head), &verdict),
+            statuses.status(&hash(head))
+        );
+        assert!(
+            statuses.el_contradiction(),
+            "INVALID_BLOCK_HASH for the forkchoiceUpdated head {head}"
+        );
+        assert_eq!(
+            statuses_of(&statuses, [1, 2, 9]),
+            [Some(Valid), Some(Optimistic), None]
+        );
+        assert_eq!(statuses.len(), 2);
+    }
+}
+
 /// INVALID with a `null` `latestValidHash` is the Engine API's answer to a payload that does not
 /// hash to the `block_hash` that it claims (`shanghai.md`, from `engine_newPayloadV2`), and a
 /// tampered envelope can claim the hash of an honest payload. So it records nothing: a hash with
@@ -653,6 +678,101 @@ fn a_boundary_steps_over_evicted_invalid_ancestors() {
         ],
         "2 must be Invalid"
     );
+}
+
+/// INVALID for 33 on 32 with `latestValidHash` 31, while 32 is missing: the boundary waits for 32.
+/// Then 33 loses its full entry to `MAX_INVALID_PAYLOADS` newer Invalid payloads. It must keep
+/// its wait: when 32 is recorded, the boundary applies as if 33 had kept its entry. 32 must
+/// become Invalid and 31 Valid.
+#[test]
+fn an_evicted_invalid_payload_keeps_its_latest_valid_hash_wait() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(&mut statuses, &[(31, 30, OPT), (33, 32, OPT)]);
+    statuses.record(hash(33), hash(32), &invalid(Some(hash(31))));
+    for i in 0..u32::try_from(MAX_INVALID_PAYLOADS).unwrap() {
+        statuses.record(wide(i), hash(0xfe), &invalid(Some(hash(0xfe))));
+    }
+    assert_eq!(statuses.len(), MAX_INVALID_PAYLOADS + 1, "33 is evicted");
+    assert_eq!(
+        statuses_of(&statuses, [31, 32, 33]),
+        [Some(Optimistic), None, Some(Invalid)]
+    );
+    assert_eq!(statuses.record(hash(32), hash(31), &OPT), Some(Invalid));
+    assert_eq!(
+        statuses_of(&statuses, [31, 32, 33]),
+        [Some(Valid), Some(Invalid), Some(Invalid)],
+        "the boundary of the evicted 33 must apply"
+    );
+    assert!(!statuses.el_contradiction());
+}
+
+/// Finality at 3 drops 3 and its ancestors. An INVALID for 3, or strictly below it, is an EL
+/// contradiction: its `latestValidHash` is an ancestor of 3 (2, for 5 on 4) or the zero hash (for
+/// 5 on 4), or it is for 3 itself, also with the parent of 3 as `latestValidHash` (the boundary
+/// the walk finds first). A `latestValidHash` equal to 3 is not: INVALID for 4 with
+/// `latestValidHash` 3 is the ordinary boundary, and 4 and 5 are Invalid. Above 3 it is not
+/// either: INVALID for 5 with `latestValidHash` 4 makes 4 Valid and 5 Invalid. The finalized
+/// payload of the zero hash is no payload (`hash(0)` is the zero hash): an INVALID with the zero
+/// hash after it sets no contradiction.
+#[test]
+fn an_invalid_for_or_strictly_below_the_finalized_payload_is_an_el_contradiction() {
+    let finalized_at_3 = || {
+        let mut statuses = ExecutionStatuses::new();
+        chain(
+            &mut statuses,
+            &[
+                (1, 0, VALID),
+                (2, 1, OPT),
+                (3, 2, OPT),
+                (4, 3, OPT),
+                (5, 4, OPT),
+            ],
+        );
+        statuses.prune_finalized(&hash(3));
+        statuses
+    };
+    for (n, parent, latest_valid) in [
+        (5, 4, hash(2)),
+        (5, 4, Hash32::ZERO),
+        (3, 2, hash(1)),
+        (3, 2, hash(2)),
+    ] {
+        let mut statuses = finalized_at_3();
+        statuses.record(hash(n), hash(parent), &invalid(Some(latest_valid)));
+        assert!(
+            statuses.el_contradiction(),
+            "INVALID for {n} with {latest_valid} must contradict finality at 3"
+        );
+        assert_eq!(
+            statuses.status(&hash(n)),
+            Some(Invalid),
+            "{n} stays recorded"
+        );
+    }
+
+    let mut statuses = finalized_at_3();
+    statuses.record(hash(4), hash(3), &invalid(Some(hash(3))));
+    assert!(
+        !statuses.el_contradiction(),
+        "a latestValidHash equal to the finalized payload is honest"
+    );
+    assert_eq!(
+        statuses_of(&statuses, [3, 4, 5]),
+        [None, Some(Invalid), Some(Invalid)]
+    );
+
+    let mut statuses = finalized_at_3();
+    statuses.record(hash(5), hash(4), &invalid(Some(hash(4))));
+    assert!(!statuses.el_contradiction());
+    assert_eq!(statuses_of(&statuses, [4, 5]), [Some(Valid), Some(Invalid)]);
+
+    let mut statuses = ExecutionStatuses::new();
+    chain(&mut statuses, &[(1, 0, OPT), (2, 1, OPT)]);
+    assert_eq!(hash(0), Hash32::ZERO);
+    statuses.prune_finalized(&Hash32::ZERO);
+    statuses.record(hash(2), hash(1), &invalid(Some(Hash32::ZERO)));
+    assert!(!statuses.el_contradiction());
+    assert_eq!(statuses_of(&statuses, [1, 2]), [Some(Invalid); 2]);
 }
 
 /// 2 is Invalid, and it loses its full entry to `MAX_INVALID_PAYLOADS` newer Invalid payloads. It

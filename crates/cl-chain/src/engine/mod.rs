@@ -13,7 +13,8 @@
 //!
 //! The chain core ([`crate::core`]) calls newPayload on envelope import, keeps the execution
 //! statuses, and sends forkchoiceUpdated through a [`fcu::ForkchoiceSink`] (the sender) when
-//! the arguments of its fork choice head change.
+//! the arguments of its fork choice head change. It reads the answers back, and halts the sink
+//! when the EL contradicts itself.
 
 pub mod client;
 pub mod fcu;

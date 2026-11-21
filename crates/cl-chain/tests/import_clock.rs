@@ -2,10 +2,10 @@
 //!
 //! A test clock sets the time of the core ([`ChainCore::with_clock`]). The anchor is the
 //! genesis of the pinned minimal Gloas export, so the slot of the wall clock is
-//! `(now - genesis_time) / SLOT_DURATION_MS`. The core must IGNORE a block more than one slot
-//! ahead of that slot, before the slot loop of the transition. Fork choice then refuses a block
-//! one slot ahead, and the core commits nothing. A block far after the slot of
-//! its parent state, at the slot of the wall clock, must also be IGNORE before the slot loop.
+//! `(now - genesis_time) / SLOT_DURATION_MS`. The core must IGNORE a block after the current slot
+//! of fork choice at that clock, one slot ahead included, before cl-verify and the slot loop of
+//! the transition. A block far after the slot of its parent state, at the slot of the wall
+//! clock, must also be IGNORE before the slot loop.
 //! The core must not keep that refusal. A block past the pre-state window, but near its parent
 //! state, goes on to the proposer check (`tests/state_advance.rs` has the tests of that walk).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -40,12 +40,12 @@ fn core_at(now: impl FnOnce(&Fixture) -> u128) -> (ChainCore<Minimal>, Head, Blo
     (f.core.with_clock(clock), f.anchor, f.block)
 }
 
-/// A block one slot ahead of the wall clock passes the wall-clock bound of the core, cl-verify
-/// and the transition, and then fork choice refuses it: `on_block` takes no block of a slot
-/// after the current slot of the store. The store and the core take a block both or neither, so
-/// the core commits nothing and keeps no refusal. At its slot the same block commits in both.
+/// A block one slot ahead of the wall clock is after the current slot of fork choice, the slot
+/// `on_tick` takes from that clock: `on_block` would refuse it. The core IGNOREs it before
+/// cl-verify, so also before the transition (the proposer check comes first), and commits
+/// nothing and keeps no refusal. At its slot the same block commits in both.
 #[tokio::test]
-async fn a_block_ahead_of_the_fork_choice_clock_is_refused_by_the_store_and_commits_nothing() {
+async fn a_block_ahead_of_the_fork_choice_clock_is_ignored_before_verify_bls_and_commits_nothing() {
     let times: [Now; 2] = [|f| slot_start(f, 0), |f| slot_start(f, 1) - 1];
     for now in times {
         let f = fixture();
@@ -65,8 +65,8 @@ async fn a_block_ahead_of_the_fork_choice_clock_is_refused_by_the_store_and_comm
             "fork choice must refuse a slot 1 block before slot 1: {outcome:?}"
         );
         assert!(
-            !verify.calls().is_empty(),
-            "the block must pass the wall-clock bound of the core and reach cl-verify"
+            verify.calls().is_empty(),
+            "the block must not reach cl-verify or the transition"
         );
         assert_unchanged(&core, anchor, block_root);
         assert!(!core.is_committed(&block_root));

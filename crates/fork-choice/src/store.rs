@@ -5,7 +5,7 @@
 
 use crate::Error;
 use consensus_types::gloas::{BeaconBlock, BeaconState, Checkpoint};
-use consensus_types::primitives::{Epoch, Root, Slot, ValidatorIndex};
+use consensus_types::primitives::{Epoch, Hash32, Root, Slot, ValidatorIndex};
 use ssz_types::typenum::Unsigned;
 use state_transition::accessors::get_current_epoch;
 use state_transition::{state_root, Preset};
@@ -445,6 +445,36 @@ pub fn compute_slots_since_epoch_start<E: Preset>(slot: Slot) -> Slot {
 /// `is_payload_verified` (G L314-320).
 pub fn is_payload_verified<E: Preset>(store: &Store<E>, root: Root) -> bool {
     store.payloads.contains(&root)
+}
+
+/// Not a spec function: takes out of `store.payloads` each block, kept or dropped, whose bid
+/// `block_hash` the EL has now found invalid (`invalid`). `bellatrix/optimistic-sync.md`: an
+/// `INVALIDATED` payload MUST NOT be in the canonical chain. [`get_node_children`] then gives no
+/// FULL node of such a block, so [`get_head`] moves to its EMPTY node or another branch, and
+/// `on_block` refuses a child on that payload. Returns whether it took any out.
+///
+/// [`get_node_children`]: crate::get_node_children
+/// [`get_head`]: crate::get_head
+pub fn invalidate_payloads<E: Preset>(
+    store: &mut Store<E>,
+    invalid: impl Fn(&Hash32) -> bool,
+) -> bool {
+    let Store {
+        payloads,
+        blocks,
+        dropped,
+        ..
+    } = store;
+    let before = payloads.len();
+    payloads.retain(|root| {
+        let block = blocks
+            .get(root)
+            .or_else(|| dropped.get(root).map(|d| &d.block));
+        !block.is_some_and(|block| {
+            invalid(&block.body.signed_execution_payload_bid.message.block_hash)
+        })
+    });
+    payloads.len() != before
 }
 
 /// `get_parent_payload_status` (G L368-372): FULL when the bid of `block` builds on the block

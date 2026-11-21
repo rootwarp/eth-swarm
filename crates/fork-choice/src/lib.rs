@@ -17,8 +17,9 @@
 //! envelope or a payload attestation message through a [`SignatureVerifier`]. Data
 //! availability and the answer of the execution engine for an envelope come through a
 //! [`DataAvailabilityCheck`] and an [`ExecutionEngine`]. [`on_execution_payload_envelope`]
-//! fills `store.payloads`. The test seam `testing::mark_payload_verified` (tests only) also
-//! does, without the checks of the handler.
+//! fills `store.payloads`, and [`invalidate_payloads`] takes out those the EL later found
+//! invalid. The test seam `testing::mark_payload_verified` (tests only) also fills it, without
+//! the checks of the handler.
 //!
 //! The spec's store keeps every block. Here [`on_tick`] still drops the blocks that do not
 //! descend from the finalized checkpoint block once finality moves, from the kept set that
@@ -54,9 +55,9 @@ pub use payload_attestation::on_payload_attestation_message;
 pub use store::{
     compute_slots_since_epoch_start, get_ancestor, get_checkpoint_block, get_current_slot,
     get_current_store_epoch, get_forkchoice_store, get_parent_payload_status,
-    get_slots_since_genesis, get_time_into_slot_ms, is_ancestor, is_parent_node_full,
-    is_payload_verified, milliseconds_to_seconds, seconds_to_milliseconds, ForkChoiceNode,
-    LatestMessage, PayloadStatus, Store,
+    get_slots_since_genesis, get_time_into_slot_ms, invalidate_payloads, is_ancestor,
+    is_parent_node_full, is_payload_verified, milliseconds_to_seconds, seconds_to_milliseconds,
+    ForkChoiceNode, LatestMessage, PayloadStatus, Store,
 };
 pub use weights::{
     get_filtered_node_tree, get_head, get_node_children, get_weight, is_valid_dependent_root,
