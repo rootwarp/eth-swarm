@@ -21,8 +21,11 @@
 //!   timed out. Any other gRPC status (a contract violation) is not retried: the same arguments
 //!   would be refused again.
 //! - **Answers.** The response, `PayloadStatus` included, goes to the caller as it is
-//!   ([`FcuSender::outcomes`]), an `EngineError` other than the retried ones too. This module
-//!   reads no verdict from it.
+//!   ([`FcuSender::outcomes`], and once each through [`ForkchoiceSink::take_outcome`]), an
+//!   `EngineError` other than the retried ones too. This module reads no verdict from it.
+//! - **Halt** ([`ForkchoiceSink::halt`]). The arguments not taken yet go, a lost call is not put
+//!   back, a call taken but not sent yet is not sent, and the task ends. The chain core halts it
+//!   when the EL contradicts itself.
 //! - **Metrics.** `chain_fcu_sent_total` (calls sent), `chain_fcu_coalesced_total`, and
 //!   `chain_fcu_errors_total{kind}` ([`FcuErrorKind`]).
 
@@ -39,7 +42,7 @@ use prometheus_client::registry::Registry;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
@@ -175,35 +178,64 @@ pub struct FcuOutcome {
     pub response: pb::ForkchoiceUpdatedResponse,
 }
 
-/// The one-value slot between [`FcuSender::send`] and the task.
+/// The one-value slot between [`FcuSender::send`] and the task. Once halted, it is empty for
+/// good; `halted` changes only under the lock of `latest`.
 #[derive(Default)]
 struct Slot {
     latest: Mutex<Option<ForkchoiceArgs>>,
     ready: Notify,
+    halted: AtomicBool,
 }
 
 impl Slot {
     /// Puts `args` in the slot: true if they replaced arguments not taken yet.
     fn put(&self, args: ForkchoiceArgs) -> bool {
-        let replaced = self.lock().replace(args).is_some();
+        let replaced = {
+            let mut latest = self.lock();
+            if self.halted() {
+                return false;
+            }
+            latest.replace(args).is_some()
+        };
         self.ready.notify_one();
         replaced
     }
 
-    /// Puts back `args` whose call failed, unless newer ones came meanwhile.
+    /// Puts back `args` whose call failed, unless newer ones came meanwhile or it is halted.
     fn put_back(&self, args: ForkchoiceArgs) {
-        self.lock().get_or_insert(args);
+        let mut latest = self.lock();
+        if !self.halted() {
+            latest.get_or_insert(args);
+        }
     }
 
-    /// Takes the latest arguments, waiting until there are some.
-    async fn take(&self) -> ForkchoiceArgs {
+    /// Takes the latest arguments, waiting until there are some: `None` once halted.
+    async fn take(&self) -> Option<ForkchoiceArgs> {
         loop {
-            let taken = self.lock().take();
-            if let Some(args) = taken {
-                return args;
+            {
+                let mut latest = self.lock();
+                if self.halted() {
+                    return None;
+                }
+                if let Some(args) = latest.take() {
+                    return Some(args);
+                }
             }
             self.ready.notified().await;
         }
+    }
+
+    /// Empties the slot for good, and wakes the task so that it ends.
+    fn halt(&self) {
+        let mut latest = self.lock();
+        self.halted.store(true, Ordering::SeqCst);
+        *latest = None;
+        drop(latest);
+        self.ready.notify_one();
+    }
+
+    fn halted(&self) -> bool {
+        self.halted.load(Ordering::SeqCst)
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<ForkchoiceArgs>> {
@@ -233,8 +265,7 @@ struct Task {
 impl Task {
     async fn run(mut self) {
         let mut backoff = BACKOFF_MIN;
-        loop {
-            let args = self.slot.take().await;
+        while let Some(args) = self.slot.take().await {
             match self.call(args).await {
                 Ok(outcome) => {
                     backoff = BACKOFF_MIN;
@@ -275,6 +306,10 @@ impl Task {
                 }
             }
         };
+        // Halted while it connected: the call does not go out.
+        if self.slot.halted() {
+            return Err(Failed::Refused);
+        }
         let seq = self.seq.next();
         self.metrics.sent.inc();
         let call = client.forkchoice_updated(args.request(seq));
@@ -327,6 +362,8 @@ pub struct FcuSender {
     slot: Arc<Slot>,
     metrics: FcuMetrics,
     outcomes: watch::Receiver<Option<FcuOutcome>>,
+    /// The `seq` of the latest answer [`ForkchoiceSink::take_outcome`] gave, 0 before the first.
+    taken: AtomicU64,
     task: JoinHandle<()>,
 }
 
@@ -356,6 +393,7 @@ impl FcuSender {
             slot,
             metrics,
             outcomes,
+            taken: AtomicU64::new(0),
             task: tokio::spawn(task.run()),
         }
     }
@@ -380,10 +418,19 @@ impl ForkchoiceSink for FcuSender {
     }
 
     fn take_outcome(&self) -> Option<FcuOutcome> {
-        None
+        let latest = self.outcomes.borrow();
+        let seq = latest.as_ref()?.seq;
+        // The task answers in `seq` order, so a newer answer has a higher `seq`.
+        if self.taken.fetch_max(seq, Ordering::Relaxed) < seq {
+            latest.clone()
+        } else {
+            None
+        }
     }
 
-    fn halt(&self) {}
+    fn halt(&self) {
+        self.slot.halt();
+    }
 }
 
 impl Drop for FcuSender {

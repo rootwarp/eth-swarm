@@ -277,6 +277,14 @@ impl Wall {
     }
 }
 
+/// `core` whose fork choice store took the tick of the start of `slot` (`on_tick`), as before a
+/// wall clock that stepped back. A block one slot ahead of the wall clock is then not after the
+/// current slot of fork choice, so it goes on to the checks after the wall-clock bound.
+fn store_at(core: ChainCore<Minimal>, wall: &Wall, slot: u64) -> ChainCore<Minimal> {
+    let ms = u64::try_from(wall.ms(slot)).unwrap();
+    core.with_fork_choice(|store| fork_choice::on_tick(store, ms).unwrap())
+}
+
 /// A test clock that a fake cl-verify can move, in Unix milliseconds.
 #[derive(Clone)]
 struct Moving(Arc<AtomicU64>);
@@ -1136,6 +1144,8 @@ async fn one_slot_of_the_core_clock_admits_eight_epochs_of_walk() {
     let core = f.core.with_clock(wall.at(first_slot));
     let (outcome, core, _) = import_one(core, first.clone(), Answer::Valid).await;
     assert_eq!(outcome, committed(&first));
+    // `next` is one slot ahead of the clock: only a store ahead of the clock takes it.
+    let core = store_at(core, &wall, next_slot);
 
     let verify = FakeVerify::new(Answer::Valid);
     let watched = import_watched(
@@ -1196,6 +1206,8 @@ async fn two_walks_of_four_epochs_spend_the_admission_budget_of_one_slot() {
     let (outcome, core, _) = import_one(core, from_first.clone(), Answer::Valid).await;
     assert_eq!(outcome, committed(&from_first));
     assert!(core.advanced_state(&first_root, 4).is_some());
+    // `last` is one slot ahead of the clock: only a store ahead of the clock takes it.
+    let core = store_at(core, &wall, now + 1);
 
     let verify = FakeVerify::new(Answer::Valid);
     let watched = import_watched(

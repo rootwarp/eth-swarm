@@ -21,8 +21,9 @@
 //!   that misses [`ChainCore::with_payload_gate`] commits nothing
 //!   ([`PermitAll`](crate::import::block::PermitAll) is an explicit opt-in);
 //! - the block slot is more than [`MAX_FUTURE_SLOTS`] ahead of the slot of the wall clock
-//!   ([`ChainCore::with_clock`], the system clock if not set), or the wall clock is before
-//!   genesis: IGNORE;
+//!   ([`ChainCore::with_clock`], the system clock if not set), or after the current slot of the
+//!   fork choice store at that clock (`on_tick` never goes back), which `on_block` refuses, or
+//!   the wall clock is before genesis: IGNORE;
 //! - the core committed the block, or it is the anchor: IGNORE;
 //! - the core refused the block before and kept the refusal: the same answer again;
 //! - the parent has no pre-state, in the LRU or else in the fork choice store (see
@@ -64,8 +65,7 @@
 //!   pre-state and the proposer domain of the fork that the network schedule gives for the
 //!   epoch of the block ([`schedule_proposer_domain`]): INVALID on an INVALID verdict (kept for
 //!   that signature only), IGNORE on no verdict;
-//! - the wall clock again, after that VerifyBls call: the block slot is more than
-//!   [`MAX_FUTURE_SLOTS`] ahead of its slot, or it is before genesis: IGNORE;
+//! - the slot checks again, after that VerifyBls call, at the wall clock then: IGNORE;
 //! - the walk does not fit in the admission budget of that slot of the wall clock
 //!   ([`AdvanceBudget`]): at most
 //!   [`MAX_ADVANCE_EPOCHS_PER_SLOT`](super::advance::MAX_ADVANCE_EPOCHS_PER_SLOT) epochs of walk
@@ -105,10 +105,10 @@
 //! top of the pre-states. A block that passed each check above goes to the store first:
 //! `on_tick` with the wall clock (never back), then `on_block`, whose state transition gives the
 //! post-state the core computed (no second transition, no second VerifyBls call). A refusal of
-//! the store, such as a block of a slot after the current slot of the store, is IGNORE and not
-//! kept: the core commits nothing (a tick stays, as time passed). Since no attestation reaches
-//! the store yet, the core keeps the state of the justified checkpoint that `get_head` reads
-//! (`store_target_checkpoint_state`, with the real `process_slots`).
+//! the store is IGNORE and not kept: the core commits nothing (a tick stays, as time passed).
+//! Since no attestation reaches the store yet, the core keeps the state of the justified
+//! checkpoint that `get_head` reads (`store_target_checkpoint_state`, with the real
+//! `process_slots`).
 //!
 //! After a commit or an envelope import, the head is `get_head` of the store. A new finalized
 //! checkpoint prunes the EL's verdicts at the bid `parent_block_hash` of the finalized block, the
@@ -118,8 +118,13 @@
 //! the last ones it sent. If `get_head` fails, the head stays and no forkchoiceUpdated is sent,
 //! also when the safe or the finalized checkpoint moved: the old head with the new safe or
 //! finalized hash is no fork choice of the store. The last arguments sent stay as they were. The
-//! prune at finality still runs, as it reads only the finalized checkpoint. `get_head` has no
-//! filter of invalidated payloads yet: a later INVALID does not move the head.
+//! prune at finality still runs, as it reads only the finalized checkpoint.
+//!
+//! **A later INVALID.** A newPayload verdict, or an INVALID with a `latestValidHash` that the
+//! EL answers to a forkchoiceUpdated (the core takes the sink's latest answer at the start of
+//! each turn, [`ForkchoiceSink::take_outcome`]), can make payloads `Invalid` that the store has
+//! verified. They leave the store (`invalidate_payloads`), so `get_head` offers no FULL node of
+//! their blocks, and the head moves at once, with its forkchoiceUpdated.
 //! [`ChainCore::payload_verified`] is `true` while the store has the payload and the LRU holds
 //! the pre-state of its block; the checks of an import read the store alone
 //! (`is_payload_verified`).
@@ -127,7 +132,10 @@
 //! **Fail closed.** While the EL contradiction is set, no block and no envelope reaches the
 //! store (`on_tick`, `on_block` and `on_execution_payload_envelope` are not called), `get_head`
 //! does not run and no forkchoiceUpdated is sent: the head and the last arguments sent stay as
-//! they were. The newPayload answer that sets it is refused and sends none.
+//! they were. The answer that sets it (newPayload or forkchoiceUpdated) moves nothing, and halts
+//! the sink ([`ForkchoiceSink::halt`]): queued arguments and the retries of a lost call never
+//! reach the EL, and a later answer is not read. An INVALID at or below the finalized payload is
+//! such a contradiction ([`ExecutionStatuses`]).
 //!
 //! # Seen roots
 //!
@@ -145,9 +153,9 @@
 //! the block and on the pre-state of its parent. A refusal for the proposer signature holds
 //! only for that signature, as the block root does not commit to it. The core does not keep no
 //! verdict (the block can come again and get a verdict in time), a parent without a pre-state
-//! (it can come), a refused payload, a refusal from the EL's verdicts, the wall-clock bound (the
-//! same block is in that bound once its slot comes, and that check costs no slot loop and no
-//! VerifyBls call), a caller that stopped waiting, a far-parent proposer past the registry of
+//! (it can come), a refused payload, a refusal from the EL's verdicts, the slot checks (the
+//! same block passes them once its slot comes, and they cost no slot loop and no VerifyBls
+//! call), a caller that stopped waiting, a far-parent proposer past the registry of
 //! the parent pre-state or one that it shows slashed, exited or withdrawable, a fork of the
 //! parent pre-state or of the advanced state that is not the schedule fork, the admission
 //! budget, or a refusal of the walk: a later walk can start from a nearer state, or have more
@@ -177,8 +185,9 @@
 //!   refusal or no verdict is IGNORE.
 //!
 //! An imported envelope makes its block's payload verified (VALID, or SYNCING or ACCEPTED: the
-//! table keeps which). A refused one changes nothing but the record of a verdict the EL gave.
-//! INVALID with a `null` `latestValidHash` says that this payload does not hash to the
+//! table keeps which). A refused one changes nothing but the record of a verdict the EL gave,
+//! and the verified payloads that this record makes `Invalid` (see
+//! [A later INVALID](#fork-choice)). INVALID with a `null` `latestValidHash` says that this payload does not hash to the
 //! `block_hash` it claims, so it records nothing: it refuses that envelope only, and the honest
 //! envelope of the block can still import.
 //!
@@ -199,7 +208,7 @@ use crate::engine::fcu::{
     forkchoice_args, Bid, ForkchoiceArgs, ForkchoiceSink, ForkchoiceView, PayloadStatus,
     CUSTODY_COLUMN_BYTES,
 };
-use crate::engine::verdict::{ElVerdict, ExecutionStatus, ExecutionStatuses};
+use crate::engine::verdict::{map_proto, ElVerdict, ExecutionStatus, ExecutionStatuses};
 use crate::import::block::{
     check_proposer_signature, check_proposer_signature_in, import_block, process_empty_slots,
     schedule_proposer_domain, NotImported, PayloadImportGate,
@@ -208,13 +217,13 @@ use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{
     BeaconState, Checkpoint, SignedBeaconBlock, SignedExecutionPayloadEnvelope,
 };
-use consensus_types::primitives::{BLSPubkey, Epoch, Root, Slot, ValidatorIndex};
+use consensus_types::primitives::{BLSPubkey, Epoch, Hash32, Root, Slot, ValidatorIndex};
 use consensus_types::signing::DOMAIN_BEACON_PROPOSER;
 use ethswarm_proto::verify::BlsSet;
 use fork_choice::{
-    get_forkchoice_store, get_head, is_payload_verified, on_block, on_execution_payload_envelope,
-    on_tick, store_target_checkpoint_state, DataAvailabilityCheck, EnvelopeError, StateProvider,
-    Store,
+    get_current_slot, get_forkchoice_store, get_head, invalidate_payloads, is_payload_verified,
+    on_block, on_execution_payload_envelope, on_tick, store_target_checkpoint_state,
+    DataAvailabilityCheck, EnvelopeError, StateProvider, Store,
 };
 use network_config::ChainConfig;
 use state_transition::accessors::get_domain;
@@ -243,7 +252,9 @@ pub const DEFAULT_ENGINE_TIMEOUT: Duration = CALL_TIMEOUT;
 
 /// The most slots a block can be ahead of the slot of the wall clock: one slot of clock skew
 /// between the core and the proposer. The gossip rule (`MAXIMUM_GOSSIP_CLOCK_DISPARITY`) is
-/// tighter, but it is for gossip validation, and no code reads that config value yet.
+/// tighter, but it is for gossip validation, and no code reads that config value yet. A block
+/// after the current slot of fork choice is IGNORE too, so this bound counts only while the
+/// time of the store is ahead of the wall clock.
 pub const MAX_FUTURE_SLOTS: u64 = 1;
 
 /// The most roots of refused blocks that the core keeps \[est\]. Past it, the root refused
@@ -399,8 +410,9 @@ pub fn queue<E: Preset>(capacity: usize) -> (CoreSender<E>, CoreQueue<E>) {
 impl<E: Preset> CoreSender<E> {
     /// Queues `block` for import. The answer comes on the receiver; a receiver that closes
     /// without one means the core stopped (IGNORE). The core checks the slot of the block
-    /// against the wall clock before the slot loop (see the module docs). If the caller drops
-    /// the receiver, the core stops the import at its next check of the caller (IGNORE).
+    /// against the wall clock and fork choice before the slot loop (see the module docs). If
+    /// the caller drops the receiver, the core stops the import at its next check of the caller
+    /// (IGNORE).
     pub fn import(
         &self,
         block: SignedBeaconBlock<E>,
@@ -531,6 +543,11 @@ impl<E: Preset> ChainCore<E> {
         let store = get_forkchoice_store(state.clone(), block.message.clone(), slot_ms)
             .map_err(AnchorError::Store)?;
         let head = store_head(&store).map_err(AnchorError::Store)?;
+        // The finalized payload of the anchor, for the contradiction check of the table.
+        let mut statuses = ExecutionStatuses::new();
+        if let Some(bid) = bid_of(&store, &store.finalized_checkpoint().root) {
+            statuses.prune_finalized(&bid.parent_block_hash);
+        }
         Ok(Self {
             config,
             genesis_time: state.genesis_time,
@@ -539,7 +556,7 @@ impl<E: Preset> ChainCore<E> {
             budget: AdvanceBudget::new(),
             committed: HashSet::from([head.block_root]),
             refused: Refused::new(MAX_REFUSED_ROOTS),
-            statuses: ExecutionStatuses::new(),
+            statuses,
             head,
             finalized: store.finalized_checkpoint().clone(),
             store,
@@ -733,6 +750,10 @@ impl<E: Preset> ChainCore<E> {
         while let Some(item) = runtime.block_on(queue.next()) {
             self.turns += 1;
             let turn = self.turns;
+            // Before the item: the finalized payload of the table, then the EL's latest answer
+            // to a forkchoiceUpdated.
+            self.note_finality();
+            self.fcu_answer();
             let (outcome, reply) = match item {
                 Item::Import(item) => (
                     self.import(&item.block, &item.reply, verifier, runtime),
@@ -1030,9 +1051,9 @@ impl<E: Preset> ChainCore<E> {
         };
         let checked = on_execution_payload_envelope(&mut self.store, &hooks, signed);
         let el = hooks.el.get();
-        // The answer that set it is refused too: the hooks refused the payload, so the store
-        // did not change.
-        if self.statuses.el_contradiction() {
+        // The answer that set it is refused too: the hooks refused the payload, so the store did
+        // not change. Else a payload this verdict made `Invalid` leaves the store.
+        if el.is_some() && self.reconcile() {
             return Outcome::Ignored(EL_CONTRADICTION.into());
         }
         match checked {
@@ -1075,21 +1096,16 @@ impl<E: Preset> ChainCore<E> {
         Ok(())
     }
 
-    /// After a commit or an envelope import: the prune at finality, the head and the
-    /// forkchoiceUpdated (see [Fork choice](#fork-choice)). Nothing while the EL contradiction
-    /// is set, and no new head and no forkchoiceUpdated while `get_head` fails.
+    /// After a commit, an envelope import or a payload that left the store: the prune at
+    /// finality, the head and the forkchoiceUpdated (see [Fork choice](#fork-choice)). Nothing
+    /// while the EL contradiction is set, and no new head and no forkchoiceUpdated while
+    /// `get_head` fails.
     fn refresh(&mut self) {
         if self.statuses.el_contradiction() {
             return;
         }
         // It reads only the finalized checkpoint, so it does not wait for a head.
-        let finalized = self.store.finalized_checkpoint();
-        if *finalized != self.finalized {
-            if let Some(bid) = bid_of(&self.store, &finalized.root) {
-                self.statuses.prune_finalized(&bid.parent_block_hash);
-            }
-            self.finalized = finalized.clone();
-        }
+        self.note_finality();
         match store_head(&self.store) {
             Ok(head) => self.head = head,
             // The old head with the safe and finalized hashes of the store now is no fork choice
@@ -1117,6 +1133,60 @@ impl<E: Preset> ChainCore<E> {
         }
     }
 
+    /// A new finalized checkpoint of the store prunes the EL's verdicts at the bid
+    /// `parent_block_hash` of its block, which the table keeps as the finalized payload.
+    fn note_finality(&mut self) {
+        let finalized = self.store.finalized_checkpoint();
+        if *finalized != self.finalized {
+            if let Some(bid) = bid_of(&self.store, &finalized.root) {
+                self.statuses.prune_finalized(&bid.parent_block_hash);
+            }
+            self.finalized = finalized.clone();
+        }
+    }
+
+    /// The sink's latest answer to a forkchoiceUpdated, once (see [Fork choice](#fork-choice)).
+    /// Only INVALID with a `latestValidHash` for the head hash sent counts. Nothing while the
+    /// EL contradiction is set: a call already on its way when the sink halted moves nothing.
+    fn fcu_answer(&mut self) {
+        if self.statuses.el_contradiction() {
+            return;
+        }
+        let Some(outcome) = self.sink.as_deref().and_then(|sink| sink.take_outcome()) else {
+            return;
+        };
+        let head = outcome.args.head_block_hash;
+        let (Some(status), None) = (&outcome.response.status, &outcome.response.error) else {
+            return;
+        };
+        let verdict = map_proto(status, head);
+        if let ElVerdict::Invalid {
+            latest_valid_hash: Some(_),
+        } = verdict
+        {
+            self.statuses.record_head(head, &verdict);
+            self.reconcile();
+        }
+    }
+
+    /// After a verdict in the table: `true` on an EL contradiction, and the sink halts. Else
+    /// each verified payload that the table now has `Invalid` leaves the fork choice store, and
+    /// the head follows if one did.
+    fn reconcile(&mut self) -> bool {
+        if self.statuses.el_contradiction() {
+            if let Some(sink) = self.sink.as_deref() {
+                sink.halt();
+            }
+            return true;
+        }
+        let statuses = &self.statuses;
+        let invalid = |hash: &Hash32| statuses.status(hash) == Some(ExecutionStatus::Invalid);
+        if invalidate_payloads(&mut self.store, invalid) {
+            self.refresh();
+        }
+        false
+    }
+
     /// The deadline of the VerifyBls calls of an import that starts now: on the clock of the
     /// timers of `runtime`. A timeout past the range of `Instant` gives no time at all.
     fn deadline(&self, runtime: &Handle) -> Instant {
@@ -1126,7 +1196,8 @@ impl<E: Preset> ChainCore<E> {
     }
 
     /// The slot of the wall clock. `Err` (why, for the log) if `slot` is more than
-    /// [`MAX_FUTURE_SLOTS`] ahead of it, or if the wall clock is before genesis.
+    /// [`MAX_FUTURE_SLOTS`] ahead of it or after the current slot of the fork choice store at
+    /// that clock (`on_tick` never goes back), or if the wall clock is before genesis.
     fn check_slot(&self, slot: Slot) -> Result<Slot, String> {
         let now_ms = (self.clock)();
         let wall_slot = now_ms
@@ -1139,7 +1210,14 @@ impl<E: Preset> ChainCore<E> {
                  slot {wall_slot}"
             ));
         }
-        Ok(Slot::try_from(wall_slot).unwrap_or(Slot::MAX))
+        let wall_slot = Slot::try_from(wall_slot).unwrap_or(Slot::MAX);
+        let current = get_current_slot(&self.store).max(wall_slot);
+        if slot > current {
+            return Err(format!(
+                "block slot {slot} is after the current slot {current} of fork choice"
+            ));
+        }
+        Ok(wall_slot)
     }
 }
 

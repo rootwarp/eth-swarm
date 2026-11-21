@@ -17,10 +17,10 @@ use consensus_types::primitives::{Epoch, Gwei, Root, Slot, ValidatorIndex};
 use consensus_types::Minimal;
 use fork_choice::testing::{add_equivocating_index, mark_payload_verified, set_latest_message};
 use fork_choice::{
-    get_ancestor, get_filtered_node_tree, get_forkchoice_store, get_head, get_weight,
-    is_payload_verified, is_valid_dependent_root, on_attestation, on_block, on_tick,
-    store_target_checkpoint_state, AttestationError, Error, ForkChoiceNode, LatestMessage,
-    PayloadStatus, SignatureVerifier, StateProvider, Store,
+    get_ancestor, get_filtered_node_tree, get_forkchoice_store, get_head, get_node_children,
+    get_weight, invalidate_payloads, is_payload_verified, is_valid_dependent_root, on_attestation,
+    on_block, on_tick, store_target_checkpoint_state, AttestationError, Error, ForkChoiceNode,
+    LatestMessage, PayloadStatus, SignatureVerifier, StateProvider, Store,
 };
 use ssz::{BitVector, ProgressiveBitList};
 use state_transition::caches::CommitteeCache;
@@ -354,6 +354,40 @@ fn a_dropped_block_is_a_known_block_and_keeps_the_store() {
         Err(Error::UnknownParent(f.x))
     );
     assert_eq!(f.store, before);
+}
+
+/// The payloads of `b`, `d` and `e` are verified, `b` a block that the prune dropped. The EL then
+/// finds the payloads of `b` and `d` invalid: both leave `store.payloads`, so `d` has no FULL
+/// node and the head is its EMPTY node. The payload of `e`, which the EL did not name, stays.
+#[test]
+fn invalidated_payloads_leave_the_store_kept_or_dropped() {
+    let mut f = finalized();
+    tick(&mut f.store, 11);
+    assert!(f.store.block(f.b).is_none(), "the prune dropped b");
+    for root in [f.b, f.d, f.e] {
+        mark_payload_verified(&mut f.store, root);
+    }
+    assert!(get_node_children(&f.store, &pending(f.d))
+        .unwrap()
+        .contains(&full(f.d)));
+    let invalid = [f.b, f.d].map(|root| {
+        let block = f.store.block_or_dropped(root).unwrap();
+        block.body.signed_execution_payload_bid.message.block_hash
+    });
+
+    assert!(invalidate_payloads(&mut f.store, |hash| invalid.contains(hash)));
+    assert!(!is_payload_verified(&f.store, f.b));
+    assert!(!is_payload_verified(&f.store, f.d));
+    assert!(is_payload_verified(&f.store, f.e));
+    assert_eq!(
+        get_node_children(&f.store, &pending(f.d)),
+        Ok(vec![empty(f.d)])
+    );
+    assert_eq!(get_head(&f.store), Ok(empty(f.d)));
+    assert!(
+        !invalidate_payloads(&mut f.store, |hash| invalid.contains(hash)),
+        "nothing more to take out"
+    );
 }
 
 #[test]
