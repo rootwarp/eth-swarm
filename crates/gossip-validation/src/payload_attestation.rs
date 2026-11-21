@@ -1,6 +1,20 @@
 //! The `payload_attestation_message` topic: `validate_payload_attestation_message_gossip`
 //! (L891-954), with `is_current_slot` (`altair/p2p-interface.md` L95-107) and
 //! `is_within_slot_range` (`phase0/p2p-interface.md` L395-411).
+//!
+//! # Deviation: a head state with no PTC of the slot is IGNORE
+//!
+//! The spec reads `get_ptc(state, data.slot)` on the head state (L937-938). `get_ptc`
+//! (`gloas/beacon-chain.md` L1392-1404) asserts `epoch >= GLOAS_FORK_EPOCH`,
+//! `epoch + 1 >= state_epoch` and `epoch <= state_epoch + MIN_SEED_LOOKAHEAD`, where `epoch` is
+//! the epoch of `data.slot` and `state_epoch` is the epoch of the head state. The spec does not
+//! say what a failed assert is in this function. Here it is IGNORE ([`IgnoreReason::NoPtc`]),
+//! not REJECT. The earlier checks already proved the fork epoch and the current slot, so a
+//! failed assert shows that the local head state is out of the window, for example a head that
+//! is behind the current slot during a sync. It does not show that the message is invalid.
+//! IGNORE does not penalize the peer, and `Seen` does not get the key, so a later copy can
+//! pass when the head is in the window again. `arch/gossip-payload-attestation-ptc.md` records
+//! this deviation and the tests that pin it.
 
 use crate::seen::{Seen, SeenKey, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT};
 use crate::verdict::{IgnoreReason, RejectReason, Verdict};
@@ -77,7 +91,8 @@ where
 /// ([`StoreView::head_state`]), not the post-state of the attested block: the index must be in
 /// its registry and in its PTC of `data.slot`, and the signing root has its PTC domain at the
 /// epoch of `data.slot`. A store with no head state, or a head state with no PTC of
-/// `data.slot`, is IGNORE: neither proves the message invalid.
+/// `data.slot` (the deviation of the module documentation), is IGNORE: neither proves the
+/// message invalid.
 ///
 /// `gloas_fork_epoch` is the config value `GLOAS_FORK_EPOCH`. The signer is the validator by
 /// index. Its key is the key of the head state: a PTC member is active, so the finalized
