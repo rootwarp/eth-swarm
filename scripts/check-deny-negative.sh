@@ -6,7 +6,7 @@
 # with the expected diagnostic:
 #   control      the unmodified copy passes `cargo deny check bans sources` with no error (so a
 #                failure below comes from the injected violation, not from the copy)
-#   libp2p-dup   a second libp2p-swarm version (crates.io =0.47.1 next to the patched 0.48)
+#   libp2p-dup   a second libp2p-swarm version (crates.io =0.47.1 next to the patched 0.49)
 #                -> error[duplicate] for crate 'libp2p-swarm'
 #   dev-dup      the same, as a dev-dependency only (multiple-versions-include-dev)
 #                -> error[duplicate] for crate 'libp2p-swarm'
