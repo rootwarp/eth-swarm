@@ -3,8 +3,13 @@
 //! A block more than `PRE_STATE_EPOCHS` epochs of slots after the state of its parent needs the
 //! empty slots between them. The core walks them on a copy of the parent state, from the best
 //! start: the parent state, or a checkpoint of an earlier walk from the same parent. The walk
-//! is at most eight epochs of slots, and it stops one slot before the block. The core then
-//! checks the proposer on the advanced state, and imports the block on it.
+//! is at most eight epochs of slots, and it stops one slot before the block.
+//!
+//! Before the walk, the core checks the proposer signature: the key of `proposer_index` in the
+//! parent state, and the proposer domain of the fork that the network schedule gives for the
+//! epoch of the block. After the walk, the core checks that `proposer_index` is the proposer of
+//! the block slot. It sends the proposer set again only if the key or the domain of the advanced
+//! state is different. Then it imports the block on the advanced state.
 //!
 //! The blocks come from the pinned minimal export. A test moves a block to a later slot: it sets
 //! the slot of the block and of its bid, and the proposer of that slot, and it removes the
@@ -19,16 +24,18 @@
 #[allow(dead_code)]
 mod support;
 
-use cl_chain::core::advance::Advanced;
+use cl_chain::core::advance::{AdvanceBudget, Advanced};
 use cl_chain::core::snapshot::PRE_STATE_EPOCHS;
 use cl_chain::core::{
     queue, ChainCore, Head, Outcome, Served, MAX_ADVANCED_STATES, MAX_ADVANCE_EPOCHS,
+    MAX_ADVANCE_EPOCHS_PER_SLOT,
 };
 use cl_chain::import::block::PermitAll;
 use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::common::PendingDeposit;
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{BLSPubkey, Bytes32, Epoch, Root};
+use consensus_types::signing::{compute_domain, DOMAIN_BEACON_PROPOSER};
 use consensus_types::{EthSpec, Minimal};
 use crypto_bls::{eth_aggregate_pubkeys, PublicKey};
 use ethswarm_proto::verify::BlsSet;
@@ -42,8 +49,8 @@ use state_transition::{
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{
-    assert_unchanged, clock_at, export_block, fixture, import_one, proposer_set, slot_start,
-    Answer, FakeVerify, Fixture, QUEUE, VERIFY_TIMEOUT,
+    assert_unchanged, clock_at, export_block, fixture, import_one, proposer_set, proposer_set_in,
+    slot_start, Answer, FakeVerify, Fixture, QUEUE, VERIFY_TIMEOUT,
 };
 use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
 use testkit::anchor::load_anchor;
@@ -81,6 +88,30 @@ fn the_walk_bounds_are_eight_epochs_and_sixty_four_states() {
     assert_eq!(MAX_ADVANCE_EPOCHS, 8);
     assert_eq!(cap(), 64);
     assert_eq!(MAX_ADVANCED_STATES, 64);
+    assert_eq!(MAX_ADVANCE_EPOCHS_PER_SLOT, 8);
+}
+
+#[test]
+fn the_admission_budget_refills_with_the_clock_up_to_one_slot() {
+    let mut budget = AdvanceBudget::new();
+    // The first take fills the bucket.
+    assert!(budget.take(10, 5));
+    assert!(budget.take(10, 3));
+    assert!(!budget.take(10, 1), "eight epochs in one slot");
+    // A take over the budget takes nothing.
+    assert!(budget.take(11, 8));
+    assert!(!budget.take(11, 1));
+    // Idle slots add no more than one slot of work.
+    assert!(!budget.take(20, 9));
+    assert!(budget.take(20, 8));
+    // A clock that goes back adds nothing and empties nothing.
+    assert!(!budget.take(15, 1));
+    assert!(budget.take(21, 2));
+    assert!(budget.take(19, 6));
+    assert!(!budget.take(21, 1));
+    assert!(budget.take(22, 8));
+    // A zero walk always fits.
+    assert!(budget.take(22, 0));
 }
 
 #[test]
@@ -131,6 +162,28 @@ fn the_kept_states_are_bounded_and_the_least_recent_goes_first() {
     assert_eq!(kept.peek(&root(39), 1), Some(&39), "the newest must stay");
     assert!(!kept.is_empty());
     assert_eq!(Advanced::<u64>::new(0).len(), 0);
+}
+
+#[test]
+fn a_retain_keeps_the_states_of_the_parents_that_stay() {
+    let mut kept = Advanced::new(8);
+    kept.insert(root(1), 1, 11u64);
+    kept.insert(root(2), 1, 21);
+    kept.insert(root(1), 2, 12);
+    kept.insert(root(3), 1, 31);
+    kept.retain(|parent| *parent != root(1));
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept.peek(&root(1), 1), None);
+    assert_eq!(kept.peek(&root(1), 2), None);
+    assert_eq!(kept.peek(&root(2), 1), Some(&21));
+    assert_eq!(kept.peek(&root(3), 1), Some(&31));
+    // The order of use does not change: 2 is still the least recent, and goes at the next
+    // insert past the bound.
+    for byte in 4..11 {
+        kept.insert(root(byte), 1, u64::from(byte));
+    }
+    assert_eq!(kept.peek(&root(2), 1), None);
+    assert_eq!(kept.peek(&root(3), 1), Some(&31));
 }
 
 /// The wall clock of the fixture chain.
@@ -241,6 +294,22 @@ fn committed(block: &Block) -> Outcome {
 /// The anchor state of the fixture.
 fn anchor_state(f: &Fixture) -> State {
     f.core.state(&f.anchor.block_root).unwrap().clone()
+}
+
+/// The proposer set that the core sends before the walk: the key of `proposer_index` in
+/// `parent`, and the proposer domain of the fork that the network schedule of `config` gives for
+/// the epoch of the block, with the genesis validators root of `parent`.
+fn early_set(parent: &State, block: &Block, config: &ChainConfig) -> BlsSet {
+    let schedule = config.fork_schedule();
+    let fork = schedule
+        .fork_at(Minimal::epoch_at_slot(block.message.slot))
+        .expect("the fixture network has a fork at each epoch");
+    let domain = compute_domain(
+        DOMAIN_BEACON_PROPOSER,
+        schedule.fork_version(fork),
+        parent.genesis_validators_root,
+    );
+    proposer_set_in(parent, block, domain)
 }
 
 #[tokio::test]
@@ -367,6 +436,9 @@ async fn a_later_import_starts_from_a_kept_state_of_its_parent() {
         .expect("the walk must keep the state at the end of its last full epoch");
     assert!(late_slot - kept.slot <= cap());
 
+    // The walk of the second import spends the admission budget of its slot. The third import
+    // comes one slot later.
+    let core = core.with_clock(wall.at(late_slot + 1));
     let (outcome, core, verify) = import_one(core, late.clone(), Answer::Valid).await;
     assert_eq!(
         outcome,
@@ -378,20 +450,38 @@ async fn a_later_import_starts_from_a_kept_state_of_its_parent() {
 }
 
 #[tokio::test]
-async fn a_bad_proposer_signature_after_the_walk_is_invalid_before_the_slot_loop() {
+async fn a_bad_proposer_signature_of_a_far_block_is_invalid_before_the_walk() {
     let f = fixture();
     let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
     let slot = window() + 4;
-    let (block, before) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+    let (block, _) = moved(&f.block, &anchor, slot, &f.config);
     let block_root = block.message.tree_hash_root();
-    let expected = proposer_set(&before, &block);
     let core = f.core.with_clock(wall.at(slot));
-    let (outcome, core, verify) = import_one(core, block.clone(), Answer::Invalid).await;
-    assert_eq!(outcome, Outcome::Invalid(StfError::InvalidBlockSignature));
+    let verify = FakeVerify::new(Answer::Invalid);
+    let watched = import_watched(
+        core,
+        block.clone(),
+        Arc::clone(&verify),
+        &verify,
+        &Waiting::default(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        watched.outcome,
+        Some(Outcome::Invalid(StfError::InvalidBlockSignature))
+    );
     assert_eq!(
         verify.calls(),
-        vec![vec![expected]],
-        "only the proposer set of the advanced state must go to cl-verify, before the slot loop"
+        vec![vec![early_set(&anchor, &block, &f.config)]],
+        "only the proposer set of the parent state must go to cl-verify"
+    );
+    assert!(watched.walk.is_empty(), "the core must not start the walk");
+    let core = watched.core;
+    assert!(
+        core.advanced_state(&f.anchor.block_root, 1).is_none(),
+        "the core must not keep a state of a walk"
     );
     assert_unchanged(&core, f.anchor, block_root);
     assert!(
@@ -407,36 +497,61 @@ async fn a_bad_proposer_signature_after_the_walk_is_invalid_before_the_slot_loop
 }
 
 #[tokio::test]
-async fn an_out_of_range_proposer_after_the_walk_is_invalid_before_cl_verify() {
+async fn a_proposer_past_the_parent_registry_is_ignored_before_the_walk_and_not_kept() {
     let f = fixture();
-    let wall = Wall::of(&f);
-    let slot = window() + 4;
     let validators = anchor_state(&f).validators.len();
-    let proposer = u64::try_from(validators).unwrap();
-    let mut block = f.block.clone();
-    block.message.slot = slot;
-    block.message.proposer_index = proposer;
-    let block_root = block.message.tree_hash_root();
-    let core = f.core.with_clock(wall.at(slot));
-    let (outcome, core, verify) = import_one(core, block, Answer::Valid).await;
-    assert_eq!(
-        outcome,
-        Outcome::Invalid(StfError::UnknownValidator(proposer))
-    );
-    assert!(verify.calls().is_empty());
-    assert_unchanged(&core, f.anchor, block_root);
-    assert!(core.is_refused(&block_root));
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_missing_proposer_verdict_after_the_walk_is_ignored_before_the_slot_loop() {
-    for answer in [Answer::Never, Answer::Late, Answer::AtDeadline] {
+    let first_out = u64::try_from(validators).unwrap();
+    for proposer in [first_out, u64::MAX] {
         let f = fixture();
         let wall = Wall::of(&f);
         let slot = window() + 4;
-        let (block, before) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+        let mut block = f.block.clone();
+        block.message.slot = slot;
+        block.message.proposer_index = proposer;
         let block_root = block.message.tree_hash_root();
-        let expected = proposer_set(&before, &block);
+        let core = f.core.with_clock(wall.at(slot));
+        let verify = FakeVerify::new(Answer::Valid);
+        let watched = import_watched(
+            core,
+            block,
+            Arc::clone(&verify),
+            &verify,
+            &Waiting::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(watched.outcome, Some(Outcome::Ignored(_))),
+            "{proposer}: a later parent state can have a longer registry: {:?}",
+            watched.outcome
+        );
+        assert!(
+            verify.calls().is_empty(),
+            "{proposer}: the block must not reach cl-verify"
+        );
+        assert!(
+            watched.walk.is_empty(),
+            "{proposer}: the core must not start the walk"
+        );
+        let core = watched.core;
+        assert!(core.advanced_state(&f.anchor.block_root, 1).is_none());
+        assert_unchanged(&core, f.anchor, block_root);
+        assert!(
+            !core.is_refused(&block_root),
+            "{proposer}: the core must not keep the refusal"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_missing_proposer_verdict_before_the_walk_is_ignored_and_not_kept() {
+    for answer in [Answer::Never, Answer::Late, Answer::AtDeadline] {
+        let f = fixture();
+        let wall = Wall::of(&f);
+        let anchor = anchor_state(&f);
+        let slot = window() + 4;
+        let (block, _) = moved(&f.block, &anchor, slot, &f.config);
+        let block_root = block.message.tree_hash_root();
         let core = f.core.with_clock(wall.at(slot));
         let (outcome, core, verify) = import_one(core, block.clone(), answer).await;
         assert!(
@@ -445,8 +560,12 @@ async fn a_missing_proposer_verdict_after_the_walk_is_ignored_before_the_slot_lo
         );
         assert_eq!(
             verify.calls(),
-            vec![vec![expected]],
-            "{answer:?}: only the proposer set must go to cl-verify, before the slot loop"
+            vec![vec![early_set(&anchor, &block, &f.config)]],
+            "{answer:?}: only the proposer set must go to cl-verify"
+        );
+        assert!(
+            core.advanced_state(&f.anchor.block_root, 1).is_none(),
+            "{answer:?}: the core must not walk without a proposer verdict"
         );
         assert_unchanged(&core, f.anchor, block_root);
         assert!(!core.is_refused(&block_root), "{answer:?}");
@@ -457,6 +576,177 @@ async fn a_missing_proposer_verdict_after_the_walk_is_ignored_before_the_slot_lo
             "{answer:?}: the block must be able to come again"
         );
     }
+}
+
+/// The walk hook of an import from the anchor to the slot before a block at slot 20: before the
+/// walk, at the end of epochs 0 and 1, and after the walk. Each entry also has the number of
+/// cl-verify calls before that hook call. `calls` is that number for each entry.
+fn walk_to_slot_19(calls: usize) -> Vec<(u64, usize)> {
+    vec![
+        (0, calls),
+        (epoch_slots() - 1, calls),
+        (2 * epoch_slots() - 1, calls),
+        (window() + 3, calls),
+    ]
+}
+
+#[tokio::test]
+async fn a_valid_far_block_sends_its_proposer_set_once_before_the_walk() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    let slot = window() + 4;
+    let (block, before) = moved(&f.block, &anchor, slot, &f.config);
+    let core = f.core.with_clock(wall.at(slot));
+    let verify = FakeVerify::new(Answer::Valid);
+    let watched = import_watched(
+        core,
+        block.clone(),
+        Arc::clone(&verify),
+        &verify,
+        &Waiting::default(),
+        None,
+    )
+    .await;
+    assert_eq!(watched.outcome, Some(committed(&block)));
+    assert_eq!(
+        watched.walk,
+        walk_to_slot_19(1),
+        "the proposer set must go to cl-verify before the walk, and no set during the walk"
+    );
+    let calls = verify.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the proposer set before the walk, then the block sets: no second proposer call"
+    );
+    assert_eq!(calls[0], vec![early_set(&anchor, &block, &f.config)]);
+    assert_eq!(
+        early_set(&anchor, &block, &f.config),
+        proposer_set(&before, &block),
+        "the key and the domain of the advanced state are the same"
+    );
+    assert!(
+        calls[1].len() > 1,
+        "the second call must hold the block sets"
+    );
+    assert_eq!(watched.core.head(), head_of(&block));
+}
+
+/// `block` with `proposer_index` set to another validator than the proposer of its slot. The
+/// state root is not correct for it, but the core refuses the block before the transition.
+fn other_proposer(block: &Block, validators: usize) -> Block {
+    let mut other = block.clone();
+    let count = u64::try_from(validators).unwrap();
+    other.message.proposer_index = (block.message.proposer_index + 1) % count;
+    other
+}
+
+#[tokio::test]
+async fn a_signed_far_block_of_another_proposer_is_wrong_proposer_after_the_walk() {
+    // Slot 20 is in the middle of epoch 2. Slot 24 opens epoch 3: the advanced state is at the
+    // last slot of epoch 2, and its lookahead holds the proposers of epoch 3 after those of
+    // epoch 2.
+    for slot in [window() + 4, 3 * epoch_slots()] {
+        let f = fixture();
+        let wall = Wall::of(&f);
+        let anchor = anchor_state(&f);
+        let (valid, _) = moved(&f.block, &anchor, slot, &f.config);
+        let expected = valid.message.proposer_index;
+        let block = other_proposer(&valid, anchor.validators.len());
+        let claimed = block.message.proposer_index;
+        let block_root = block.message.tree_hash_root();
+        let core = f.core.with_clock(wall.at(slot));
+        let verify = FakeVerify::new(Answer::Valid);
+        let watched = import_watched(
+            core,
+            block.clone(),
+            Arc::clone(&verify),
+            &verify,
+            &Waiting::default(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            watched.outcome,
+            Some(Outcome::Invalid(StfError::WrongProposer {
+                block: claimed,
+                expected,
+            })),
+            "slot {slot}"
+        );
+        assert_eq!(
+            verify.calls(),
+            vec![vec![early_set(&anchor, &block, &f.config)]],
+            "slot {slot}: only the proposer set before the walk must go to cl-verify"
+        );
+        let last = watched.walk.last().copied();
+        assert_eq!(
+            watched.walk.first().copied(),
+            Some((0, 1)),
+            "slot {slot}: the walk must start after the proposer set"
+        );
+        assert_eq!(last, Some((slot - 1, 1)), "slot {slot}");
+        let core = watched.core;
+        assert_unchanged(&core, f.anchor, block_root);
+        assert!(core.is_refused(&block_root), "slot {slot}");
+
+        // The signature was valid, so the refusal holds for each signature.
+        let mut signed_again = block.clone();
+        signed_again.signature[10] ^= 0x01;
+        let (outcome, _, verify) = import_one(core, signed_again, Answer::Valid).await;
+        assert_eq!(
+            outcome,
+            Outcome::Invalid(StfError::WrongProposer {
+                block: claimed,
+                expected,
+            }),
+            "slot {slot}"
+        );
+        assert!(verify.calls().is_empty(), "slot {slot}");
+    }
+}
+
+/// The fixture with another fork version in the anchor state. The network schedule does not
+/// change, so the proposer domain of the advanced state is not the domain of the schedule.
+fn other_fork_fixture() -> Fixture {
+    anchor_with(|state| state.fork.current_version = [0x07, 0, 0, 0x42])
+}
+
+#[tokio::test]
+async fn a_far_block_is_verified_again_when_the_advanced_domain_is_different() {
+    let f = other_fork_fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    let slot = window() + 4;
+    let (block, before) = moved(&f.block, &anchor, slot, &f.config);
+    let block_root = block.message.tree_hash_root();
+    let early = early_set(&anchor, &block, &f.config);
+    let again = proposer_set(&before, &block);
+    assert_ne!(early, again, "the two domains must be different");
+
+    let core = f.core.with_clock(wall.at(slot));
+    let verify = FakeVerify::answers(vec![Answer::Valid, Answer::Invalid]);
+    let (outcome, core) = support::import_with(core, block.clone(), Arc::clone(&verify)).await;
+    assert_eq!(outcome, Outcome::Invalid(StfError::InvalidBlockSignature));
+    assert_eq!(
+        verify.calls(),
+        vec![vec![early.clone()], vec![again.clone()]],
+        "the proposer set of the parent state, then of the advanced state"
+    );
+    assert_unchanged(&core, f.anchor, block_root);
+    assert!(
+        core.is_refused(&block_root),
+        "the core must keep the refusal of the signature"
+    );
+
+    let mut signed_again = block.clone();
+    signed_again.signature[10] ^= 0x01;
+    let (outcome, _, verify) = import_one(core, signed_again, Answer::Valid).await;
+    assert_eq!(outcome, committed(&block));
+    let calls = verify.calls();
+    assert_eq!(calls.len(), 3, "two proposer calls, then the block sets");
+    assert_eq!(calls[1].len(), 1);
 }
 
 #[tokio::test]
@@ -495,11 +785,200 @@ async fn a_deadline_before_the_walk_is_ignored_and_not_kept() {
     );
 }
 
-/// The fixture with a pending deposit of a new key in the anchor state. The first epoch
-/// boundary after the anchor applies it. verify.v1 has no signer for a key that is not in the
-/// registry, so the core has no verdict for that deposit. The slot 1 block has the new anchor as
-/// its parent.
-fn deposit_fixture() -> Fixture {
+#[tokio::test]
+async fn one_slot_of_the_core_clock_admits_eight_epochs_of_walk() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    // A walk of eight epochs from the anchor. The next block then needs one more epoch from the
+    // state that the walk keeps at slot 63.
+    let first_slot = cap();
+    let next_slot = cap() + 1;
+    let (first, _) = moved(&f.block, &anchor, first_slot, &f.config);
+    let (next, _) = moved(&f.block, &anchor, next_slot, &f.config);
+    let next_root = next.message.tree_hash_root();
+    let core = f.core.with_clock(wall.at(first_slot));
+    let (outcome, core, _) = import_one(core, first.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&first));
+
+    let verify = FakeVerify::new(Answer::Valid);
+    let watched = import_watched(
+        core,
+        next.clone(),
+        Arc::clone(&verify),
+        &verify,
+        &Waiting::default(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(watched.outcome, Some(Outcome::Ignored(_))),
+        "the budget of the clock slot is spent: {:?}",
+        watched.outcome
+    );
+    assert!(watched.walk.is_empty(), "the core must not start the walk");
+    assert_eq!(
+        verify.calls(),
+        vec![vec![early_set(&anchor, &next, &f.config)]],
+        "only the proposer set before the walk must go to cl-verify"
+    );
+    let core = watched.core;
+    assert!(
+        !core.is_refused(&next_root),
+        "the core must not keep the refusal of a spent budget"
+    );
+    assert_eq!(core.head(), head_of(&first));
+
+    // One slot later, the budget is full again.
+    let core = core.with_clock(wall.at(next_slot));
+    let (outcome, core, _) = import_one(core, next.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&next));
+    assert_eq!(core.head(), head_of(&next));
+}
+
+#[tokio::test]
+async fn two_walks_of_four_epochs_spend_the_admission_budget_of_one_slot() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    let now = 4 * epoch_slots() + 1;
+    let core = f.core.with_clock(wall.at(now));
+    // An import in the pre-state window takes nothing from the budget.
+    let first = f.block.clone();
+    let first_root = first.message.tree_hash_root();
+    let (outcome, core, _) = import_one(core, first.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&first));
+    let parent = core.state(&first_root).unwrap().clone();
+    // Four epochs from the anchor, and four epochs from the slot 1 block.
+    let (from_anchor, _) = moved(&f.block, &anchor, 4 * epoch_slots(), &f.config);
+    let (from_first, _) = moved(&export_block(2), &parent, now, &f.config);
+    // One epoch from the state that the second walk keeps at slot 31.
+    let (last, _) = moved(&export_block(2), &parent, now + 1, &f.config);
+    let last_root = last.message.tree_hash_root();
+    let (outcome, core, _) = import_one(core, from_anchor.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&from_anchor));
+    let (outcome, core, _) = import_one(core, from_first.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&from_first));
+    assert!(core.advanced_state(&first_root, 4).is_some());
+
+    let verify = FakeVerify::new(Answer::Valid);
+    let watched = import_watched(
+        core,
+        last.clone(),
+        Arc::clone(&verify),
+        &verify,
+        &Waiting::default(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(watched.outcome, Some(Outcome::Ignored(_))),
+        "the budget of the clock slot is spent: {:?}",
+        watched.outcome
+    );
+    assert!(watched.walk.is_empty(), "the core must not start the walk");
+    assert_eq!(verify.calls().len(), 1, "only the proposer set");
+    let core = watched.core;
+    assert!(!core.is_refused(&last_root));
+    assert_eq!(core.head(), head_of(&from_first));
+
+    // One slot later, the budget is full again.
+    let core = core.with_clock(wall.at(now + 1));
+    let (outcome, _, _) = import_one(core, last.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&last));
+}
+
+#[tokio::test]
+async fn a_block_past_the_cap_or_with_a_bad_signature_spends_no_admission_budget() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    let mut core = f.core.with_clock(wall.at(cap()));
+    // Past the cap from the anchor: IGNORE before cl-verify.
+    let mut far = f.block.clone();
+    far.message.slot = cap() + 1;
+    for _ in 0..3 {
+        let (outcome, next, verify) = import_one(core, far.clone(), Answer::Valid).await;
+        assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+        assert!(verify.calls().is_empty());
+        core = next;
+    }
+    // A bad signature: INVALID before the walk.
+    let (block, _) = moved(&f.block, &anchor, cap(), &f.config);
+    for byte in 1..4 {
+        let mut bad = block.clone();
+        bad.signature[10] ^= byte;
+        let (outcome, next, _) = import_one(core, bad, Answer::Invalid).await;
+        assert_eq!(outcome, Outcome::Invalid(StfError::InvalidBlockSignature));
+        core = next;
+    }
+    // The full budget of the slot is still there: a walk of eight epochs.
+    let (outcome, _, _) = import_one(core, block.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&block));
+}
+
+/// Commits `block` on `core` with a fake cl-verify that answers VALID.
+async fn commit(core: ChainCore<Minimal>, block: &Block) -> ChainCore<Minimal> {
+    let (outcome, core, _) = import_one(core, block.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(block));
+    core
+}
+
+#[tokio::test]
+async fn the_kept_states_of_a_parent_go_when_its_pre_state_goes() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    let now = window() + 6;
+    let core = f.core.with_clock(wall.at(now));
+    // A walk from the slot 1 block, and a walk from the anchor. Each keeps the states at the
+    // ends of epochs 0 and 1.
+    let first = f.block.clone();
+    let first_root = first.message.tree_hash_root();
+    let core = commit(core, &first).await;
+    let parent = core.state(&first_root).unwrap().clone();
+    let (child, _) = moved(&export_block(2), &parent, now, &f.config);
+    let core = commit(core, &child).await;
+    let (far, _) = moved(&f.block, &anchor, window() + 4, &f.config);
+    let mut core = commit(core, &far).await;
+    for epoch in 1..=2 {
+        assert!(core.advanced_state(&first_root, epoch).is_some());
+        assert!(core.advanced_state(&f.anchor.block_root, epoch).is_some());
+    }
+
+    // Children of the anchor in the pre-state window fill the pre-states. The pre-state of the
+    // slot 1 block is the least recently used, so it goes first.
+    let mut gone = false;
+    for slot in 2..=window() {
+        let (block, _) = moved(&f.block, &anchor, slot, &f.config);
+        core = commit(core, &block).await;
+        if core.state(&first_root).is_none() {
+            gone = true;
+            break;
+        }
+        for epoch in 1..=2 {
+            assert!(
+                core.advanced_state(&first_root, epoch).is_some(),
+                "slot {slot}: the kept states of a parent with a pre-state must stay"
+            );
+        }
+    }
+    assert!(gone, "the pre-state of the slot 1 block must go");
+    for epoch in 1..=2 {
+        assert!(
+            core.advanced_state(&first_root, epoch).is_none(),
+            "epoch {epoch}: a kept state of a parent without a pre-state must go"
+        );
+        assert!(
+            core.advanced_state(&f.anchor.block_root, epoch).is_some(),
+            "epoch {epoch}: the kept states of the anchor must stay"
+        );
+    }
+}
+
+/// The fixture with an anchor state that `edit` changed. The anchor block gets the new state
+/// root, and the slot 1 block has the new anchor as its parent.
+fn anchor_with(edit: impl FnOnce(&mut State)) -> Fixture {
     let pinned = pinned_export().expect("the pinned export must open");
     let dir = tempfile::tempdir().unwrap();
     AnchorFiles::genesis(&pinned.export)
@@ -508,19 +987,7 @@ fn deposit_fixture() -> Fixture {
         .unwrap();
     let loaded = load_anchor::<Minimal>(dir.path()).expect("the anchor must load");
     let (mut state, mut block) = loaded.into_parts();
-    assert!(state.pending_deposits.is_empty());
-    let mut credentials = [0u8; 32];
-    credentials[0] = 0x01;
-    state
-        .pending_deposits
-        .push(PendingDeposit {
-            pubkey: [0x42; 48],
-            withdrawal_credentials: Bytes32::from(credentials),
-            amount: 1_000_000_000,
-            signature: [0x24; 96],
-            slot: 0,
-        })
-        .unwrap();
+    edit(&mut state);
     block.message.state_root = state_root(&mut state).unwrap();
     let anchor = head_of(&block);
     let core = ChainCore::from_anchor(state, block, pinned.config.clone())
@@ -543,6 +1010,27 @@ fn deposit_fixture() -> Fixture {
     }
 }
 
+/// The fixture with a pending deposit of a new key in the anchor state. The first epoch
+/// boundary after the anchor applies it. verify.v1 has no signer for a key that is not in the
+/// registry, so the core has no verdict for that deposit.
+fn deposit_fixture() -> Fixture {
+    anchor_with(|state| {
+        assert!(state.pending_deposits.is_empty());
+        let mut credentials = [0u8; 32];
+        credentials[0] = 0x01;
+        state
+            .pending_deposits
+            .push(PendingDeposit {
+                pubkey: [0x42; 48],
+                withdrawal_credentials: Bytes32::from(credentials),
+                amount: 1_000_000_000,
+                signature: [0x24; 96],
+                slot: 0,
+            })
+            .unwrap();
+    })
+}
+
 #[tokio::test]
 async fn a_missing_deposit_verdict_in_the_walk_is_ignored_and_keeps_the_state_before_it() {
     let f = deposit_fixture();
@@ -551,15 +1039,17 @@ async fn a_missing_deposit_verdict_in_the_walk_is_ignored_and_keeps_the_state_be
     let mut block = f.block.clone();
     block.message.slot = slot;
     let block_root = block.message.tree_hash_root();
+    let expected = early_set(&anchor_state(&f), &block, &f.config);
     let core = f.core.with_clock(wall.at(slot));
     let (outcome, core, verify) = import_one(core, block, Answer::Valid).await;
     assert!(
         matches!(outcome, Outcome::Ignored(_)),
         "a walk without a deposit verdict must be IGNORE: {outcome:?}"
     );
-    assert!(
-        verify.calls().is_empty(),
-        "the walk must stop before the proposer check"
+    assert_eq!(
+        verify.calls(),
+        vec![vec![expected]],
+        "only the proposer set before the walk must go to cl-verify: no deposit set"
     );
     assert_unchanged(&core, f.anchor, block_root);
     assert!(
@@ -614,26 +1104,36 @@ struct Watched {
     outcome: Option<Outcome>,
     /// The core after its writer thread stops.
     core: ChainCore<Minimal>,
-    /// The slot of each call of the walk hook, in order.
-    slots: Vec<u64>,
+    /// Each call of the walk hook, in order: the slot of the walk state, and the number of
+    /// cl-verify calls before it.
+    walk: Vec<(u64, usize)>,
 }
 
-/// Imports `block` on `core`, and sends its sets to `verifier`. `waiting` holds the receiver
-/// of the answer. The walk hook of the core records the slot of each call. At slot `drop_at`,
-/// the hook drops the receiver. The test does not wait for the answer. It waits for the writer
-/// thread to stop, and then reads the answer, if the receiver is still there.
+impl Watched {
+    /// The slot of each call of the walk hook, in order.
+    fn slots(&self) -> Vec<u64> {
+        self.walk.iter().map(|(slot, _)| *slot).collect()
+    }
+}
+
+/// Imports `block` on `core`, and sends its sets to `verifier`. `fake` is the fake cl-verify
+/// that `verifier` uses. `waiting` holds the receiver of the answer. The walk hook of the core
+/// records the slot of each call, and the number of calls of `fake` before it. At slot
+/// `drop_at`, the hook drops the receiver. The test does not wait for the answer. It waits for
+/// the writer thread to stop, and then reads the answer, if the receiver is still there.
 async fn import_watched<V: BlsVerifier + 'static>(
     core: ChainCore<Minimal>,
     block: Block,
     verifier: Arc<V>,
+    fake: &Arc<FakeVerify>,
     waiting: &Waiting,
     drop_at: Option<u64>,
 ) -> Watched {
-    let slots: Arc<Mutex<Vec<u64>>> = Arc::default();
+    let walk: Arc<Mutex<Vec<(u64, usize)>>> = Arc::default();
     let hook = {
-        let (slots, waiting) = (Arc::clone(&slots), waiting.clone());
+        let (walk, fake, waiting) = (Arc::clone(&walk), Arc::clone(fake), waiting.clone());
         move |slot| {
-            slots.lock().unwrap().push(slot);
+            walk.lock().unwrap().push((slot, fake.called().len()));
             if drop_at == Some(slot) {
                 waiting.stop();
             }
@@ -658,11 +1158,11 @@ async fn import_watched<V: BlsVerifier + 'static>(
         .expect("the writer thread must not panic");
     let outcome = (waiting.0.lock().unwrap().take())
         .map(|mut answer| answer.try_recv().expect("the core must answer").outcome);
-    let slots = slots.lock().unwrap().clone();
+    let walk = walk.lock().unwrap().clone();
     Watched {
         outcome,
         core,
-        slots,
+        walk,
     }
 }
 
@@ -670,8 +1170,9 @@ async fn import_watched<V: BlsVerifier + 'static>(
 async fn an_import_whose_caller_stops_waiting_before_the_walk_is_ignored_and_not_kept() {
     let f = fixture();
     let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
     let slot = window() + 4;
-    let (block, _) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+    let (block, _) = moved(&f.block, &anchor, slot, &f.config);
     let block_root = block.message.tree_hash_root();
     let core = f.core.with_clock(wall.at(slot));
     let verify = FakeVerify::new(Answer::Valid);
@@ -680,6 +1181,7 @@ async fn an_import_whose_caller_stops_waiting_before_the_walk_is_ignored_and_not
         core,
         block.clone(),
         Arc::clone(&verify),
+        &verify,
         &Waiting::default(),
         Some(f.anchor.slot),
     )
@@ -691,17 +1193,18 @@ async fn an_import_whose_caller_stops_waiting_before_the_walk_is_ignored_and_not
         !core.is_refused(&block_root),
         "the core must not keep the refusal of a stopped import"
     );
-    assert!(
-        verify.calls().is_empty(),
-        "the import must not reach cl-verify"
+    assert_eq!(
+        verify.calls(),
+        vec![vec![early_set(&anchor, &block, &f.config)]],
+        "only the proposer set before the walk must go to cl-verify"
     );
     assert!(
         core.advanced_state(&f.anchor.block_root, 1).is_none(),
         "the walk must stop before process_slots"
     );
     assert_eq!(
-        watched.slots,
-        vec![f.anchor.slot],
+        watched.walk,
+        vec![(f.anchor.slot, 1)],
         "the walk must stop at its first check"
     );
 
@@ -731,6 +1234,7 @@ async fn an_import_whose_caller_stops_waiting_at_an_epoch_boundary_keeps_the_sta
         core,
         block.clone(),
         Arc::clone(&verify),
+        &verify,
         &Waiting::default(),
         Some(first_end),
     )
@@ -742,13 +1246,14 @@ async fn an_import_whose_caller_stops_waiting_at_an_epoch_boundary_keeps_the_sta
         !core.is_refused(&block_root),
         "the core must not keep the refusal of a stopped import"
     );
-    assert!(
-        verify.calls().is_empty(),
-        "the proposer set must not go to cl-verify"
+    assert_eq!(
+        verify.calls(),
+        vec![vec![early_set(&anchor, &block, &f.config)]],
+        "only the proposer set before the walk must go to cl-verify"
     );
     assert_eq!(
-        watched.slots,
-        vec![0, first_end],
+        watched.walk,
+        vec![(0, 1), (first_end, 1)],
         "the walk must stop at the first epoch boundary"
     );
     let mut kept = core
@@ -772,13 +1277,14 @@ async fn an_import_whose_caller_stops_waiting_at_an_epoch_boundary_keeps_the_sta
         core,
         block.clone(),
         Arc::clone(&verify),
+        &verify,
         &Waiting::default(),
         None,
     )
     .await;
     assert_eq!(watched.outcome, Some(committed(&block)));
     assert_eq!(
-        watched.slots,
+        watched.slots(),
         vec![first_end, second_end, slot - 1],
         "the walk must start from the kept state at slot 7"
     );
@@ -787,11 +1293,12 @@ async fn an_import_whose_caller_stops_waiting_at_an_epoch_boundary_keeps_the_sta
 }
 
 #[tokio::test]
-async fn an_import_whose_caller_stops_waiting_after_the_walk_sends_no_proposer_set() {
+async fn an_import_whose_caller_stops_waiting_after_the_walk_sends_no_block_sets() {
     let f = fixture();
     let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
     let slot = window() + 4;
-    let (block, _) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+    let (block, _) = moved(&f.block, &anchor, slot, &f.config);
     let block_root = block.message.tree_hash_root();
     let core = f.core.with_clock(wall.at(slot));
     let verify = FakeVerify::new(Answer::Valid);
@@ -800,6 +1307,7 @@ async fn an_import_whose_caller_stops_waiting_after_the_walk_sends_no_proposer_s
         core,
         block.clone(),
         Arc::clone(&verify),
+        &verify,
         &Waiting::default(),
         Some(slot - 1),
     )
@@ -811,14 +1319,12 @@ async fn an_import_whose_caller_stops_waiting_after_the_walk_sends_no_proposer_s
         !core.is_refused(&block_root),
         "the core must not keep the refusal of a stopped import"
     );
-    assert!(
-        verify.calls().is_empty(),
-        "the proposer set must not go to cl-verify"
-    );
     assert_eq!(
-        watched.slots,
-        vec![0, epoch_slots() - 1, 2 * epoch_slots() - 1, slot - 1]
+        verify.calls(),
+        vec![vec![early_set(&anchor, &block, &f.config)]],
+        "the proposer set goes before the walk, and the block sets must not go to cl-verify"
     );
+    assert_eq!(watched.walk, walk_to_slot_19(1));
     assert!(
         core.advanced_state(&f.anchor.block_root, 2).is_some(),
         "the walk must keep the states that it reached"
@@ -836,10 +1342,11 @@ async fn an_import_whose_caller_stops_waiting_after_the_walk_sends_no_proposer_s
 async fn an_import_whose_caller_stops_waiting_during_the_proposer_check_does_not_commit() {
     let f = fixture();
     let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
     let slot = window() + 4;
-    let (block, before) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+    let (block, _) = moved(&f.block, &anchor, slot, &f.config);
     let block_root = block.message.tree_hash_root();
-    let expected = proposer_set(&before, &block);
+    let expected = early_set(&anchor, &block, &f.config);
     let core = f.core.with_clock(wall.at(slot));
     let verify = FakeVerify::new(Answer::Valid);
     let waiting = Waiting::default();
@@ -849,12 +1356,14 @@ async fn an_import_whose_caller_stops_waiting_during_the_proposer_check_does_not
         waiting: waiting.clone(),
         on_call: 1,
     });
-    let watched = import_watched(core, block.clone(), stops, &waiting, None).await;
+    let watched = import_watched(core, block.clone(), stops, &verify, &waiting, None).await;
     assert_eq!(
         watched.outcome, None,
         "the fake cl-verify must drop the receiver"
     );
+    assert!(watched.walk.is_empty(), "the core must not start the walk");
     let core = watched.core;
+    assert!(core.advanced_state(&f.anchor.block_root, 1).is_none());
     assert_unchanged(&core, f.anchor, block_root);
     assert!(
         !core.is_refused(&block_root),
@@ -891,7 +1400,7 @@ async fn an_import_whose_caller_stops_waiting_during_the_block_sets_does_not_com
         waiting: waiting.clone(),
         on_call: 2,
     });
-    let watched = import_watched(core, block.clone(), stops, &waiting, None).await;
+    let watched = import_watched(core, block.clone(), stops, &verify, &waiting, None).await;
     assert_eq!(
         watched.outcome, None,
         "the fake cl-verify must drop the receiver"
@@ -921,7 +1430,8 @@ async fn an_import_whose_caller_stops_waiting_during_the_block_sets_does_not_com
 
 #[tokio::test]
 async fn an_invalid_verdict_after_the_caller_stops_waiting_is_not_kept() {
-    // INVALID for the proposer set (call 1), and INVALID for the block sets (call 2).
+    // INVALID for the proposer set before the walk (call 1), and INVALID for the block sets
+    // (call 2).
     let cases = [
         (vec![Answer::Invalid], 1),
         (vec![Answer::Valid, Answer::Invalid], 2),
@@ -942,12 +1452,20 @@ async fn an_invalid_verdict_after_the_caller_stops_waiting_is_not_kept() {
             waiting: waiting.clone(),
             on_call,
         });
-        let watched = import_watched(core, block.clone(), stops, &waiting, None).await;
+        let watched = import_watched(core, block.clone(), stops, &verify, &waiting, None).await;
         assert_eq!(
             watched.outcome, None,
             "call {on_call}: the fake cl-verify must drop the receiver"
         );
         assert_eq!(verify.calls().len(), on_call, "call {on_call}");
+        // The proposer set goes before the walk. A drop in that call stops the import before
+        // the walk.
+        let walk = if on_call == 1 {
+            vec![]
+        } else {
+            walk_to_slot_19(1)
+        };
+        assert_eq!(watched.walk, walk, "call {on_call}");
         let core = watched.core;
         assert_unchanged(&core, f.anchor, block_root);
         assert!(

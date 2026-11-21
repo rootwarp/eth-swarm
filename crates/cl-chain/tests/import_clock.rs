@@ -163,8 +163,9 @@ async fn a_block_far_from_its_parent_is_ignored_without_the_slot_loop() {
 }
 
 /// At the window, the block goes on to the proposer check on the parent state: cl-verify
-/// refuses its signature. One slot past the window, the core first walks the slots after the
-/// parent state, and then the block also goes on to the proposer check.
+/// refuses its signature. One slot past the window, the block also goes on to the proposer
+/// check, before the walk over the slots after the parent state. The refused signature stops
+/// the import before the walk.
 #[tokio::test]
 async fn the_parent_distance_bound_is_the_pre_state_window() {
     let bound = PRE_STATE_EPOCHS * Minimal::slots_per_epoch();
@@ -191,6 +192,10 @@ async fn the_parent_distance_bound_is_the_pre_state_window() {
         verify.calls().len(),
         1,
         "only the proposer set must go to cl-verify"
+    );
+    assert!(
+        core.advanced_state(&anchor.block_root, 1).is_none(),
+        "a refused signature must stop the import before the walk"
     );
     assert_unchanged(&core, anchor, block_root);
 }
