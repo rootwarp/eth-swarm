@@ -2,7 +2,7 @@
 //! (L891-954), with `is_current_slot` (`altair/p2p-interface.md` L95-107) and
 //! `is_within_slot_range` (`phase0/p2p-interface.md` L395-411).
 
-use crate::seen::{Seen, SeenKey};
+use crate::seen::{Seen, SeenKey, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT};
 use crate::verdict::{IgnoreReason, RejectReason, Verdict};
 use crate::StoreView;
 use consensus_types::gloas::PayloadAttestationMessage;
@@ -10,6 +10,7 @@ use consensus_types::primitives::{Epoch, Slot};
 use consensus_types::signing::{
     compute_signing_root, SignatureSet, SignerRef, DOMAIN_PTC_ATTESTER,
 };
+use ssz_types::typenum::Unsigned;
 use state_transition::accessors::get_domain;
 use state_transition::caches::get_ptc;
 use state_transition::Preset;
@@ -38,12 +39,39 @@ where
     now + disparity >= start_time_ms && end_time_ms + disparity >= now
 }
 
+/// The oldest slot that is current at `current_time_ms` ([`is_current_slot`]). Not a spec
+/// function: [`Seen`] removes the keys of the slots before it.
+///
+/// A slot `s` is not current, and cannot be current again, once
+/// `end(s) + MAXIMUM_GOSSIP_CLOCK_DISPARITY < current_time_ms`, where `end(s)` is the start of
+/// slot `s + 1`. The result is 0 up to `genesis_time_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
+/// The times are in 128 bits, so no value can overflow.
+pub fn oldest_current_slot<E, S>(store: &S, current_time_ms: u64) -> Slot
+where
+    E: Preset,
+    S: StoreView<E> + ?Sized,
+{
+    let first_expiry =
+        u128::from(store.genesis_time_ms()) + u128::from(MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS);
+    let now = u128::from(current_time_ms);
+    if now <= first_expiry {
+        return 0;
+    }
+    // Slot `s` is past the disparity if `(s + 1) * slot_duration < over`.
+    let over = now - first_expiry;
+    let slot = (over - 1) / u128::from(store.slot_duration_ms().get());
+    Slot::try_from(slot).unwrap_or(Slot::MAX)
+}
+
 /// `validate_payload_attestation_message_gossip` (L891-954) up to the signature check.
 ///
 /// It runs the IGNORE and REJECT checks before the signature in spec order, and gives the
 /// first that fails. If each passes, it gives [`Verdict::Pending`] with the set of
 /// `bls.Verify` and the key of the message. The caller must verify the set and give the result
-/// to [`Seen::resolve`], which adds the key to `Seen` only for a valid signature.
+/// to [`Seen::resolve`], which adds the key to `Seen` only for a valid signature. The key also
+/// has the oldest current slot at `current_time_ms` ([`oldest_current_slot`]) and the limit of
+/// validators for each slot, `MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT * PTC_SIZE`, which
+/// [`Seen::resolve`] applies.
 ///
 /// The checks of the validator read the head state, `store.block_states[get_head(store).root]`
 /// ([`StoreView::head_state`]), not the post-state of the attested block: the index must be in
@@ -122,6 +150,11 @@ where
     );
     Verdict::Pending {
         bls_sets: vec![set],
-        seen_key: SeenKey::payload_attestation(data.slot, validator_index),
+        seen_key: SeenKey::payload_attestation(
+            data.slot,
+            validator_index,
+            oldest_current_slot(store, current_time_ms),
+            MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT * E::PtcSize::to_usize(),
+        ),
     }
 }

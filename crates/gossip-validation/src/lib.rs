@@ -5,7 +5,8 @@
 //!   [`validate_execution_payload_envelope_gossip`] (L811-885).
 //! - [`payload_attestation`]: the `payload_attestation_message` topic,
 //!   [`validate_payload_attestation_message_gossip`] (L891-954).
-//! - [`seen`]: the spec's `Seen` (L188-219), for the topics of this crate.
+//! - [`seen`]: the spec's `Seen` (L188-219), for the topics of this crate, with bounds on the
+//!   payload attestation keys.
 //! - [`verdict`]: the [`Verdict`] of a message, and why it is IGNORE or REJECT.
 //!
 //! The crate does no I/O and links no BLS library. A validation function runs each check that
@@ -29,9 +30,13 @@ pub use execution_payload::{
     verify_withdrawals_limit, RequestCounts,
 };
 pub use payload_attestation::{
-    is_current_slot, validate_payload_attestation_message_gossip, MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS,
+    is_current_slot, oldest_current_slot, validate_payload_attestation_message_gossip,
+    MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS,
 };
-pub use seen::{Seen, SeenKey, SeenPayload};
+pub use seen::{
+    Seen, SeenKey, SeenPayload, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT,
+    MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS,
+};
 pub use verdict::{IgnoreReason, RejectReason, RequestKind, Verdict};
 
 use consensus_types::gloas::{BeaconBlock, BeaconState, Checkpoint};
