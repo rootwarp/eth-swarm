@@ -8,6 +8,8 @@
 //!   no handler and excused by no `skip.toml` entry. A name filter, `--skip`, `--ignored`,
 //!   `--list` or `--bench` turns it off, since those runs do not execute every case. Only reads
 //!   made while a trial runs count.
+//! - An unfiltered run also fails if a scanned preset set has fewer official gossip cases to run
+//!   than `suite::MIN_OFFICIAL_GOSSIP_RUNS`.
 //! - Setup and skip-list errors exit 101 before any trial runs, whatever the filter.
 
 use libtest_mimic::{Arguments, Failed, Trial};
@@ -83,6 +85,7 @@ fn main() {
         unaccounted,
     } = suite::gossip_counts(&suite.trials);
     eprintln!("official gossip cases: {run} to run, {skipped} skipped, {unaccounted} unaccounted");
+    let gossip_short = suite::gossip_shortfall(&suite.trials, &suite.scanned);
 
     let trials = suite
         .trials
@@ -102,6 +105,10 @@ fn main() {
     if let Some(why) = guard_off {
         eprintln!("coverage guard: off ({why})");
     } else {
+        if let Some(short) = gossip_short {
+            eprintln!("official gossip cases: {short}");
+            std::process::exit(101);
+        }
         let started = std::time::Instant::now();
         let result = suite.guard.check(&suite.reads);
         eprintln!(

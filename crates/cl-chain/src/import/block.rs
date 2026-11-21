@@ -38,8 +38,8 @@
 //!
 //! Before it returns the post-state, the import asks a [`PayloadImportGate`] about the payload
 //! bid of the block. A refusal is IGNORE. The chain core has no gate until one is set, and
-//! commits nothing without one; a later check of the execution status of the payload will plug
-//! in here.
+//! commits nothing without one. Before the transition, the core also checks the bid against
+//! the EL's verdicts that it recorded (see [`crate::core::actor`]).
 
 use crate::verify::client::BlsOutcome;
 use crate::verify::pubkey_feed::{builder_signer, BuilderFeed};
@@ -67,7 +67,7 @@ pub trait PayloadImportGate: Send {
 }
 
 /// A gate that permits each payload. The chain core uses it only when its caller sets it: a
-/// core without a gate commits nothing.
+/// core without a gate commits nothing. The core's checks of the EL's verdicts still apply.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PermitAll;
 
@@ -212,6 +212,21 @@ pub fn check_proposer_signature_in<E: Preset>(
         Ok(false) => Err(NotImported::Invalid(StfError::InvalidBlockSignature)),
         Err(e) => Err(NotImported::Ignored(e.0)),
     }
+}
+
+/// `Ok(true)` if each of `sets` is valid, as one cl-verify call through `verdict` says, with the
+/// keys of `keys`: the signature check of an envelope import. `Err` is no verdict.
+pub(crate) fn verify_sets<E: Preset>(
+    keys: &BeaconState<E>,
+    sets: &[SignatureSet],
+    verdict: &dyn Fn(Vec<BlsSet>) -> BlsOutcome,
+) -> Result<bool, BackendError> {
+    let backend = ClVerify {
+        keys,
+        builders: BuilderFeed::new(),
+        verdict,
+    };
+    backend.verify_signature_sets(sets)
 }
 
 /// Runs `process_slots(state, slot)` over the empty slots after the post-state of a parent:

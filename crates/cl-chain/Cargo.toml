@@ -15,7 +15,8 @@ description = "cl-chain: the ethswarm.chain.v1 service (stub: contract layer onl
 test-config = []
 # The crash-injection seam of persist::durable (`FileSet::open_crashing`, `Step`,
 # `Error::Crashed`): at a named step of a durable write an injected crash returns early and
-# leaves the disk as it is. Only cl-chain's own dev-dependency turns it on.
+# leaves the disk as it is. Also the chain core's seams (`ChainCore::with_walk_hook`,
+# `with_advanced_state`, `with_payload_verified`). Only cl-chain's own dev-dependency turns it on.
 test-hooks = []
 
 # The test binary of the service, built only with test-config. Its unit tests are cl-chain's.
@@ -57,6 +58,9 @@ state-transition = { path = "../state-transition" }
 # engine::client: the engine_newPayloadV5 params of an envelope and its bid, and the
 # PayloadStatusV1 that engine::verdict maps. Pure, no I/O; it adds no crate to Cargo.lock.
 engine-api = { path = "../engine-api" }
+# core: verify_execution_payload_envelope of an envelope import, and the data availability and
+# engine hooks it takes. Pure, no I/O and no BLS; it adds no crate to Cargo.lock.
+fork-choice = { path = "../fork-choice" }
 # probe::storage_contract: block roots of the reference node's blocks, the stored sidecar's SSZ.
 tree_hash.workspace = true
 ethereum_ssz.workspace = true
@@ -106,8 +110,10 @@ p2p-wire = { path = "../p2p-wire", features = ["testkit"] }
 cl-verify = { path = "../cl-verify" }
 # tests/kzg_fixture.rs: the fixture blobs' cells and proofs, from the pinned setup.
 crypto-kzg = { path = "../crypto-kzg" }
-# The reference-API fixture server (testkit::collector::testing::FixtureServer).
-testkit = { path = "../testkit", features = ["test-support"] }
+# The reference-API fixture server (testkit::collector::testing::FixtureServer), and the
+# scriptable mock EL behind an in-process cl-engine (tests/envelope_import.rs).
+testkit = { path = "../testkit", features = ["test-support", "mock-el"] }
+cl-engine = { path = "../cl-engine" }
 tokio-stream = { version = "0.1", features = ["net"] }
 # verify::pubkey_feed tests and tests/builders.rs build Gloas states with builders; the versions
 # consensus-types links.

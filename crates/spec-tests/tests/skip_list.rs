@@ -834,28 +834,66 @@ fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
     }
 }
 
-/// The Gloas gossip handlers that the gossip runner executes are never skipped, also a case
-/// that the pinned vectors do not have: no wildcard entry reaches them.
-#[test]
-fn gloas_gossip_runnable_handlers_are_not_skipped() {
-    let skips = committed();
+/// Each Gloas gossip handler that the gossip runner executes, and a new Gloas gossip handler,
+/// that `skips` skips in some case, as `preset/handler`.
+fn skipped_gossip_handlers(skips: &SkipList) -> Vec<String> {
+    let mut skipped = Vec::new();
     for preset in ["minimal", "mainnet"] {
-        for handler in spec_tests::gossip::RUNNABLE {
-            for case in ["pyspec_tests/case_0", "pyspec_tests/a_new_case"] {
-                let k = CaseKey {
-                    case: case.into(),
-                    ..consensus("gloas", preset, "networking", handler)
-                };
-                let skip = skips.skipped_by(&k);
-                assert!(skip.is_none(), "{k} is skipped: {skip:?}");
+        // A new handler fails setup until crates/spec-tests/src/gossip.rs classifies it.
+        for handler in spec_tests::gossip::RUNNABLE
+            .iter()
+            .chain(&["gossip_new_topic"])
+        {
+            let k = consensus("gloas", preset, "networking", handler);
+            if let Some(e) = skips.skips_some_case_of(&k) {
+                skipped.push(format!("{preset}/{handler}: {}", e.reason));
             }
         }
-        // A new Gloas gossip handler is not skipped either: it fails setup until it is
-        // classified in crates/spec-tests/src/gossip.rs.
-        let k = consensus("gloas", preset, "networking", "gossip_new_topic");
-        let skip = skips.skipped_by(&k);
-        assert!(skip.is_none(), "{k} is skipped: {skip:?}");
     }
+    skipped
+}
+
+/// The Gloas gossip handlers that the gossip runner executes are never skipped, in any case:
+/// no entry reaches them, also one narrowed to a case.
+#[test]
+fn gloas_gossip_runnable_handlers_are_not_skipped() {
+    let skipped = skipped_gossip_handlers(&committed());
+    assert!(skipped.is_empty(), "{skipped:?}");
+}
+
+/// An entry narrowed to one case of a runnable gossip handler skips no other case, but it still
+/// skips a case of that handler, so the check must catch it.
+#[test]
+fn gossip_check_catches_an_entry_narrowed_to_one_case() {
+    let skips = SkipList::parse(
+        r#"
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "minimal"
+runner  = "networking"
+handler = "gossip_execution_payload_envelope"
+case    = "pyspec_tests/one_case"
+reason  = "narrow gossip skip"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+"#,
+    )
+    .unwrap();
+    let k = consensus(
+        "gloas",
+        "minimal",
+        "networking",
+        "gossip_execution_payload_envelope",
+    );
+    assert!(
+        skips.skipped_by(&k).is_none(),
+        "another case is not skipped"
+    );
+    let skipped = skipped_gossip_handlers(&skips);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(skipped[0].starts_with("minimal/gossip_execution_payload_envelope"));
 }
 
 /// Each Gloas gossip handler that does not run is skipped by its own entry, whose reason names

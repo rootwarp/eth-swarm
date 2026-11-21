@@ -82,6 +82,7 @@ M2A_KEY_PATHS=(
   crates/crypto-bls
   crates/engine-api
   crates/ethswarm-proto
+  crates/fork-choice
   crates/ipc
   crates/network-config
   crates/node-key

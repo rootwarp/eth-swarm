@@ -8,13 +8,17 @@
 use cl_chain::core::{queue, ChainCore, Head, Outcome};
 use cl_chain::import::block::PermitAll;
 use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
-use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{Domain, Root};
+use consensus_types::gloas::{
+    BeaconState, ExecutionPayload, ExecutionPayloadEnvelope, SignedBeaconBlock,
+    SignedExecutionPayloadEnvelope,
+};
+use consensus_types::primitives::{Bytes32, Domain, Root, U256};
 use consensus_types::signing::{compute_signing_root, DOMAIN_BEACON_PROPOSER};
 use consensus_types::{EthSpec, Minimal};
 use ethswarm_proto::verify::{BlsSet, KeyNamespace, Signer};
 use network_config::ChainConfig;
 use ssz::Decode;
+use ssz_types::{FixedVector, ProgressiveVariableList, VariableList};
 use state_transition::accessors::get_domain;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,6 +26,7 @@ use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
 use testkit::anchor::load_anchor;
 use tokio::runtime::Handle;
 use tokio::time::Instant;
+use tree_hash::TreeHash;
 
 /// Room in each queue of the core.
 pub const QUEUE: usize = 4;
@@ -137,8 +142,25 @@ pub fn fixture() -> Fixture {
     }
 }
 
-/// The core of `ChainCore::from_anchor`, with [`VERIFY_TIMEOUT`] and no payload gate.
+/// [`anchored`] with the payload of the anchor verified (`ChainCore::with_payload_verified`),
+/// and no payload gate.
+///
+/// The export's blocks on the anchor build on its FULL payload: their bid's
+/// `parent_block_hash` is the anchor bid's `block_hash` (both zero). Its envelope cannot verify:
+/// the anchor bid names builder 0, which is not in the registry. So the fixture marks that
+/// payload verified, as an imported envelope would.
 pub fn ungated_fixture() -> Fixture {
+    let f = anchored();
+    let root = f.anchor.block_root;
+    Fixture {
+        core: f.core.with_payload_verified(root),
+        ..f
+    }
+}
+
+/// The core of `ChainCore::from_anchor`, with [`VERIFY_TIMEOUT`], no payload gate and no
+/// verified payload.
+pub fn anchored() -> Fixture {
     let pinned = pinned_export().expect("the pinned export must open");
     let dir = tempfile::tempdir().unwrap();
     AnchorFiles::genesis(&pinned.export)
@@ -222,6 +244,60 @@ pub fn assert_unchanged(core: &ChainCore<Minimal>, anchor: Head, block_root: Roo
         anchor.state_root,
         "the anchor state must not change"
     );
+}
+
+/// The envelope of `block`, whose post-state is `post`, on the network of `config`. It passes
+/// each check of `verify_execution_payload_envelope` on `post` when the bid of the block commits
+/// to the empty execution requests. Its signature is no real one.
+pub fn envelope_of(
+    block: &SignedBeaconBlock<Minimal>,
+    post: &BeaconState<Minimal>,
+    config: &ChainConfig,
+) -> SignedExecutionPayloadEnvelope<Minimal> {
+    let bid = &post.latest_execution_payload_bid;
+    let payload = ExecutionPayload::<Minimal> {
+        parent_hash: post.latest_block_hash,
+        fee_recipient: bid.fee_recipient,
+        state_root: Bytes32::repeat_byte(0x33),
+        receipts_root: Bytes32::repeat_byte(0x44),
+        logs_bloom: FixedVector::from_elem(0),
+        prev_randao: bid.prev_randao,
+        block_number: post.slot,
+        gas_limit: bid.gas_limit,
+        gas_used: 0,
+        timestamp: post.genesis_time + post.slot * config.slot_duration_ms() / 1000,
+        extra_data: VariableList::empty(),
+        base_fee_per_gas: U256::from(7u64),
+        block_hash: bid.block_hash,
+        transactions: ProgressiveVariableList::new(vec![]).unwrap(),
+        withdrawals: ProgressiveVariableList::new(
+            post.payload_expected_withdrawals.iter().cloned().collect(),
+        )
+        .unwrap(),
+        blob_gas_used: 0,
+        excess_blob_gas: 0,
+        // The RLP encoding of an empty list.
+        block_access_list: ProgressiveVariableList::new(vec![0xc0]).unwrap(),
+        slot_number: post.slot,
+    };
+    SignedExecutionPayloadEnvelope {
+        message: ExecutionPayloadEnvelope {
+            payload,
+            // The export's blocks carry the empty requests for their parent payload.
+            execution_requests: block.message.body.parent_execution_requests.clone(),
+            builder_index: bid.builder_index,
+            beacon_block_root: block.message.tree_hash_root(),
+            parent_beacon_block_root: post.latest_block_header.parent_root,
+        },
+        // Any bytes: the fake cl-verify gives the verdict.
+        signature: block.signature,
+    }
+}
+
+/// An envelope of the slot 1 block, for the tests that only queue one.
+pub fn some_envelope(f: &Fixture) -> SignedExecutionPayloadEnvelope<Minimal> {
+    let anchor = f.core.state(&f.anchor.block_root).unwrap();
+    envelope_of(&f.block, anchor, &f.config)
 }
 
 /// A clock that always reads `unix_ms`.

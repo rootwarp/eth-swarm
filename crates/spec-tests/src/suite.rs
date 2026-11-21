@@ -90,8 +90,9 @@ const fn consensus(
 ///
 /// `minimal` and `mainnet` must hold the trees of each runner that no skip entry may reach:
 /// `ssz_static`, `phase0/shuffling`, the Gloas state-transition runners, Gloas `fork_choice`,
-/// whose tick and block cases run, and Gloas `networking`, whose custody and gossip cases run.
-/// Without these subtrees, a missing tree would pass setup and run no trial.
+/// whose tick and block cases run, and Gloas `networking`, whose custody and gossip cases run,
+/// with each gossip handler directory that runs (`gossip::RUNNABLE`). Without these subtrees, a
+/// missing tree would pass setup and run no trial.
 ///
 /// `general` at v1.7.0-beta.4 holds only `altair/bls`, which is its scope.
 ///
@@ -150,6 +151,8 @@ pub const SETS: [VectorSet; 7] = [
             "tests/minimal/gloas/random",
             "tests/minimal/gloas/fork_choice",
             "tests/minimal/gloas/networking",
+            "tests/minimal/gloas/networking/gossip_execution_payload_envelope",
+            "tests/minimal/gloas/networking/gossip_payload_attestation_message",
         ],
     ),
     consensus(
@@ -168,6 +171,8 @@ pub const SETS: [VectorSet; 7] = [
             "tests/mainnet/gloas/random",
             "tests/mainnet/gloas/fork_choice",
             "tests/mainnet/gloas/networking",
+            "tests/mainnet/gloas/networking/gossip_execution_payload_envelope",
+            "tests/mainnet/gloas/networking/gossip_payload_attestation_message",
         ],
     ),
     VectorSet {
@@ -693,6 +698,30 @@ pub fn gossip_counts(trials: &[Trial]) -> Counts {
     })
 }
 
+/// The runnable official gossip cases of one preset set in the pinned vectors
+/// (consensus-specs v1.7.0-beta.4): 20 `gossip_execution_payload_envelope` and 13
+/// `gossip_payload_attestation_message` cases.
+pub const MIN_OFFICIAL_GOSSIP_RUNS: usize = 33;
+
+/// Why an unfiltered run is short of official gossip cases: each scanned preset set
+/// (`minimal`, `mainnet`) with fewer than [`MIN_OFFICIAL_GOSSIP_RUNS`] to run. `None` if none is.
+pub fn gossip_shortfall(trials: &[Trial], scanned: &[&str]) -> Option<String> {
+    let short: Vec<String> = ["minimal", "mainnet"]
+        .into_iter()
+        .filter(|preset| scanned.contains(preset))
+        .filter_map(|preset| {
+            let group = format!("_networking_{preset}");
+            let run = official_counts(trials, |g, handler| {
+                g.ends_with(&group) && handler.starts_with("gossip_")
+            })
+            .run;
+            let min = MIN_OFFICIAL_GOSSIP_RUNS;
+            (run < min).then(|| format!("{preset}: {run} to run, fewer than {min}"))
+        })
+        .collect();
+    (!short.is_empty()).then(|| short.join("; "))
+}
+
 /// The trials whose group (`<fork>_<runner>_<preset>`) and handler, the first two parts of the
 /// name, pass `of_group`, not the comptests.
 fn official_counts(trials: &[Trial], of_group: impl Fn(&str, &str) -> bool) -> Counts {
@@ -808,6 +837,64 @@ mod tests {
             }
         );
         assert_eq!(gossip_counts(&[]), Counts::default());
+    }
+
+    /// `n` official gossip trials of `preset` with `outcome`, in the group of `fork`.
+    fn gossip_trials(fork: &str, preset: &str, n: usize, outcome: fn() -> Outcome) -> Vec<Trial> {
+        (0..n)
+            .map(|i| {
+                let name = format!(
+                    "{fork}_networking_{preset}::gossip_execution_payload_envelope::pyspec_tests::c{i}"
+                );
+                trial(&name, outcome())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unfiltered_run_needs_the_runnable_official_gossip_cases_of_each_scanned_preset() {
+        let enough = MIN_OFFICIAL_GOSSIP_RUNS;
+        let full = gossip_trials("gloas", "minimal", enough, run);
+        assert_eq!(gossip_shortfall(&full, &["ssz-specs", "minimal"]), None);
+        // One short: skipped, unaccounted, Fulu-skipped, other-preset and comptests cases do
+        // not count.
+        let mut short = gossip_trials("gloas", "minimal", enough - 1, run);
+        short.extend(gossip_trials("gloas", "minimal", 3, skip));
+        short.push(trial(
+            "gloas_networking_minimal::gossip_new_topic::pyspec_tests::x",
+            Outcome::Unaccounted,
+        ));
+        short.extend(gossip_trials("gloas", "mainnet", enough, run));
+        short.push(trial(
+            "comptests_gloas_networking_minimal::gossip_beacon_block::pyspec_tests::y",
+            run(),
+        ));
+        short.push(trial(
+            "gloas_networking_minimal::get_custody_groups::pyspec_tests::z",
+            run(),
+        ));
+        let why = gossip_shortfall(&short, &["minimal", "mainnet"]).expect("minimal is short");
+        assert!(
+            why.contains("minimal") && why.contains(&(enough - 1).to_string()),
+            "{why}"
+        );
+        assert!(!why.contains("mainnet"), "{why}");
+        // A scanned preset set with no gossip case at all is short too; one that was not
+        // scanned is not checked.
+        let why = gossip_shortfall(&full, &["minimal", "mainnet"]).expect("mainnet is short");
+        assert!(why.contains("mainnet") && !why.contains("minimal"), "{why}");
+        assert_eq!(gossip_shortfall(&[], &["ssz-specs", "general"]), None);
+    }
+
+    #[test]
+    fn the_preset_sets_require_each_runnable_gossip_handler_tree() {
+        for preset in ["minimal", "mainnet"] {
+            let set = SETS.iter().find(|s| s.name == preset).unwrap();
+            for handler in gossip::RUNNABLE {
+                let tree = format!("tests/{preset}/gloas/networking/{handler}");
+                assert!(set.subtrees.contains(&tree.as_str()), "{preset}: {tree}");
+            }
+        }
     }
 
     fn key(fork: &str, preset: &str, runner: &str, handler: &str) -> CaseKey {

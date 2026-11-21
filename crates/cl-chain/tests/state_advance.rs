@@ -1652,7 +1652,9 @@ fn anchor_with(edit: impl FnOnce(&mut State)) -> Fixture {
     let core = ChainCore::from_anchor(state, block, pinned.config.clone())
         .expect("the anchor must install")
         .with_verify_timeout(VERIFY_TIMEOUT)
-        .with_payload_gate(PermitAll);
+        .with_payload_gate(PermitAll)
+        // The slot 1 block builds on the FULL payload of the anchor (see `support`).
+        .with_payload_verified(anchor.block_root);
     let mut child = export_block(1);
     child.message.parent_root = anchor.block_root;
     child
