@@ -80,18 +80,24 @@ the PTCs of the heads of a slot: more than `PTC_SIZE` keys. The spec does not pr
 message with a valid signature changes them:
 
 - A slot `s` stays until `end(s) + MAXIMUM_GOSSIP_CLOCK_DISPARITY`, where `end(s)` is the
-  start of slot `s + 1`. After that time no message of `s` passes `is_current_slot` again.
-  `oldest_current_slot` gives the first slot that is still current, and `Seen::resolve` and
-  `Seen::prune_payload_attestations` remove the slots before it.
+  start of slot `s + 1`. After that time no message of `s` passes `is_current_slot` again, if
+  the clock does not go back. `oldest_current_slot` gives the first slot that is still current,
+  and `Seen::resolve` and `Seen::prune_payload_attestations` remove the slots before it. That
+  slot is the floor, and it does not decrease. A key or a message of a slot before the floor is
+  IGNORE, never ACCEPT: `Seen` keeps the validators of the last slot before the floor until the
+  floor moves again, so a second copy of an accepted message is still a duplicate, and any
+  other message before the floor is not current. A clock that goes back does not change this.
 - At most `MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS` (8) slots. A new slot past the limit removes the
   oldest slot.
 - At most `MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT` (4) times `PTC_SIZE` validators for each
   slot: 64 in the minimal preset and 2,048 in the mainnet preset. A new validator past the
   limit removes the oldest validator of the slot.
 
-A removed key lets a second copy of its message pass again, where the spec ignores it. That
-copy is a duplicate of a valid message, not an invalid message, and the limits never make a
-valid first copy IGNORE. The tests in `crates/gossip-validation/tests/payload_attestation.rs`
-pin each bound: the 500 ms edge with an automatic and an explicit prune, the slot limit, a
-head change that admits two PTCs in one slot, the per-slot limit with five heads, and invalid
-copies that change nothing.
+A key that one of the two limits removes lets a second copy of its message pass again, where
+the spec ignores it. That copy is a duplicate of a valid message, not an invalid message, and
+the limits never make a valid first copy IGNORE. A first copy that is pending when its slot
+goes before the floor is IGNORE as not current. The tests in
+`crates/gossip-validation/tests/payload_attestation.rs` pin each bound: the 500 ms edge with an
+automatic and an explicit prune, pending copies across a prune, a clock that goes back, the
+slot limit, a head change that admits two PTCs in one slot, the per-slot limit with five heads,
+and invalid copies that change nothing.

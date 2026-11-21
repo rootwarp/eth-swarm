@@ -16,10 +16,21 @@
 //!   ([`is_current_slot`]) until `end(s) + MAXIMUM_GOSSIP_CLOCK_DISPARITY`, where `end(s)` is
 //!   the start of slot `s + 1`. After that time no message of `s` passes the check again, so its
 //!   keys are not necessary. A key carries the oldest slot that is current at the time of its
-//!   check ([`oldest_current_slot`]), and [`Seen::resolve`] removes each slot before it. A key
-//!   of a slot that is already removed accepts and does not add the slot again. A caller can
-//!   also prune with no valid message: [`Seen::prune_payload_attestations`] and
+//!   check ([`oldest_current_slot`]), and [`Seen::resolve`] removes each slot before it. That
+//!   slot is the floor ([`Seen::min_payload_attestation_slot`]). A caller can also prune with
+//!   no valid message: [`Seen::prune_payload_attestations`] and
 //!   [`Seen::prune_payload_attestations_before`].
+//! - **Below the floor.** A key of a slot before the floor is never ACCEPT, and does not add
+//!   the slot again. Two copies of a message can both be pending while the slot is current, and
+//!   the slot can go before the floor after the first copy accepts. Thus `Seen` keeps the
+//!   validators of the last slot before the floor
+//!   ([`Seen::has_pruned_payload_attestation`]) until the floor moves again. A key of that
+//!   slot and validator is IGNORE as a duplicate. Any other key before the floor is IGNORE as
+//!   not current. The validation of a message before the floor is IGNORE for the same reasons.
+//! - **Monotonic clock.** The prune assumes that `current_time_ms` does not decrease from one
+//!   call to the next. A prune with an earlier time, or an earlier slot, does not lower the
+//!   floor. If a caller gives an earlier time, [`is_current_slot`] can be true again for a slot
+//!   before the floor, but the validation of a message of that slot is still IGNORE.
 //! - **Slots.** `Seen` keeps at most [`MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS`] slots, and removes
 //!   the oldest slot first. A clock that moves normally keeps at most two slots current at a
 //!   time. The limit is for a clock that jumps, or a slot duration that is very short.
@@ -60,9 +71,12 @@ pub struct Seen {
     execution_payloads: HashMap<Hash32, SeenPayload>,
     /// `seen.payload_attestation_validators`, by slot.
     payload_attestation_validators: BTreeMap<Slot, SlotValidators>,
-    /// The oldest slot of the payload attestation keys. It only increases, and the slots
-    /// before it are removed.
+    /// The oldest slot of the payload attestation keys: the floor. It only increases, and the
+    /// slots before it are removed.
     min_payload_attestation_slot: Slot,
+    /// The validators of the last slot before the floor, as the prune that moved the floor
+    /// found them. The next move of the floor replaces them.
+    pruned_payload_attestations: Option<(Slot, HashSet<ValidatorIndex>)>,
 }
 
 /// The validators of the payload attestation keys of one slot.
@@ -189,10 +203,34 @@ impl Seen {
         self.payload_attestation_validators.len()
     }
 
+    /// The floor of the payload attestation keys: the oldest slot that `Seen` can keep. Each
+    /// slot before it is removed, and a key of such a slot is IGNORE. It does not decrease.
+    pub fn min_payload_attestation_slot(&self) -> Slot {
+        self.min_payload_attestation_slot
+    }
+
+    /// `(slot, validator_index)` was a key of the last slot before the floor when a prune
+    /// removed that slot. [`Seen::has_payload_attestation`] is false for it. The next move of
+    /// the floor removes this record.
+    pub fn has_pruned_payload_attestation(
+        &self,
+        slot: Slot,
+        validator_index: ValidatorIndex,
+    ) -> bool {
+        self.pruned_payload_attestations
+            .as_ref()
+            .is_some_and(|(pruned, validators)| {
+                *pruned == slot && validators.contains(&validator_index)
+            })
+    }
+
     /// Removes the payload attestation keys of each slot that is not current at
     /// `current_time_ms` and cannot be current again: each slot before
     /// [`oldest_current_slot`]. For a caller with no valid message to resolve, for example at
     /// the start of a slot.
+    ///
+    /// The caller must give a time that does not decrease from one call to the next. An
+    /// earlier time does not lower the floor and changes nothing.
     ///
     /// [`oldest_current_slot`]: crate::oldest_current_slot
     pub fn prune_payload_attestations<E, S>(&mut self, store: &S, current_time_ms: u64)
@@ -203,16 +241,25 @@ impl Seen {
         self.prune_payload_attestations_before(oldest_current_slot(store, current_time_ms));
     }
 
-    /// Removes the payload attestation keys of each slot before `min_slot`. A later key of such
-    /// a slot does not add the slot again. A `min_slot` at or before an earlier one changes
-    /// nothing.
+    /// Removes the payload attestation keys of each slot before `min_slot`, and makes
+    /// `min_slot` the floor. A later key of such a slot is IGNORE and does not add the slot
+    /// again. The validators of slot `min_slot - 1` stay as a record of duplicates
+    /// ([`Seen::has_pruned_payload_attestation`]), and replace the record of the earlier floor.
+    ///
+    /// The floor does not decrease: a `min_slot` at or before the floor changes nothing, also
+    /// the record.
     pub fn prune_payload_attestations_before(&mut self, min_slot: Slot) {
         if min_slot <= self.min_payload_attestation_slot {
             return;
         }
         self.min_payload_attestation_slot = min_slot;
-        self.payload_attestation_validators =
-            self.payload_attestation_validators.split_off(&min_slot);
+        let kept = self.payload_attestation_validators.split_off(&min_slot);
+        let mut removed = std::mem::replace(&mut self.payload_attestation_validators, kept);
+        // `min_slot` is after the earlier floor, so it is not 0.
+        self.pruned_payload_attestations = removed
+            .pop_last()
+            .filter(|(slot, _)| *slot == min_slot - 1)
+            .map(|(slot, validators)| (slot, validators.set));
     }
 
     /// The end of a [`Verdict::Pending`]: `signatures` is the BLS verdict of its sets, as
@@ -225,7 +272,9 @@ impl Seen {
     /// - `Err`: no verdict. IGNORE, and `Seen` does not change.
     ///
     /// The key of a payload attestation message also applies the bounds of `Seen` (see the
-    /// module documentation), only for `Ok(true)`.
+    /// module documentation), only for `Ok(true)`. A key of a slot before the floor is never
+    /// ACCEPT: IGNORE as a duplicate if the record of the last pruned slot has it, else IGNORE
+    /// as not current.
     pub fn resolve(
         &mut self,
         seen_key: SeenKey,
@@ -268,10 +317,17 @@ impl Seen {
                 max_per_slot,
             } => {
                 self.prune_payload_attestations_before(prune_before);
-                // The slot stopped being current after the check, so no message of it can
-                // pass the check again.
+                // The slot stopped being current after the check, and `Seen` does not keep it.
+                // Another copy of the message can have accepted before the prune. Thus this
+                // copy is IGNORE, and does not add the slot again.
                 if slot < self.min_payload_attestation_slot {
-                    return Verdict::Accept;
+                    if self.has_pruned_payload_attestation(slot, validator_index) {
+                        return Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+                            slot,
+                            validator_index,
+                        });
+                    }
+                    return Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot });
                 }
                 let slots = &mut self.payload_attestation_validators;
                 let validators = slots.entry(slot).or_default();

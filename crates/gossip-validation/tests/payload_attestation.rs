@@ -847,14 +847,27 @@ fn a_slot_stays_in_seen_through_the_clock_disparity_and_a_valid_message_then_rem
     assert!(seen.has_payload_attestation(2, w));
     assert_eq!(seen.payload_attestation_slot_count(), 1);
     assert_eq!(seen.payload_attestation_count(), 2);
+    // A copy of the accepted message of slot 1 is a duplicate. A message of another validator
+    // of slot 1 is not current.
     assert_eq!(
         validate_at(&seen, store, &m, edge + 1),
+        Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+            slot: 1,
+            validator_index: 10
+        })
+    );
+    assert_eq!(
+        validate_at(&seen, store, &message(12, chain.p, 1), edge + 1),
         Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot: 1 })
     );
 
-    // The late copy accepts, and does not add slot 1 again.
-    assert_eq!(seen.resolve(late, Ok(true)), Verdict::Accept);
+    // The late copy is IGNORE, and does not add slot 1 again.
+    assert_eq!(
+        seen.resolve(late, Ok(true)),
+        Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot: 1 })
+    );
     assert!(!seen.has_payload_attestation(1, 11));
+    assert!(!seen.has_pruned_payload_attestation(1, 11));
     assert_eq!(seen.payload_attestation_slot_count(), 1);
     assert_eq!(seen.payload_attestation_count(), 2);
 }
@@ -894,13 +907,17 @@ fn an_explicit_prune_removes_a_slot_only_after_the_clock_disparity() {
     assert_eq!(seen.payload_attestation_count(), 1);
 
     // A prune by slot removes each slot before that slot. A copy of slot 2 that resolves
-    // after it accepts, and does not add slot 2 again.
+    // after it is IGNORE, and does not add slot 2 again.
     let (_, late) = pending(validate_at(&seen, store, &message(w, r, 2), time_at(2)));
     seen.prune_payload_attestations_before(3);
     assert_eq!(seen.payload_attestation_count(), 0);
     assert_eq!(seen.payload_attestation_slot_count(), 0);
-    assert_eq!(seen.resolve(late, Ok(true)), Verdict::Accept);
+    assert_eq!(
+        seen.resolve(late, Ok(true)),
+        Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot: 2 })
+    );
     assert_eq!(seen.payload_attestation_count(), 0);
+    assert_eq!(seen.payload_attestation_slot_count(), 0);
 }
 
 #[test]

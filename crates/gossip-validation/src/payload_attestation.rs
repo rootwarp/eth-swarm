@@ -56,10 +56,11 @@ where
 /// The oldest slot that is current at `current_time_ms` ([`is_current_slot`]). Not a spec
 /// function: [`Seen`] removes the keys of the slots before it.
 ///
-/// A slot `s` is not current, and cannot be current again, once
-/// `end(s) + MAXIMUM_GOSSIP_CLOCK_DISPARITY < current_time_ms`, where `end(s)` is the start of
-/// slot `s + 1`. The result is 0 up to `genesis_time_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
-/// The times are in 128 bits, so no value can overflow.
+/// A slot `s` is not current once `end(s) + MAXIMUM_GOSSIP_CLOCK_DISPARITY < current_time_ms`,
+/// where `end(s)` is the start of slot `s + 1`. It cannot be current again if the time does not
+/// decrease: the prune of [`Seen`] assumes such a monotonic clock. The result is 0 up to
+/// `genesis_time_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY`. The times are in 128 bits, so no value
+/// can overflow.
 pub fn oldest_current_slot<E, S>(store: &S, current_time_ms: u64) -> Slot
 where
     E: Preset,
@@ -86,6 +87,12 @@ where
 /// has the oldest current slot at `current_time_ms` ([`oldest_current_slot`]) and the limit of
 /// validators for each slot, `MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT * PTC_SIZE`, which
 /// [`Seen::resolve`] applies.
+///
+/// `Seen` removes the keys of the slots before its floor
+/// ([`Seen::min_payload_attestation_slot`]). A message of such a slot is IGNORE: as a duplicate
+/// if the record of the last pruned slot has its key
+/// ([`Seen::has_pruned_payload_attestation`]), else as not current. This is also true for a
+/// `current_time_ms` before the time of the prune, where [`is_current_slot`] can be true again.
 ///
 /// The checks of the validator read the head state, `store.block_states[get_head(store).root]`
 /// ([`StoreView::head_state`]), not the post-state of the attested block: the index must be in
@@ -119,13 +126,18 @@ where
             fork_epoch: gloas_fork_epoch,
         });
     }
-    if seen.has_payload_attestation(data.slot, validator_index) {
+    if seen.has_payload_attestation(data.slot, validator_index)
+        || seen.has_pruned_payload_attestation(data.slot, validator_index)
+    {
         return Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
             slot: data.slot,
             validator_index,
         });
     }
-    if !is_current_slot(store, data.slot, current_time_ms) {
+    // A slot before the floor of `Seen` is not current, also for a clock that went back.
+    if data.slot < seen.min_payload_attestation_slot()
+        || !is_current_slot(store, data.slot, current_time_ms)
+    {
         return Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot: data.slot });
     }
     let Some(block) = store.block(block_root) else {
