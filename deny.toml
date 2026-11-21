@@ -114,11 +114,12 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # Git dependencies are allowed ONLY for rust-libp2p and the four sigp SSZ repos.
 # rust-libp2p: every libp2p* crate via the root [patch.crates-io] at one full commit SHA that contains
-# the gossipsub StrictNoSign `key` rejection (libp2p/rust-libp2p#6621):
+# the gossipsub StrictNoSign `key` rejection (libp2p/rust-libp2p#6621) and the gossipsub PRUNE backoff
+# fix for topics not in the mesh (libp2p/rust-libp2p#6707, RUSTSEC-2026-0534; gossipsub 0.51.0 here):
 #   libp2p, libp2p-*, multistream-select, rw-stream-sink, prost-codec
-#                                       https://github.com/libp2p/rust-libp2p  rev 2fed78f074af91e0c7440eedd08b8f898ad4a3fe
+#                                       https://github.com/libp2p/rust-libp2p  rev 6c5a10b4102a7a04f56d6cf65ea58eeff929cefa
 # scripts/check-libp2p-revs.sh fails CI on a second rust-libp2p SHA, a libp2p* crate from anywhere else,
-# or a SHA that does not descend from that fix. Move to crates.io once libp2p-gossipsub 0.51 is released.
+# or a SHA that does not descend from the StrictNoSign fix. Move to crates.io once libp2p-gossipsub 0.51 is released.
 # The sigp SSZ repos are pinned to the revisions in
 # Lighthouse unstable's root Cargo.toml [patch] section (see arch/ssz-crate-check.md §3):
 #   ethereum_ssz + ethereum_ssz_derive  https://github.com/sigp/ethereum_ssz  rev 974f78f421fbf70cba4e8f84e0fa28c23ad54f34
