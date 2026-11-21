@@ -98,7 +98,8 @@ message with a valid signature changes them:
 - At most `MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT` (4) times `PTC_SIZE` validators for each
   slot: 64 in the minimal preset and 2,048 in the mainnet preset. At that limit, a valid key of
   a new validator of the slot is IGNORE (`IgnoreReason::PayloadAttestationSlotFull { slot }`),
-  and `Seen` does not change.
+  and the validators of the full slot do not change. `Seen::resolve` still removes the slots
+  before the oldest current slot of the key first, as for each valid key.
 
 ### Why a full slot ignores a new validator
 
@@ -176,8 +177,9 @@ kept slot. The bounds are those of the payload attestation keys:
 - **Keys of a slot.** At most `MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT` (16). The bid of a
   block names one builder, so a slot has one key for each of its blocks, and more than one
   block only if its proposer equivocates. At the limit, a valid envelope of a new block is
-  IGNORE (`ExecutionPayloadEnvelopeSlotFull { slot }`) and `Seen` does not change, for the
-  reasons of a full payload attestation slot above.
+  IGNORE (`ExecutionPayloadEnvelopeSlotFull { slot }`) and the keys and payloads of the full
+  slot do not change, for the reasons of a full payload attestation slot above.
+  `Seen::resolve` still removes the slots before the oldest current slot of the key first.
 - Only a valid signature (`Ok(true)` in `Seen::resolve`) changes `Seen`. An invalid signature,
   a signature with no verdict, and each IGNORE or REJECT before the signature leave the keys,
   the payloads, the floor and the record as they are.

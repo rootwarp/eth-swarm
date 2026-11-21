@@ -107,9 +107,10 @@ fn shuffling_case(root: &Path) {
     );
 }
 
-/// The Gloas trees of the state-transition runners and of the fork-choice runner that a
-/// minimal or mainnet set must hold, each with a handler that its runner knows.
-const M3_TREES: [(&str, &str); 7] = [
+/// The Gloas trees of the state-transition runners, of the fork-choice runner and of the
+/// networking runner that a minimal or mainnet set must hold, each with a handler that its
+/// runner knows.
+const M3_TREES: [(&str, &str); 8] = [
     ("sanity", "blocks"),
     ("epoch_processing", "justification_and_finalization"),
     ("operations", "attestation"),
@@ -117,6 +118,7 @@ const M3_TREES: [(&str, &str); 7] = [
     ("rewards", "basic"),
     ("random", "random"),
     ("fork_choice", "on_block"),
+    ("networking", "gossip_payload_attestation_message"),
 ];
 
 /// The case name of the placeholder cases of [`M3_TREES`].
@@ -219,7 +221,7 @@ fn coverage_passes_on_a_fully_read_tree() {
     );
     assert_eq!(placeholders.len(), M3_TREES.len());
     let covered = suite.guard.check(&suite.reads).unwrap();
-    assert_eq!((covered.read, covered.total), (8, 17));
+    assert_eq!((covered.read, covered.total), (8, 18));
 }
 
 #[test]
@@ -570,8 +572,9 @@ fn missing_fork_subtree_fails() {
         }
         other => panic!("{:?}", other.err()),
     }
-    // Each Gloas tree of the state-transition runners and of the fork-choice runner is
-    // required too: without its skip entries, nothing else finds a tree that is missing.
+    // Each Gloas tree of the state-transition runners, of the fork-choice runner and of the
+    // networking runner is required too: without its skip entries, nothing else finds a tree
+    // that is missing.
     for (runner, _) in M3_TREES {
         let tree = minimal_tree();
         std::fs::remove_dir_all(tree.path().join(format!("{MINIMAL}/gloas/{runner}"))).unwrap();
@@ -745,7 +748,7 @@ fn fork_choice_case_runs_through_the_suite_and_every_file_is_read() {
     );
     run_all(&suite);
     let covered = suite.guard.check(&suite.reads).unwrap();
-    assert_eq!((covered.read, covered.total), (13, 22));
+    assert_eq!((covered.read, covered.total), (13, 23));
 }
 
 #[test]

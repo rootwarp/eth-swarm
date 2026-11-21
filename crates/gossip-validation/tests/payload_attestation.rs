@@ -1448,6 +1448,11 @@ fn a_slot_that_the_slot_limit_removes_must_not_accept_again() {
     let validator = |slot| get_ptc(chain.head_state(), slot).unwrap()[0];
     let m = |slot| message(validator(slot), view.root(slot), slot);
     let mut seen = Seen::default();
+    let last_removed = extra as Slot;
+    // Keys that are pending before the limit removes their slots: the first slot, and the
+    // last slot that the limit removes.
+    let early =
+        [1, last_removed].map(|slot| (slot, pending(validate_at(&seen, &view, &m(slot), now)).1));
     for slot in 1..=slots {
         assert_eq!(offer_at(&mut seen, &view, &m(slot), now), Verdict::Accept);
     }
@@ -1463,19 +1468,30 @@ fn a_slot_that_the_slot_limit_removes_must_not_accept_again() {
 
     // A valid copy of a message of a removed slot must not accept again. The last removed slot
     // is a duplicate, and the slots before it are not current.
-    let last_removed = extra as Slot;
-    for slot in 1..=last_removed {
-        let want = if slot == last_removed {
+    let want = |slot| {
+        if slot == last_removed {
             IgnoreReason::PayloadAttestationAlreadySeen {
                 slot,
                 validator_index: validator(slot),
             }
         } else {
             IgnoreReason::NotCurrentSlot { slot }
-        };
+        }
+    };
+    for slot in 1..=last_removed {
         assert_eq!(
             offer_at(&mut seen, &view, &m(slot), now),
-            Verdict::Ignore(want),
+            Verdict::Ignore(want(slot)),
+            "{slot}"
+        );
+        assert_eq!(seen, full, "{slot}");
+    }
+    // A key that was pending before the limit removed its slot must not accept either, and
+    // leaves Seen as it is.
+    for (slot, key) in early {
+        assert_eq!(
+            seen.resolve(key, Ok(true)),
+            Verdict::Ignore(want(slot)),
             "{slot}"
         );
         assert_eq!(seen, full, "{slot}");

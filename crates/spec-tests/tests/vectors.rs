@@ -66,22 +66,23 @@ fn main() {
         }
     };
     eprintln!("vector sets scanned: {}", suite.scanned.join(" "));
-    // One line for the CI log: the official fork_choice cases (`<fork>_fork_choice_<preset>`)
-    // by outcome, before a name filter applies. The pass and fail counts are in the trial lines.
-    let (mut run, mut skipped, mut unaccounted) = (0, 0, 0);
-    for t in &suite.trials {
-        let group = t.name.split("::").next().unwrap_or_default();
-        if group.contains("_fork_choice_") && !group.starts_with("comptests_") {
-            match t.outcome {
-                Outcome::Run(_) => run += 1,
-                Outcome::Skip(_) => skipped += 1,
-                Outcome::Unaccounted => unaccounted += 1,
-            }
-        }
-    }
+    // One line each for the CI log: the official fork_choice cases (`<fork>_fork_choice_<preset>`)
+    // and gossip cases (the `gossip_*` handlers of `<fork>_networking_<preset>`) by outcome,
+    // before a name filter applies. The pass and fail counts are in the trial lines.
+    let suite::Counts {
+        run,
+        skipped,
+        unaccounted,
+    } = suite::fork_choice_counts(&suite.trials);
     eprintln!(
         "official fork_choice cases: {run} to run, {skipped} skipped, {unaccounted} unaccounted"
     );
+    let suite::Counts {
+        run,
+        skipped,
+        unaccounted,
+    } = suite::gossip_counts(&suite.trials);
+    eprintln!("official gossip cases: {run} to run, {skipped} skipped, {unaccounted} unaccounted");
 
     let trials = suite
         .trials

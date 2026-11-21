@@ -416,12 +416,12 @@ fn attester_slashing<E: Preset>(
 /// encoding of the bounded type of consensus-types.
 #[derive(ssz_derive::Decode)]
 #[cfg_attr(test, derive(ssz_derive::Encode))]
-struct SpecExecutionRequests {
-    _deposits: ProgressiveVariableList<DepositRequest, U0>,
-    withdrawals: ProgressiveVariableList<WithdrawalRequest, U0>,
-    consolidations: ProgressiveVariableList<ConsolidationRequest, U0>,
-    builder_deposits: ProgressiveVariableList<BuilderDepositRequest, U0>,
-    builder_exits: ProgressiveVariableList<BuilderExitRequest, U0>,
+pub(crate) struct SpecExecutionRequests {
+    pub(crate) _deposits: ProgressiveVariableList<DepositRequest, U0>,
+    pub(crate) withdrawals: ProgressiveVariableList<WithdrawalRequest, U0>,
+    pub(crate) consolidations: ProgressiveVariableList<ConsolidationRequest, U0>,
+    pub(crate) builder_deposits: ProgressiveVariableList<BuilderDepositRequest, U0>,
+    pub(crate) builder_exits: ProgressiveVariableList<BuilderExitRequest, U0>,
 }
 
 /// The Gloas `BeaconBlockBody` (`gloas/beacon-chain.md` L840-860) with

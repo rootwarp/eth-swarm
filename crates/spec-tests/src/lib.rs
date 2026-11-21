@@ -10,7 +10,8 @@
 //!   [`kzg`] (cryptography-specs cell handlers through `crypto-kzg`), [`bls`] (BLS handlers
 //!   of bls12-381-tests, cryptography-specs and consensus-spec-tests `general` through
 //!   `crypto-bls`), [`networking`] (the custody handlers of `<preset>/{fulu,gloas}/networking`
-//!   through `consensus_types::das`), [`sanity`] (`<preset>/gloas/sanity/slots` through
+//!   through `consensus_types::das`, and the Gloas gossip handlers of [`gossip`] through
+//!   `gossip-validation`), [`sanity`] (`<preset>/gloas/sanity/slots` through
 //!   `state_transition::per_slot`, and `<preset>/gloas/sanity/blocks` through
 //!   `state_transition::state_transition`), [`finality`] (`<preset>/gloas/finality` with the
 //!   blocks runner of [`sanity`]), [`operations`] (`<preset>/gloas/operations` through
@@ -34,6 +35,7 @@ pub mod epoch_processing;
 pub mod finality;
 pub mod fixture;
 pub mod fork_choice;
+pub mod gossip;
 pub mod kzg;
 pub mod networking;
 pub mod operations;

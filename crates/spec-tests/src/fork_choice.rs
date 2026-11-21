@@ -40,7 +40,7 @@
 //! or a check that is not here cannot pass because the runner does less.
 
 use crate::bls_backend::{backend_for, bls_context, bls_setting, Bls, StateKeys};
-use crate::config::check_same_config;
+use crate::config::{self, fork_epoch_differs, ForkEpoch};
 use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
@@ -111,9 +111,9 @@ pub fn supported(fork: &str, preset: &str, handler: &str) -> bool {
 }
 
 /// `SLOT_DURATION_MS` of `configs/minimal.yaml` (L70) at v1.7.0-beta.4.
-const MINIMAL_SLOT_DURATION_MS: u64 = 6_000;
+pub(crate) const MINIMAL_SLOT_DURATION_MS: u64 = 6_000;
 /// `SLOT_DURATION_MS` of `configs/mainnet.yaml` (L74) at v1.7.0-beta.4.
-const MAINNET_SLOT_DURATION_MS: u64 = 12_000;
+pub(crate) const MAINNET_SLOT_DURATION_MS: u64 = 12_000;
 
 /// Runs one case. `Err` describes a failure.
 pub fn run(reads: &Reads, case: &Case) -> Result<(), String> {
@@ -139,10 +139,7 @@ fn run_case<E: Preset>(reads: &Reads, case: &Case, slot_duration_ms: u64) -> Res
     let slot_duration = NonZeroU64::new(slot_duration_ms).ok_or("SLOT_DURATION_MS is zero")?;
     let mut store = get_forkchoice_store(anchor_state, anchor_block, slot_duration)
         .map_err(|e| format!("get_forkchoice_store: {e}"))?;
-    let provider = Transition {
-        preset: &case.key.preset,
-        bls,
-    };
+    let provider = Transition::new(&case.key.preset, bls);
     let mut checks = 0;
     for (i, step) in steps.iter().enumerate() {
         checks += apply_step(reads, case, &mut store, &provider, step)
@@ -155,23 +152,40 @@ fn run_case<E: Preset>(reads: &Reads, case: &Case, slot_duration_ms: u64) -> Res
     Ok(())
 }
 
-/// The `config.yaml` of a case, if it has one: the values that the transition compiles in
-/// ([`check_same_config`]), the values that fork choice compiles in
-/// (`fork_choice::config_values`) and `SLOT_DURATION_MS` of the preset.
+/// The `config.yaml` of a case, if it has one: [`check_store_config`], and its
+/// `GLOAS_FORK_EPOCH` must be `fork_epoch`.
 fn check_config<E: Preset>(
     reads: &Reads,
     case: &Case,
     fork_epoch: u64,
     slot_duration_ms: u64,
 ) -> Result<(), String> {
-    check_same_config::<E>(reads, case, fork_epoch)?;
+    match check_store_config::<E>(reads, case, fork_epoch, slot_duration_ms, &[])? {
+        ForkEpoch::Same => Ok(()),
+        ForkEpoch::Differs(epoch) => Err(fork_epoch_differs(epoch, fork_epoch)),
+    }
+}
+
+/// The `config.yaml` of a case, if it has one: the values that the transition compiles in
+/// ([`config::check_config`], which also gives how `GLOAS_FORK_EPOCH` compares with
+/// `fork_epoch`), the values that fork choice compiles in (`fork_choice::config_values`),
+/// `SLOT_DURATION_MS` of the preset and each value of `extra`.
+pub(crate) fn check_store_config<E: Preset>(
+    reads: &Reads,
+    case: &Case,
+    fork_epoch: u64,
+    slot_duration_ms: u64,
+    extra: &[(&str, u64)],
+) -> Result<ForkEpoch, String> {
+    let fork = config::check_config::<E>(reads, case, fork_epoch)?;
     let Some(path) = case.file("config.yaml") else {
-        return Ok(());
+        return Ok(fork);
     };
     let config = fixture::load(reads, path)?;
     let values = ::fork_choice::config_values()
         .into_iter()
-        .chain([("SLOT_DURATION_MS", slot_duration_ms)]);
+        .chain([("SLOT_DURATION_MS", slot_duration_ms)])
+        .chain(extra.iter().copied());
     for (name, want) in values {
         let got = fixture::field(&config, name).map_err(|e| format!("config.yaml: {e}"))?;
         if unsigned(got) != Some(want) {
@@ -180,17 +194,22 @@ fn check_config<E: Preset>(
             ));
         }
     }
-    Ok(())
+    Ok(fork)
 }
 
 /// The state transition of the vectors. The signatures go to the in-process BLS backend with
 /// the keys of the state, or to no check for `bls_setting: 2`, with the config of the preset.
-struct Transition<'a> {
+pub(crate) struct Transition<'a> {
     preset: &'a str,
     bls: Bls,
 }
 
-impl Transition<'_> {
+impl<'a> Transition<'a> {
+    /// The transition of the vectors of `preset` with the signature check of `bls`.
+    pub(crate) fn new(preset: &'a str, bls: Bls) -> Self {
+        Self { preset, bls }
+    }
+
     fn context<'k>(&self, keys: &'k StateKeys) -> Result<BlsContext<'k>, StfError> {
         // Only an unknown preset fails here, and `run` accepts only known presets.
         bls_context(self.preset, backend_for(self.bls, keys))
@@ -361,10 +380,28 @@ fn block<E: Preset>(
     valid: bool,
 ) -> Result<(), String> {
     let signed_block: SignedBeaconBlock<E> = object(reads, case, name)?;
-    let name = name.as_str().unwrap_or_default();
+    import_block(
+        store,
+        provider,
+        &signed_block,
+        name.as_str().unwrap_or_default(),
+        valid,
+    )
+}
+
+/// `on_block` for a block with the flag `valid`, and after a valid block each attestation,
+/// attester slashing and payload attestation of the block, as `add_block` of the pyspec
+/// helpers gives them. `name` names the block in an error.
+pub(crate) fn import_block<E: Preset>(
+    store: &mut Store<E>,
+    provider: &Transition<'_>,
+    signed_block: &SignedBeaconBlock<E>,
+    name: &str,
+    valid: bool,
+) -> Result<(), String> {
     let body = &signed_block.message.body;
     run_handler(store, "on_block", valid, |store| {
-        on_block(store, provider, &signed_block)
+        on_block(store, provider, signed_block)
     })?;
     if !valid {
         return Ok(());
@@ -421,7 +458,7 @@ fn ptc_messages<E: Preset>(
 }
 
 /// The SSZ object of the `<name>.ssz_snappy` file that a step names.
-fn object<T: Decode>(reads: &Reads, case: &Case, name: &Yaml) -> Result<T, String> {
+pub(crate) fn object<T: Decode>(reads: &Reads, case: &Case, name: &Yaml) -> Result<T, String> {
     let name = name.as_str().ok_or("expected a file name")?;
     let file = format!("{name}.ssz_snappy");
     let path = case
@@ -625,11 +662,11 @@ fn equal<T: PartialEq + std::fmt::Debug>(
     }
 }
 
-fn unsigned(y: &Yaml) -> Option<u64> {
+pub(crate) fn unsigned(y: &Yaml) -> Option<u64> {
     y.as_i64().and_then(|v| u64::try_from(v).ok())
 }
 
-fn root(y: &Yaml) -> Option<Root> {
+pub(crate) fn root(y: &Yaml) -> Option<Root> {
     fixture::hex_array::<32>(y).ok().flatten().map(Root::from)
 }
 
@@ -647,7 +684,7 @@ fn checkpoint(y: &Yaml) -> Option<Checkpoint> {
 }
 
 /// An SSZ value from a `.ssz_snappy` file.
-fn decode<T: Decode>(reads: &Reads, path: &Path) -> Result<T, String> {
+pub(crate) fn decode<T: Decode>(reads: &Reads, path: &Path) -> Result<T, String> {
     let bytes = fixture::ssz_snappy(reads, path)?;
     T::from_ssz_bytes(&bytes).map_err(|e| format!("{}: {e:?}", path.display()))
 }

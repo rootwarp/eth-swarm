@@ -12,6 +12,8 @@ consensus-types = { path = "../consensus-types" }
 state-transition = { path = "../state-transition" }
 # The fork_choice runner. Without its `testing` feature: the runner uses no test seam.
 fork-choice = { path = "../fork-choice" }
+# The gossip runner: the Gloas `execution_payload` and `payload_attestation_message` topics.
+gossip-validation = { path = "../gossip-validation" }
 network-config = { path = "../network-config" }
 crypto-kzg = { path = "../crypto-kzg" }
 # `test-vectors` (sign, aggregate_signatures, aggregate_verify) is for this runner only;

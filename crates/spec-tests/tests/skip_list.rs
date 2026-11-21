@@ -833,3 +833,67 @@ fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
         }
     }
 }
+
+/// The Gloas gossip handlers that the gossip runner executes are never skipped, also a case
+/// that the pinned vectors do not have: no wildcard entry reaches them.
+#[test]
+fn gloas_gossip_runnable_handlers_are_not_skipped() {
+    let skips = committed();
+    for preset in ["minimal", "mainnet"] {
+        for handler in spec_tests::gossip::RUNNABLE {
+            for case in ["pyspec_tests/case_0", "pyspec_tests/a_new_case"] {
+                let k = CaseKey {
+                    case: case.into(),
+                    ..consensus("gloas", preset, "networking", handler)
+                };
+                let skip = skips.skipped_by(&k);
+                assert!(skip.is_none(), "{k} is skipped: {skip:?}");
+            }
+        }
+        // A new Gloas gossip handler is not skipped either: it fails setup until it is
+        // classified in crates/spec-tests/src/gossip.rs.
+        let k = consensus("gloas", preset, "networking", "gossip_new_topic");
+        let skip = skips.skipped_by(&k);
+        assert!(skip.is_none(), "{k} is skipped: {skip:?}");
+    }
+}
+
+/// Each Gloas gossip handler that does not run is skipped by its own entry, whose reason names
+/// its topic, and each Fulu gossip handler is skipped as Fulu.
+#[test]
+fn gossip_handlers_that_do_not_run_are_skipped_with_reasons() {
+    let skips = committed();
+    for preset in ["minimal", "mainnet"] {
+        for handler in spec_tests::gossip::NOT_RUN {
+            let k = consensus("gloas", preset, "networking", handler);
+            let e = skips
+                .skipped_by(&k)
+                .unwrap_or_else(|| panic!("{k} is not skipped"));
+            let topic = handler.strip_prefix("gossip_").unwrap();
+            assert!(
+                e.reason.contains(&format!("`{topic}`")),
+                "{k} is skipped by an entry that does not name {topic}: {e:?}"
+            );
+            assert_eq!(e.issue, "none", "{k}");
+        }
+        for handler in spec_tests::gossip::RUNNABLE
+            .iter()
+            .chain(&spec_tests::gossip::NOT_RUN)
+            .chain(&["gossip_blob_sidecar"])
+        {
+            let k = consensus("fulu", preset, "networking", handler);
+            let e = skips
+                .skipped_by(&k)
+                .unwrap_or_else(|| panic!("{k} is not skipped"));
+            assert!(e.reason.contains("Fulu"), "{k}: {e:?}");
+            assert_eq!(e.issue, "none", "{k}");
+        }
+        // The custody handlers run in both forks.
+        for fork in ["fulu", "gloas"] {
+            for handler in spec_tests::networking::RUNNABLE {
+                let k = consensus(fork, preset, "networking", handler);
+                assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
+            }
+        }
+    }
+}
