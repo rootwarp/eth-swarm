@@ -25,10 +25,11 @@
 //!   genesis: IGNORE;
 //! - the core committed the block, or it is the anchor: IGNORE;
 //! - the core refused the block before and kept the refusal: the same answer again;
-//! - the parent has no pre-state: IGNORE;
+//! - the parent has no pre-state, in the LRU or else in the fork choice store (see
+//!   [Seen roots](#seen-roots)): IGNORE;
 //! - the block builds on the FULL payload of its parent (`get_parent_payload_status`: the bid's
-//!   `parent_block_hash` is the `block_hash` of the bid of the parent pre-state) and that payload
-//!   is not verified: IGNORE;
+//!   `parent_block_hash` is the `block_hash` of the bid of the parent pre-state) and the fork
+//!   choice store has not verified that payload (`is_payload_verified`): IGNORE;
 //! - the block slot is more than [`PRE_STATE_EPOCHS`] epochs of slots after the slot of the
 //!   parent pre-state: the far-parent path below, in place of the checks that follow here;
 //! - `proposer_index` is past the registry of the pre-state: INVALID, kept;
@@ -90,12 +91,12 @@
 //! a walk go in calls between them. Each VerifyBls call of one import gets the same deadline,
 //! and no verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state
 //! root equal to `block.state_root`, a gate that permits the payload and a fork choice store
-//! that takes the block: it makes the parent pre-state the most recently used, keeps the
-//! post-state as a pre-state, and drops the kept walk states of each block whose pre-state left
-//! the LRU. There is no prune of pre-states at finality yet; when one comes, it must also drop
-//! the kept walk states of the parents that it prunes. On any other outcome the head and the
-//! pre-states do not change, their order of use included. An INVALID outcome of the transition
-//! is kept.
+//! that takes the block: it makes the parent pre-state the most recently used (a parent
+//! pre-state that the store served stays out of the LRU), keeps the post-state as a pre-state,
+//! and drops the kept walk states of each block whose pre-state is not in the LRU. There is no
+//! prune of pre-states at finality yet; when one comes, it must also drop the kept walk states
+//! of the parents that it prunes. On any other outcome the head and the pre-states do not
+//! change, their order of use included. An INVALID outcome of the transition is kept.
 //!
 //! # Fork choice
 //!
@@ -109,14 +110,19 @@
 //! the store yet, the core keeps the state of the justified checkpoint that `get_head` reads
 //! (`store_target_checkpoint_state`, with the real `process_slots`).
 //!
-//! After a commit or an envelope import, the head is `get_head` of the store (it stays if
-//! `get_head` fails). A new finalized checkpoint prunes the EL's verdicts at the bid
-//! `parent_block_hash` of the finalized block, the `finalizedBlockHash` of a forkchoiceUpdated
-//! ([`ExecutionStatuses::prune_finalized`]; nothing if the store has no such block). With a sink
-//! ([`ChainCore::with_forkchoice_sink`]) the core sends the forkchoiceUpdated arguments of the
-//! head ([`forkchoice_args`]) when they differ from the last ones it sent. `get_head` has no
-//! filter of invalidated payloads yet: a later INVALID does not move the head. A payload is
-//! verified for the core while the store has it and the core holds the pre-state of its block.
+//! After a commit or an envelope import, the head is `get_head` of the store. A new finalized
+//! checkpoint prunes the EL's verdicts at the bid `parent_block_hash` of the finalized block, the
+//! `finalizedBlockHash` of a forkchoiceUpdated ([`ExecutionStatuses::prune_finalized`]; nothing
+//! if the store has no such block). With a sink ([`ChainCore::with_forkchoice_sink`]) the core
+//! sends the forkchoiceUpdated arguments of the head ([`forkchoice_args`]) when they differ from
+//! the last ones it sent. If `get_head` fails, the head stays and no forkchoiceUpdated is sent,
+//! also when the safe or the finalized checkpoint moved: the old head with the new safe or
+//! finalized hash is no fork choice of the store. The last arguments sent stay as they were. The
+//! prune at finality still runs, as it reads only the finalized checkpoint. `get_head` has no
+//! filter of invalidated payloads yet: a later INVALID does not move the head.
+//! [`ChainCore::payload_verified`] is `true` while the store has the payload and the LRU holds
+//! the pre-state of its block; the checks of an import read the store alone
+//! (`is_payload_verified`).
 //!
 //! **Fail closed.** While the EL contradiction is set, no block and no envelope reaches the
 //! store (`on_tick`, `on_block` and `on_execution_payload_envelope` are not called), `get_head`
@@ -126,9 +132,13 @@
 //! # Seen roots
 //!
 //! The core keeps the root of each block it committed, and of the anchor, apart from the
-//! pre-states: a block whose pre-state left the LRU is still IGNORE, and the head does not go
-//! back to it. These roots are not bounded until a prune at finality exists: 32 bytes for each
-//! committed block, and the overhead of the set.
+//! pre-states: a committed block sent again is still IGNORE, also once its pre-state left the
+//! LRU. `get_head` reads the fork choice store, not the LRU, so such a block can still be the
+//! head. Where the LRU no longer holds the pre-state of a block, the core reads it from the fork
+//! choice store ([`Store::block_state`]), which holds the post-state of each block until
+//! finality prunes it: such a head can still import its envelope and a child. These roots are
+//! not bounded until a prune at finality exists: 32 bytes for each committed block, and the
+//! overhead of the set.
 //!
 //! It also keeps the refusals marked *kept*, at most [`MAX_REFUSED_ROOTS`], the first refused
 //! going first. Such a refusal does not change when the block comes again: it depends only on
@@ -149,10 +159,11 @@
 //! the store). In order:
 //!
 //! - the EL contradicted itself: IGNORE;
-//! - the payload of `beacon_block_root` is verified, an optimistic one (SYNCING or ACCEPTED)
-//!   included, or that block is not committed with a pre-state: IGNORE. Its envelope sent again
-//!   does not check that payload again: its status changes only through a later verdict on a
-//!   descendant or a later fork-choice update;
+//! - the fork choice store has verified the payload of `beacon_block_root`
+//!   (`is_payload_verified`), an optimistic one (SYNCING or ACCEPTED) included, or that block is
+//!   not committed, or it has no pre-state in the LRU or else in the fork choice store: IGNORE.
+//!   Its envelope sent again does not check that payload again: its status changes only through
+//!   a later verdict on a descendant or a later fork-choice update;
 //! - no data availability check ([`ChainCore::with_data_availability`]) or no engine
 //!   ([`ChainCore::with_engine`]) is set: IGNORE;
 //! - the store does not hold the block, or its data is not available: IGNORE;
@@ -659,7 +670,8 @@ impl<E: Preset> ChainCore<E> {
         self.sent
     }
 
-    /// The post-state of block `block_root`, if the core holds it as a pre-state.
+    /// The post-state of block `block_root`, if the LRU of the core holds it as a pre-state. The
+    /// fork choice store can hold it too (see [Seen roots](#seen-roots)).
     pub fn state(&self, block_root: &Root) -> Option<&BeaconState<E>> {
         self.snapshots.peek(block_root)
     }
@@ -680,7 +692,8 @@ impl<E: Preset> ChainCore<E> {
         self.committed.contains(block_root)
     }
 
-    /// `true` if the payload of block `block_root` is verified (see [Fork choice](#fork-choice)).
+    /// `true` if the payload of block `block_root` is verified and the LRU holds the pre-state of
+    /// that block (see [Fork choice](#fork-choice)).
     pub fn payload_verified(&self, block_root: &Root) -> bool {
         self.snapshots.contains(block_root) && is_payload_verified(&self.store, *block_root)
     }
@@ -771,12 +784,14 @@ impl<E: Preset> ChainCore<E> {
         }
         let parent = block.message.parent_root;
         // A peek: the parent becomes the most recently used only if its child commits, so a
-        // failed import does not change the order of use.
-        let Some(parent_state) = self.snapshots.peek(&parent) else {
+        // failed import does not change the order of use. A parent that the LRU dropped, such
+        // as a head, gets its pre-state from the fork choice store.
+        let Some(parent_state) = pre_state(&self.snapshots, &self.store, &parent) else {
             return Outcome::Ignored(format!("no pre-state for the parent {parent}"));
         };
+        // The store alone: `payload_verified` is `false` for a parent that the LRU dropped.
         if bid.parent_block_hash == parent_state.latest_execution_payload_bid.block_hash
-            && !self.payload_verified(&parent)
+            && !is_payload_verified(&self.store, parent)
         {
             return Outcome::Ignored(format!(
                 "the payload of the parent {parent} is not verified"
@@ -950,8 +965,9 @@ impl<E: Preset> ChainCore<E> {
                 }
                 self.snapshots.promote(&parent);
                 self.snapshots.insert(imported.block_root, imported.post);
-                // The insert can drop the pre-state of a parent. Its kept walk states then
-                // cannot serve an import, as an import needs that pre-state first.
+                // The insert can drop the pre-state of a parent, and a parent that the store
+                // served is not in the LRU. Their kept walk states go: a later child of such a
+                // parent walks again from the post-state that the store serves.
                 let snapshots = &self.snapshots;
                 self.advanced.retain(|parent| snapshots.contains(parent));
                 self.committed.insert(imported.block_root);
@@ -982,14 +998,18 @@ impl<E: Preset> ChainCore<E> {
             return Outcome::Ignored(EL_CONTRADICTION.into());
         }
         let root = signed.message.beacon_block_root;
-        // An optimistic payload too: its envelope sent again does not check it again.
-        if self.payload_verified(&root) {
+        // An optimistic payload too: its envelope sent again does not check it again. The store
+        // alone: `payload_verified` is `false` for a block that the LRU dropped.
+        if is_payload_verified(&self.store, root) {
             return Outcome::Ignored(format!("the payload of block {root} is already verified"));
         }
         let committed = self.committed.contains(&root);
-        let Some(state) = self.snapshots.peek(&root).filter(|_| committed) else {
+        let state = pre_state(&self.snapshots, &self.store, &root).filter(|_| committed);
+        let Some(state) = state else {
             return Outcome::Ignored(format!("block {root} is not committed with a pre-state"));
         };
+        // A copy: the state can be the store's, which the envelope check below changes.
+        let bid = state.latest_execution_payload_bid.clone();
         let Some(data) = self.data.as_deref() else {
             return Outcome::Ignored("no data availability check is set".into());
         };
@@ -1004,7 +1024,7 @@ impl<E: Preset> ChainCore<E> {
             runtime,
             timeout: self.engine_timeout,
             envelope: &signed.message,
-            bid: &state.latest_execution_payload_bid,
+            bid: &bid,
             statuses: RefCell::new(&mut self.statuses),
             el: Cell::new(None),
         };
@@ -1055,23 +1075,32 @@ impl<E: Preset> ChainCore<E> {
         Ok(())
     }
 
-    /// After a commit or an envelope import: the head, the prune at finality and the
+    /// After a commit or an envelope import: the prune at finality, the head and the
     /// forkchoiceUpdated (see [Fork choice](#fork-choice)). Nothing while the EL contradiction
-    /// is set.
+    /// is set, and no new head and no forkchoiceUpdated while `get_head` fails.
     fn refresh(&mut self) {
         if self.statuses.el_contradiction() {
             return;
         }
-        match store_head(&self.store) {
-            Ok(head) => self.head = head,
-            Err(e) => tracing::warn!(error = %e, "fork choice gave no head: the head stays"),
-        }
+        // It reads only the finalized checkpoint, so it does not wait for a head.
         let finalized = self.store.finalized_checkpoint();
         if *finalized != self.finalized {
             if let Some(bid) = bid_of(&self.store, &finalized.root) {
                 self.statuses.prune_finalized(&bid.parent_block_hash);
             }
             self.finalized = finalized.clone();
+        }
+        match store_head(&self.store) {
+            Ok(head) => self.head = head,
+            // The old head with the safe and finalized hashes of the store now is no fork choice
+            // of the store: the EL gets nothing.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "fork choice gave no head: the head stays, no forkchoiceUpdated"
+                );
+                return;
+            }
         }
         let Some(sink) = self.sink.as_deref() else {
             return;
@@ -1147,6 +1176,17 @@ fn keep_justified_state<E: Preset>(store: &mut Store<E>, provider: &Provider<'_,
     if let Err(e) = store_target_checkpoint_state(store, provider, &justified) {
         tracing::warn!(error = %e, "no state of the justified checkpoint");
     }
+}
+
+/// The post-state of block `root` as a pre-state: the one of the LRU, else the one of the fork
+/// choice store, which holds the post-state of each block until finality prunes it (see
+/// [Seen roots](#seen-roots)). A peek: the order of use of the LRU does not change.
+fn pre_state<'a, E: Preset>(
+    snapshots: &'a Snapshots<BeaconState<E>>,
+    store: &'a Store<E>,
+    root: &Root,
+) -> Option<&'a BeaconState<E>> {
+    snapshots.peek(root).or_else(|| store.block_state(*root))
 }
 
 /// `get_head` of `store`, with the slot and the state root of its block.
