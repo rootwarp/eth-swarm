@@ -263,9 +263,12 @@ issue   = "none"
 expires = "2026-11-30"
 
 # ---------------------------------------------------------------------------------------
-# Networking gossip validation and fast confirmation: runners land with cl-chain; no plan
-# item names them yet. The networking custody handlers (get_custody_groups,
-# compute_columns_for_custody_group) run.
+# Networking gossip validation and fast confirmation. The networking custody handlers
+# (get_custody_groups, compute_columns_for_custody_group) run, and so do the Gloas gossip
+# handlers of crates/spec-tests/src/gossip.rs RUNNABLE (gossip_execution_payload_envelope,
+# gossip_payload_attestation_message): no entry may reach them. Each other Gloas gossip
+# handler (gossip.rs NOT_RUN) has its own entry, so a new Gloas handler fails setup until
+# gossip.rs classifies it. No plan item names the other topics yet.
 
 [[skip]]
 source  = "consensus-specs"
@@ -280,12 +283,155 @@ expires = "2026-11-30"
 
 [[skip]]
 source  = "consensus-specs"
-fork    = "*"
+fork    = "fulu"
 preset  = "*"
 runner  = "networking"
 handler = "gossip_*"
-reason  = "No gossip validation runner yet; it lands with cl-chain gossip validation and cl-p2p"
-owner   = "ian"
+reason  = "No Fulu gossip validation: crates/gossip-validation has only the Gloas execution_payload and payload_attestation_message topics, and the gossip runner takes only Gloas"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_attester_slashing"
+reason  = "No gossip validation of the Gloas `attester_slashing` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_beacon_aggregate_and_proof"
+reason  = "No gossip validation of the Gloas `beacon_aggregate_and_proof` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_beacon_attestation"
+reason  = "No gossip validation of the Gloas `beacon_attestation` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_beacon_block"
+reason  = "No gossip validation of the Gloas `beacon_block` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_bls_to_execution_change"
+reason  = "No gossip validation of the Gloas `bls_to_execution_change` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_data_column_sidecar"
+reason  = "No gossip validation of the Gloas `data_column_sidecar` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_execution_payload_bid"
+reason  = "No gossip validation of the Gloas `execution_payload_bid` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_partial_data_column_sidecar"
+reason  = "No gossip validation of the Gloas `partial_data_column_sidecar` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_proposer_preferences"
+reason  = "No gossip validation of the Gloas `proposer_preferences` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_proposer_slashing"
+reason  = "No gossip validation of the Gloas `proposer_slashing` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_sync_committee_contribution_and_proof"
+reason  = "No gossip validation of the Gloas `sync_committee_contribution_and_proof` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_sync_committee_message"
+reason  = "No gossip validation of the Gloas `sync_committee_message` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "networking"
+handler = "gossip_voluntary_exit"
+reason  = "No gossip validation of the Gloas `voluntary_exit` topic yet: crates/gossip-validation has only execution_payload and payload_attestation_message"
+owner   = "rust-developer"
 issue   = "none"
 expires = "2026-11-30"
 

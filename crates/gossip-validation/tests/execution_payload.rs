@@ -1456,6 +1456,13 @@ fn seen_keeps_at_most_the_envelope_slot_limit_and_a_removed_slot_must_not_accept
     let next = view.add(slots + 1, 0);
     assert_eq!(oldest_current_slot(&view, view.time_ms()), 0);
     let mut seen = Seen::default();
+    let last_removed = extra as Slot;
+    // Keys that are pending before the limit removes their slots: the first slot, and the
+    // last slot that the limit removes.
+    let early = [1, last_removed].map(|slot| {
+        let signed = &envelopes[slot as usize - 1];
+        (slot, signed, pending(validate_on(&seen, &view, signed)).1)
+    });
     for signed in &envelopes {
         assert_eq!(offer(&mut seen, &view, signed), Verdict::Accept);
         assert!(seen.has_execution_payload_envelope(root(signed), BUILDER));
@@ -1486,7 +1493,6 @@ fn seen_keeps_at_most_the_envelope_slot_limit_and_a_removed_slot_must_not_accept
         );
         assert_eq!(gas_limit_of(&seen, signed).is_some(), kept, "{slot}");
     }
-    let last_removed = extra as Slot;
     assert_eq!(seen.min_execution_payload_envelope_slot(), last_removed + 1);
     let full = seen.clone();
 
@@ -1499,6 +1505,17 @@ fn seen_keeps_at_most_the_envelope_slot_limit_and_a_removed_slot_must_not_accept
             not_current(slot)
         };
         assert_eq!(offer(&mut seen, &view, signed), want, "{slot}");
+        assert_eq!(seen, full, "{slot}");
+    }
+    // A key that was pending before the limit removed its slot must not accept either, and
+    // leaves Seen as it is.
+    for (slot, signed, key) in early {
+        let want = if slot == last_removed {
+            already_seen(signed)
+        } else {
+            not_current(slot)
+        };
+        assert_eq!(seen.resolve(key, Ok(true)), want, "{slot}");
         assert_eq!(seen, full, "{slot}");
     }
     // Each kept slot stays a duplicate.

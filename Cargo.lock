@@ -5724,6 +5724,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "fork-choice",
+ "gossip-validation",
  "hex",
  "libtest-mimic",
  "milhouse",

@@ -49,8 +49,10 @@
 //!   envelope keys, and [`MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT`] times `PTC_SIZE` payload
 //!   attestation keys. At a limit, a new key of the slot is IGNORE
 //!   ([`IgnoreReason::ExecutionPayloadEnvelopeSlotFull`],
-//!   [`IgnoreReason::PayloadAttestationSlotFull`]) and `Seen` does not change. Each key that
-//!   `Seen` keeps stays a duplicate until the floor passes its slot, so no copy of a message is
+//!   [`IgnoreReason::PayloadAttestationSlotFull`]), and the keys of the full slot (and, for
+//!   envelopes, its payloads) do not change. [`Seen::resolve`] still removes the slots before
+//!   the oldest current slot of the key first, as for each valid key. Each key that `Seen`
+//!   keeps stays a duplicate until the floor passes its slot, so no copy of a message is
 //!   ACCEPT twice. A valid first message of a new key in a full slot is IGNORE: it is not
 //!   propagated, and its peer is not penalized. To remove the oldest key instead lets a copy of
 //!   its message pass again, and a record of each removed key has no bound.
@@ -395,7 +397,9 @@ impl Seen {
     /// The key also applies the bounds of `Seen` (see the module documentation), only for
     /// `Ok(true)`. A key of a slot before the floor is never ACCEPT: IGNORE as a duplicate if
     /// the record of the last pruned slot has it, else IGNORE as not current. A new key of a
-    /// full slot is IGNORE, and `Seen` does not change.
+    /// full slot is IGNORE, and the keys and payloads of that slot do not change. For
+    /// `Ok(true)`, `Seen` first removes the slots before the oldest current slot of the key,
+    /// so a valid key moves the floor also when its verdict is IGNORE.
     pub fn resolve(
         &mut self,
         seen_key: SeenKey,
@@ -422,6 +426,8 @@ impl Seen {
                 prune_before,
                 max_per_slot,
             } => {
+                // First, for each valid key: the floor can move also when the verdict below is
+                // IGNORE.
                 self.prune_execution_payload_envelopes_before(prune_before);
                 let already_seen = Verdict::Ignore(IgnoreReason::EnvelopeAlreadySeen {
                     block_root,
@@ -440,7 +446,8 @@ impl Seen {
                     return already_seen;
                 }
                 let slots = &mut self.execution_payload_envelopes;
-                // A full slot keeps each key that it has, so each stays a duplicate.
+                // A full slot keeps each key and payload that it has, so each key stays a
+                // duplicate. Only the prune above changed `Seen`.
                 if slots
                     .get(&slot)
                     .is_some_and(|kept| kept.envelopes.len() >= max_per_slot.max(1))
@@ -469,6 +476,8 @@ impl Seen {
                 prune_before,
                 max_per_slot,
             } => {
+                // First, for each valid key: the floor can move also when the verdict below is
+                // IGNORE.
                 self.prune_payload_attestations_before(prune_before);
                 // The slot stopped being current after the check, and `Seen` does not keep it.
                 // Another copy of the message can have accepted before the prune. Thus this
@@ -491,6 +500,7 @@ impl Seen {
                         });
                     }
                     // A full slot keeps each validator that it has, so each stays a duplicate.
+                    // Only the prune above changed `Seen`.
                     if validators.len() >= max_per_slot.max(1) {
                         return Verdict::Ignore(IgnoreReason::PayloadAttestationSlotFull { slot });
                     }

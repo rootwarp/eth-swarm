@@ -89,9 +89,9 @@ const fn consensus(
 /// the rest are scanned when extracted.
 ///
 /// `minimal` and `mainnet` must hold the trees of each runner that no skip entry may reach:
-/// `ssz_static`, `phase0/shuffling`, the Gloas state-transition runners and Gloas
-/// `fork_choice`, whose tick and block cases run. Without these subtrees, a missing tree would
-/// pass setup and run no trial.
+/// `ssz_static`, `phase0/shuffling`, the Gloas state-transition runners, Gloas `fork_choice`,
+/// whose tick and block cases run, and Gloas `networking`, whose custody and gossip cases run.
+/// Without these subtrees, a missing tree would pass setup and run no trial.
 ///
 /// `general` at v1.7.0-beta.4 holds only `altair/bls`, which is its scope.
 ///
@@ -149,6 +149,7 @@ pub const SETS: [VectorSet; 7] = [
             "tests/minimal/gloas/rewards",
             "tests/minimal/gloas/random",
             "tests/minimal/gloas/fork_choice",
+            "tests/minimal/gloas/networking",
         ],
     ),
     consensus(
@@ -166,6 +167,7 @@ pub const SETS: [VectorSet; 7] = [
             "tests/mainnet/gloas/rewards",
             "tests/mainnet/gloas/random",
             "tests/mainnet/gloas/fork_choice",
+            "tests/mainnet/gloas/networking",
         ],
     ),
     VectorSet {
@@ -452,8 +454,8 @@ fn incomplete(set: &VectorSet, dir: &Path, cases: &[Case]) -> Option<String> {
     })
 }
 
-/// Fails on a `bls`, `kzg`, Gloas `epoch_processing`, Gloas `operations` or Gloas
-/// `fork_choice` handler directory the runners do not classify.
+/// Fails on a `bls`, `kzg`, Gloas `epoch_processing`, Gloas `operations`, Gloas
+/// `fork_choice` or Gloas `networking` handler directory the runners do not classify.
 fn handler_check(k: &CaseKey) -> Result<(), String> {
     if k.handler.is_empty() {
         return Ok(());
@@ -474,6 +476,11 @@ fn handler_check(k: &CaseKey) -> Result<(), String> {
         }
         "fork_choice" if k.source == "consensus-specs" && k.fork == "gloas" => {
             fork_choice::handler_runs(&k.handler)
+                .map(drop)
+                .map_err(|e| e + &at())
+        }
+        "networking" if k.source == "consensus-specs" && k.fork == "gloas" => {
+            networking::handler_runs(&k.fork, &k.handler)
                 .map(drop)
                 .map_err(|e| e + &at())
         }
@@ -527,7 +534,9 @@ fn kind(case: &Case) -> Option<Kind> {
         ("cryptography-specs", "kzg") if kzg::handler_runs(&k.handler) == Ok(true) => {
             Some(Kind::Kzg)
         }
-        ("consensus-specs", "networking") if networking::supported(&k.fork, &k.handler) => {
+        ("consensus-specs", "networking")
+            if networking::supported(&k.fork, &k.preset, &k.handler) =>
+        {
             Some(Kind::Networking)
         }
         ("consensus-specs", "operations")
@@ -587,7 +596,7 @@ impl Kind {
             Kind::Kzg => kzg::run(reads, handler, data(case, "data.yaml")?),
             Kind::Networking => {
                 consensus_manifest(reads, case)?;
-                networking::run(reads, handler, data(case, "meta.yaml")?)
+                networking::run(reads, case)
             }
             Kind::Operations => {
                 consensus_manifest(reads, case)?;
@@ -660,6 +669,52 @@ pub fn trial_name(k: &CaseKey) -> String {
     }
 }
 
+/// The official cases of a group of trials by outcome, before a name filter applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Cases that run.
+    pub run: usize,
+    /// Cases that a skip entry skips.
+    pub skipped: usize,
+    /// Cases that are neither run nor skipped.
+    pub unaccounted: usize,
+}
+
+/// The official `fork_choice` cases (`<fork>_fork_choice_<preset>`), not the comptests.
+pub fn fork_choice_counts(trials: &[Trial]) -> Counts {
+    official_counts(trials, |group, _| group.contains("_fork_choice_"))
+}
+
+/// The official gossip cases: the `gossip_*` handlers of `<fork>_networking_<preset>`, not the
+/// custody handlers and not the comptests.
+pub fn gossip_counts(trials: &[Trial]) -> Counts {
+    official_counts(trials, |group, handler| {
+        group.contains("_networking_") && handler.starts_with("gossip_")
+    })
+}
+
+/// The trials whose group (`<fork>_<runner>_<preset>`) and handler, the first two parts of the
+/// name, pass `of_group`, not the comptests.
+fn official_counts(trials: &[Trial], of_group: impl Fn(&str, &str) -> bool) -> Counts {
+    let mut counts = Counts::default();
+    for t in trials {
+        let mut parts = t.name.split("::");
+        let (group, handler) = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        );
+        if group.starts_with("comptests_") || !of_group(group, handler) {
+            continue;
+        }
+        match t.outcome {
+            Outcome::Run(_) => counts.run += 1,
+            Outcome::Skip(_) => counts.skipped += 1,
+            Outcome::Unaccounted => counts.unaccounted += 1,
+        }
+    }
+    counts
+}
+
 /// `<root>/<source>/<tag>/<stem>` of a set, for callers that plant or inspect files.
 pub fn set_dir(root: &Path, tags: &HashMap<String, String>, set: &VectorSet) -> Option<PathBuf> {
     let tag = tags.get(set.source)?;
@@ -668,4 +723,166 @@ pub fn set_dir(root: &Path, tags: &HashMap<String, String>, set: &VectorSet) -> 
             .join(tag)
             .join(set.stem.replace("{tag}", tag)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gossip;
+
+    fn trial(name: &str, outcome: Outcome) -> Trial {
+        Trial {
+            name: name.into(),
+            outcome,
+        }
+    }
+
+    fn run() -> Outcome {
+        Outcome::Run(Arc::new(|| Ok(())))
+    }
+
+    fn skip() -> Outcome {
+        Outcome::Skip("reason".into())
+    }
+
+    #[test]
+    fn the_counts_take_only_the_official_cases_of_their_group() {
+        let trials = [
+            trial(
+                "gloas_networking_minimal::gossip_payload_attestation_message::pyspec_tests::a",
+                run(),
+            ),
+            trial(
+                "gloas_networking_mainnet::gossip_execution_payload_envelope::pyspec_tests::b",
+                run(),
+            ),
+            trial(
+                "gloas_networking_minimal::gossip_beacon_block::pyspec_tests::c",
+                skip(),
+            ),
+            trial(
+                "fulu_networking_minimal::gossip_beacon_block::pyspec_tests::d",
+                skip(),
+            ),
+            trial(
+                "gloas_networking_minimal::gossip_new_topic::pyspec_tests::e",
+                Outcome::Unaccounted,
+            ),
+            // Not gossip: a custody handler, the comptests, another runner.
+            trial(
+                "gloas_networking_minimal::get_custody_groups::pyspec_tests::f",
+                run(),
+            ),
+            trial(
+                "comptests_gloas_networking_minimal::gossip_beacon_block::pyspec_tests::g",
+                run(),
+            ),
+            trial(
+                "gloas_fork_choice_minimal::on_block::pyspec_tests::h",
+                run(),
+            ),
+            trial(
+                "gloas_fork_choice_minimal::get_head::pyspec_tests::i",
+                skip(),
+            ),
+            trial(
+                "comptests_gloas_fork_choice_minimal::on_block::pyspec_tests::j",
+                run(),
+            ),
+            trial("gloas_ssz_static_minimal::gossip_x::case_0", run()),
+        ];
+        assert_eq!(
+            gossip_counts(&trials),
+            Counts {
+                run: 2,
+                skipped: 2,
+                unaccounted: 1
+            }
+        );
+        assert_eq!(
+            fork_choice_counts(&trials),
+            Counts {
+                run: 1,
+                skipped: 1,
+                unaccounted: 0
+            }
+        );
+        assert_eq!(gossip_counts(&[]), Counts::default());
+    }
+
+    fn key(fork: &str, preset: &str, runner: &str, handler: &str) -> CaseKey {
+        CaseKey {
+            source: "consensus-specs".into(),
+            fork: fork.into(),
+            preset: preset.into(),
+            runner: runner.into(),
+            handler: handler.into(),
+            case: "pyspec_tests/case_0".into(),
+        }
+    }
+
+    #[test]
+    fn each_gloas_networking_handler_must_be_classified() {
+        for handler in networking::RUNNABLE
+            .iter()
+            .chain(&gossip::RUNNABLE)
+            .chain(&gossip::NOT_RUN)
+        {
+            assert_eq!(
+                handler_check(&key("gloas", "minimal", "networking", handler)),
+                Ok(())
+            );
+        }
+        let err =
+            handler_check(&key("gloas", "minimal", "networking", "gossip_new_topic")).unwrap_err();
+        assert!(
+            err.contains("gossip_new_topic") && err.contains("gloas"),
+            "{err}"
+        );
+        // Only Gloas: a Fulu or a comptests handler is not checked.
+        assert_eq!(
+            handler_check(&key("fulu", "minimal", "networking", "gossip_new_topic")),
+            Ok(())
+        );
+        let comptests = CaseKey {
+            source: "comptests".into(),
+            ..key("gloas", "minimal", "networking", "gossip_new_topic")
+        };
+        assert_eq!(handler_check(&comptests), Ok(()));
+    }
+
+    #[test]
+    fn the_gloas_gossip_cases_go_to_the_networking_runner() {
+        let kind_of = |fork: &str, preset: &str, handler: &str| {
+            kind(&Case {
+                key: key(fork, preset, "networking", handler),
+                files: Vec::new(),
+            })
+        };
+        for preset in ["minimal", "mainnet"] {
+            for handler in gossip::RUNNABLE.iter().chain(&networking::RUNNABLE) {
+                assert!(
+                    matches!(kind_of("gloas", preset, handler), Some(Kind::Networking)),
+                    "{handler}"
+                );
+            }
+            for handler in gossip::NOT_RUN {
+                assert!(kind_of("gloas", preset, handler).is_none(), "{handler}");
+            }
+            for handler in gossip::RUNNABLE {
+                assert!(kind_of("fulu", preset, handler).is_none(), "{handler}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_preset_sets_require_the_gloas_networking_tree() {
+        for (name, tree) in [
+            ("minimal", "tests/minimal/gloas/networking"),
+            ("mainnet", "tests/mainnet/gloas/networking"),
+        ] {
+            let set = SETS.iter().find(|s| s.name == name).unwrap();
+            assert!(set.subtrees.contains(&tree), "{name}");
+        }
+    }
 }
