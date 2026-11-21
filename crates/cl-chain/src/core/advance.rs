@@ -26,6 +26,10 @@
 //! it reached. A later walk from the same parent starts from the latest of them, so it does not
 //! walk those slots again.
 //!
+//! - after the proposer signature, the walk must fit in the admission budget of the core
+//!   ([`AdvanceBudget`]): at most [`MAX_ADVANCE_EPOCHS_PER_SLOT`] epochs of walk for each slot
+//!   of the clock of the core. Else it is IGNORE, with no `process_slots`.
+//!
 //! No refusal of the walk is a proof about the block: each is IGNORE, and the core does not
 //! keep it. The block can import later from a nearer state, or with more time.
 //!
@@ -44,6 +48,11 @@ pub const MAX_ADVANCE_EPOCHS: u64 = 8;
 
 /// The most states that the walks keep \[est\]. Past it, the least recently used goes first.
 pub const MAX_ADVANCED_STATES: usize = 64;
+
+/// The most epochs of walk that the core admits for each slot of its clock, and the most that
+/// the admission budget holds \[est\]: one walk of [`MAX_ADVANCE_EPOCHS`] epochs, or several
+/// shorter ones.
+pub const MAX_ADVANCE_EPOCHS_PER_SLOT: u64 = 8;
 
 /// `process_slots` on a state to a slot. `Err` (why, for the log) is IGNORE.
 pub(crate) type Walk<'a, E> = dyn Fn(&mut BeaconState<E>, Slot) -> Result<(), String> + 'a;
@@ -114,6 +123,48 @@ impl<S> Advanced<S> {
     /// `true` if there is no state.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// The admission budget of the walks: a bucket of epochs of walk, on the slots of the clock of
+/// the core. The core is the single writer, so the budget bounds the work of the walks in one
+/// slot, not their concurrency.
+///
+/// The first [`Self::take`] fills the bucket to [`MAX_ADVANCE_EPOCHS_PER_SLOT`]. Each later
+/// slot of the clock adds [`MAX_ADVANCE_EPOCHS_PER_SLOT`], up to that bound: idle slots keep no
+/// more than one slot of work. A clock that goes back adds nothing and empties nothing.
+#[derive(Clone, Debug, Default)]
+pub struct AdvanceBudget {
+    /// The epochs of walk left.
+    epochs: u64,
+    /// The latest slot of the clock that a take saw. `None` before the first take.
+    slot: Option<Slot>,
+}
+
+impl AdvanceBudget {
+    /// An empty budget. The first take fills it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes `epochs` of walk at slot `now` of the clock, and returns `true`, if the bucket
+    /// holds them after the refill of `now`. Else it takes nothing, and returns `false`. A walk
+    /// that stops early gives nothing back.
+    pub fn take(&mut self, now: Slot, epochs: u64) -> bool {
+        let added = self.slot.map_or(MAX_ADVANCE_EPOCHS_PER_SLOT, |last| {
+            now.saturating_sub(last)
+                .saturating_mul(MAX_ADVANCE_EPOCHS_PER_SLOT)
+        });
+        self.slot = Some(self.slot.map_or(now, |last| last.max(now)));
+        self.epochs = self
+            .epochs
+            .saturating_add(added)
+            .min(MAX_ADVANCE_EPOCHS_PER_SLOT);
+        if epochs > self.epochs {
+            return false;
+        }
+        self.epochs -= epochs;
+        true
     }
 }
 

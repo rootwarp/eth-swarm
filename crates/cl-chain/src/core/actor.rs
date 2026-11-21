@@ -51,6 +51,11 @@
 //!   pre-state and the proposer domain of the fork that the network schedule gives for the
 //!   epoch of the block ([`schedule_proposer_domain`]): INVALID on an INVALID verdict (kept for
 //!   that signature only), IGNORE on no verdict;
+//! - the walk does not fit in the admission budget
+//!   ([`AdvanceBudget`](super::advance::AdvanceBudget)): at most
+//!   [`MAX_ADVANCE_EPOCHS_PER_SLOT`](super::advance::MAX_ADVANCE_EPOCHS_PER_SLOT) epochs of walk
+//!   for each slot of the wall clock. Charged in full before the walk: IGNORE, with no walk and
+//!   no charge;
 //! - the walk: the deadline, a caller that stopped waiting, no deposit verdict, or an error in
 //!   the walk is IGNORE;
 //! - the caller stopped waiting: IGNORE;
@@ -88,13 +93,16 @@
 //! verdict (the block can come again and get a verdict in time), a parent without a pre-state
 //! (it can come), a refused payload, the wall-clock bound (the same block is in that bound
 //! once its slot comes, and that check costs no slot loop and no VerifyBls call), a caller
-//! that stopped waiting, a far-parent proposer past the registry of the parent pre-state, or a
-//! refusal of the walk: a later walk can start from a nearer state, or have more time.
+//! that stopped waiting, a far-parent proposer past the registry of the parent pre-state, the
+//! admission budget, or a refusal of the walk: a later walk can start from a nearer state, or
+//! have more time or budget.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
 
-use super::advance::{advance, block_proposer, walk_slots, Advanced, MAX_ADVANCED_STATES};
+use super::advance::{
+    advance, block_proposer, walk_slots, AdvanceBudget, Advanced, MAX_ADVANCED_STATES,
+};
 use super::seen::Refused;
 use super::snapshot::{max_pre_states, Snapshots, PRE_STATE_EPOCHS};
 use crate::import::block::{
@@ -327,6 +335,8 @@ pub struct ChainCore<E: Preset> {
     snapshots: Snapshots<BeaconState<E>>,
     /// The states of the walks over empty slots (see [`advance`](super::advance)).
     advanced: Advanced<BeaconState<E>>,
+    /// The admission budget of those walks, on the slots of `clock`.
+    budget: AdvanceBudget,
     /// The root of each block the core committed, and of the anchor (see the module docs).
     committed: HashSet<Root>,
     /// The kept refusals, by block root (see the module docs).
@@ -375,6 +385,7 @@ impl<E: Preset> ChainCore<E> {
             genesis_time: state.genesis_time,
             snapshots: Snapshots::new(head.block_root, state, max_pre_states::<E>()),
             advanced: Advanced::new(MAX_ADVANCED_STATES),
+            budget: AdvanceBudget::new(),
             committed: HashSet::from([head.block_root]),
             refused: Refused::new(MAX_REFUSED_ROOTS),
             head,
@@ -505,9 +516,10 @@ impl<E: Preset> ChainCore<E> {
         let Some(gate) = self.gate.as_deref() else {
             return Outcome::Ignored("no payload gate is set".into());
         };
-        if let Err(why) = self.check_slot(block.message.slot) {
-            return Outcome::Ignored(why);
-        }
+        let wall_slot = match self.check_slot(block.message.slot) {
+            Ok(wall_slot) => wall_slot,
+            Err(why) => return Outcome::Ignored(why),
+        };
         let block_root = block.message.tree_hash_root();
         if self.committed.contains(&block_root) {
             return Outcome::Ignored(format!("block {block_root} is already committed"));
@@ -551,10 +563,11 @@ impl<E: Preset> ChainCore<E> {
             parent_state
         } else {
             // A block far after its parent: the checks before the walk cost no `process_slots`.
-            // Past the cap: no proof about the block, so the refusal is not kept.
-            if let Err(why) = walk_slots(&self.advanced, parent, parent_state, slot) {
-                return Outcome::Ignored(why);
-            }
+            let gap = match walk_slots(&self.advanced, parent, parent_state, slot) {
+                Ok(gap) => gap,
+                // Past the cap: no proof about the block, so the refusal is not kept.
+                Err(why) => return Outcome::Ignored(why),
+            };
             // The walk can add an index to the registry, so an index past the registry of the
             // parent state is no proof here. It is not kept, and it costs no VerifyBls call.
             if !in_registry(parent_state, proposer) {
@@ -578,6 +591,15 @@ impl<E: Preset> ChainCore<E> {
             if let Some(stop) = signature_stop(&mut self.refused, block_root, block, reply, checked)
             {
                 return stop;
+            }
+            // The walk is charged in full before it starts, and gives nothing back if it stops
+            // early. A block over the budget can come again in a later slot, or from a nearer
+            // kept state.
+            let epochs = gap.div_ceil(E::slots_per_epoch());
+            if !self.budget.take(wall_slot, epochs) {
+                return Outcome::Ignored(format!(
+                    "the walk of {epochs} epochs is over the admission budget of slot {wall_slot}"
+                ));
             }
             let hooks = &self.hooks;
             // On the clock of the runtime, as the deadline.
@@ -663,9 +685,9 @@ impl<E: Preset> ChainCore<E> {
         }
     }
 
-    /// `Err` (why, for the log) if `slot` is more than [`MAX_FUTURE_SLOTS`] ahead of the slot
-    /// of the wall clock, or if the wall clock is before genesis.
-    fn check_slot(&self, slot: Slot) -> Result<(), String> {
+    /// The slot of the wall clock. `Err` (why, for the log) if `slot` is more than
+    /// [`MAX_FUTURE_SLOTS`] ahead of it, or if the wall clock is before genesis.
+    fn check_slot(&self, slot: Slot) -> Result<Slot, String> {
         let now_ms = (self.clock)();
         let wall_slot = now_ms
             .checked_sub(u128::from(self.genesis_time) * 1000)
@@ -677,7 +699,7 @@ impl<E: Preset> ChainCore<E> {
                  slot {wall_slot}"
             ));
         }
-        Ok(())
+        Ok(Slot::try_from(wall_slot).unwrap_or(Slot::MAX))
     }
 }
 

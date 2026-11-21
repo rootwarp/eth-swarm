@@ -24,10 +24,11 @@
 #[allow(dead_code)]
 mod support;
 
-use cl_chain::core::advance::Advanced;
+use cl_chain::core::advance::{AdvanceBudget, Advanced};
 use cl_chain::core::snapshot::PRE_STATE_EPOCHS;
 use cl_chain::core::{
     queue, ChainCore, Head, Outcome, Served, MAX_ADVANCED_STATES, MAX_ADVANCE_EPOCHS,
+    MAX_ADVANCE_EPOCHS_PER_SLOT,
 };
 use cl_chain::import::block::PermitAll;
 use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
@@ -87,6 +88,30 @@ fn the_walk_bounds_are_eight_epochs_and_sixty_four_states() {
     assert_eq!(MAX_ADVANCE_EPOCHS, 8);
     assert_eq!(cap(), 64);
     assert_eq!(MAX_ADVANCED_STATES, 64);
+    assert_eq!(MAX_ADVANCE_EPOCHS_PER_SLOT, 8);
+}
+
+#[test]
+fn the_admission_budget_refills_with_the_clock_up_to_one_slot() {
+    let mut budget = AdvanceBudget::new();
+    // The first take fills the bucket.
+    assert!(budget.take(10, 5));
+    assert!(budget.take(10, 3));
+    assert!(!budget.take(10, 1), "eight epochs in one slot");
+    // A take over the budget takes nothing.
+    assert!(budget.take(11, 8));
+    assert!(!budget.take(11, 1));
+    // Idle slots add no more than one slot of work.
+    assert!(!budget.take(20, 9));
+    assert!(budget.take(20, 8));
+    // A clock that goes back adds nothing and empties nothing.
+    assert!(!budget.take(15, 1));
+    assert!(budget.take(21, 2));
+    assert!(budget.take(19, 6));
+    assert!(!budget.take(21, 1));
+    assert!(budget.take(22, 8));
+    // A zero walk always fits.
+    assert!(budget.take(22, 0));
 }
 
 #[test]

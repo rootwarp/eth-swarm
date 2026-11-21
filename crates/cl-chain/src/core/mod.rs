@@ -10,4 +10,4 @@ pub use actor::{
     queue, AnchorError, ChainCore, CoreQueue, CoreSender, Head, Outcome, Served, SubmitError,
     DEFAULT_VERIFY_TIMEOUT, MAX_FUTURE_SLOTS, MAX_REFUSED_ROOTS,
 };
-pub use advance::{MAX_ADVANCED_STATES, MAX_ADVANCE_EPOCHS};
+pub use advance::{MAX_ADVANCED_STATES, MAX_ADVANCE_EPOCHS, MAX_ADVANCE_EPOCHS_PER_SLOT};
