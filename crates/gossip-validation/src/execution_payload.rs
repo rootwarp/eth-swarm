@@ -124,20 +124,22 @@ pub fn verify_withdrawals_limit<E: EthSpec>(count: usize) -> Result<(), RejectRe
 
 /// `validate_execution_payload_envelope_gossip` (L811-885) up to the signature check.
 ///
-/// It runs the three IGNORE checks and the REJECT checks before the signature in spec order,
-/// and gives the first that fails. If each passes, it gives [`Verdict::Pending`] with the set of
-/// `verify_execution_payload_envelope_signature` on the post-state of the block (the builder
-/// key, or the proposer key for a self-build envelope) and the key of the envelope. The
-/// caller must verify the set and give the result to [`Seen::resolve`], which adds the key to
-/// `Seen` only for a valid signature.
+/// It runs the three IGNORE checks of the spec, the IGNORE check of the floor of `Seen` (not a
+/// spec check, after the finalized slot check), and the REJECT checks before the signature in
+/// spec order, and gives the first that fails. If each passes, it gives [`Verdict::Pending`]
+/// with the set of `verify_execution_payload_envelope_signature` on the post-state of the block
+/// (the builder key, or the proposer key for a self-build envelope) and the key of the
+/// envelope. The caller must verify the set and give the result to [`Seen::resolve`], which
+/// adds the key to `Seen` only for a valid signature.
 ///
 /// `Seen` has bounds by slot (the deviation of the module documentation). The duplicate check
-/// also reads the record of the last pruned slot ([`Seen::has_pruned_execution_payload_envelope`]).
-/// After the finalized slot check, an envelope of a slot before the floor of `Seen`
-/// ([`Seen::min_execution_payload_envelope_slot`]) is IGNORE as not current, also for a clock
-/// of the store that went back. The key has the oldest current slot at the time of the store
-/// ([`StoreView::time_ms`]) and the limit of envelopes for each slot,
-/// [`MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT`], which [`Seen::resolve`] applies.
+/// also reads the record of the last pruned slot
+/// ([`Seen::has_pruned_execution_payload_envelope`]). After the finalized slot check, an
+/// envelope of a slot before the floor of `Seen` ([`Seen::min_execution_payload_envelope_slot`])
+/// is IGNORE as not current, also for a clock of the store that went back. The key has the
+/// oldest current slot at the time of the store ([`StoreView::time_ms`]) and the limit of
+/// envelopes for each slot, [`MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT`], which
+/// [`Seen::resolve`] applies.
 ///
 /// The pinned function reads no clock, only the finalized slot of the store. This function
 /// reads the clock of the store only for the key, so no check before the signature depends on
