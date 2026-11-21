@@ -574,6 +574,18 @@ impl StoreView<E> for NoPostStates<'_> {
     fn finalized_checkpoint(&self) -> &Checkpoint {
         self.0.finalized_checkpoint()
     }
+
+    fn genesis_time_ms(&self) -> u64 {
+        self.0.genesis_time_ms()
+    }
+
+    fn slot_duration_ms(&self) -> NonZeroU64 {
+        self.0.slot_duration_ms()
+    }
+
+    fn head_state(&self) -> Option<&BeaconState<E>> {
+        StoreView::head_state(self.0)
+    }
 }
 
 #[test]
