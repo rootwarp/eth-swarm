@@ -683,6 +683,9 @@ impl<E: Preset> ChainCore<E> {
                 // The lookahead of the state is at fault, not the block.
                 Err(why) => return Outcome::Ignored(why),
             };
+            // This check comes before the domain check below, so a block that fails both is
+            // refused here and kept INVALID: `process_block_header` refuses another proposer on
+            // the advanced state, and that check reads no domain.
             if proposer != expected {
                 // The signature is valid, so the refusal holds for the message.
                 let invalid = Outcome::Invalid(StfError::WrongProposer {

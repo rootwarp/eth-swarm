@@ -144,6 +144,11 @@ impl<E: Preset> Store<E> {
         self.genesis_time_ms
     }
 
+    /// The config value `SLOT_DURATION_MS` of the store.
+    pub fn slot_duration_ms(&self) -> NonZeroU64 {
+        self.slot_duration_ms
+    }
+
     /// `store.justified_checkpoint`.
     pub fn justified_checkpoint(&self) -> &Checkpoint {
         &self.justified_checkpoint

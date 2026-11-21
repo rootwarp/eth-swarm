@@ -1978,6 +1978,64 @@ async fn an_import_whose_caller_stops_waiting_at_an_epoch_boundary_keeps_the_sta
 }
 
 #[tokio::test]
+async fn a_stopped_walk_gives_nothing_back_to_the_budget_of_all_proposers() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    // A walk of six epochs from the anchor (slots 0 to 47) stops after the state at slot 7.
+    // It keeps its charge, so the budget of all proposers keeps two epochs in this clock slot.
+    let now = 6 * epoch_slots();
+    let first_end = epoch_slots() - 1;
+    let (first, _) = moved(&f.block, &anchor, now, &f.config);
+    let core = f.core.with_clock(wall.at(now));
+    let verify = FakeVerify::new(Answer::Valid);
+    let watched = import_watched(
+        core,
+        first.clone(),
+        Arc::clone(&verify),
+        &verify,
+        &Waiting::default(),
+        Some(first_end),
+    )
+    .await;
+    assert_eq!(watched.outcome, None, "the hook must drop the receiver");
+    assert_eq!(watched.walk, vec![(0, 1), (first_end, 1)]);
+    let core = watched.core;
+
+    // A block of another proposer needs three epochs from the state at slot 7 (slots 7 to 24
+    // or more). Its own bucket is full, so only the budget of all proposers refuses it.
+    let other = (3 * epoch_slots() + 1..4 * epoch_slots())
+        .map(|slot| moved(&f.block, &anchor, slot, &f.config).0)
+        .find(|block| block.message.proposer_index != first.message.proposer_index)
+        .expect("a slot of epoch 3 with another proposer");
+    let other_root = other.message.tree_hash_root();
+    let verify = FakeVerify::new(Answer::Valid);
+    let watched = import_watched(
+        core,
+        other.clone(),
+        Arc::clone(&verify),
+        &verify,
+        &Waiting::default(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(&watched.outcome, Some(Outcome::Ignored(why)) if why.contains("admission budget")),
+        "a stopped walk gives nothing back to the budget of all proposers: {:?}",
+        watched.outcome
+    );
+    assert!(watched.walk.is_empty(), "the core must not start the walk");
+    let core = watched.core;
+    assert!(!core.is_refused(&other_root));
+
+    // In the next clock slot, the budget is full again.
+    let core = core.with_clock(wall.at(now + 1));
+    let (outcome, core, _) = import_one(core, other.clone(), Answer::Valid).await;
+    assert_eq!(outcome, committed(&other));
+    assert_eq!(core.head(), head_of(&other));
+}
+
+#[tokio::test]
 async fn an_import_whose_caller_stops_waiting_after_the_walk_sends_no_block_sets() {
     let f = fixture();
     let wall = Wall::of(&f);

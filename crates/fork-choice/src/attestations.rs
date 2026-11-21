@@ -38,9 +38,9 @@ pub trait SignatureVerifier<E: Preset> {
 }
 
 /// A [`SignatureVerifier`] with the keys of one state, as the transition helpers call it.
-struct Keys<'a, E: Preset, V: ?Sized> {
-    verifier: &'a V,
-    state: &'a BeaconState<E>,
+pub(crate) struct Keys<'a, E: Preset, V: ?Sized> {
+    pub(crate) verifier: &'a V,
+    pub(crate) state: &'a BeaconState<E>,
 }
 
 impl<E: Preset, V: SignatureVerifier<E> + ?Sized> SignatureBackend for Keys<'_, E, V> {

@@ -230,10 +230,9 @@ impl AdvanceBudget {
         if let Some(at) = at {
             self.proposers.remove(at);
         }
-        let own = Bucket {
-            epochs: own.epochs - own_epochs,
-            ..own
-        };
+        // A bucket holds at most its size, and the walk takes its full size, so the check
+        // above leaves `own.epochs == own_epochs`: the walk empties the bucket.
+        let own = Bucket { epochs: 0, ..own };
         self.proposers.push((proposer, own));
         if self.proposers.len() > MAX_ADVANCE_BUDGET_PROPOSERS {
             self.proposers.remove(0);
