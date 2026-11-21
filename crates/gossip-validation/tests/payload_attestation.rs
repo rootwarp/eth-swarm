@@ -903,6 +903,145 @@ fn an_explicit_prune_removes_a_slot_only_after_the_clock_disparity() {
     assert_eq!(seen.payload_attestation_count(), 0);
 }
 
+#[test]
+fn a_pending_duplicate_across_a_prune_must_ignore() {
+    let (chain, r) = chain_at_slot_2();
+    let store = &chain.store;
+    let [v, _] = two_of_slot_2(store);
+    let edge = time_at(2) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS;
+    let mut seen = Seen::default();
+    let m = message(10, chain.p, 1);
+
+    // Two copies for slot 1 and validator 10 pass validation at `edge` before either resolves.
+    let (_, first) = pending(validate_at(&seen, store, &m, edge));
+    let (_, second) = pending(validate_at(&seen, store, &m, edge));
+
+    // The first copy resolves before the prune and returns Accept.
+    assert_eq!(seen.resolve(first, Ok(true)), Verdict::Accept);
+
+    // A valid message of slot 2 at `edge + 1` prunes slot 1.
+    assert_eq!(
+        accept_at(&mut seen, store, &message(v, r, 2), edge + 1),
+        Verdict::Accept
+    );
+    assert!(!seen.has_payload_attestation(1, 10));
+
+    // The second pending copy must return Ignore(PayloadAttestationAlreadySeen), not Accept.
+    assert_eq!(
+        seen.resolve(second, Ok(true)),
+        Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+            slot: 1,
+            validator_index: 10,
+        })
+    );
+}
+
+#[test]
+fn a_pending_duplicate_across_an_explicit_prune_must_ignore() {
+    let (chain, _) = chain_at_slot_2();
+    let store = &chain.store;
+    let edge = time_at(2) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS;
+    let mut seen = Seen::default();
+    let m = message(10, chain.p, 1);
+    let already_seen = Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+        slot: 1,
+        validator_index: 10,
+    });
+
+    // Two copies pass validation at `edge`. The first copy accepts before the prune.
+    let (_, first) = pending(validate_at(&seen, store, &m, edge));
+    let (_, second) = pending(validate_at(&seen, store, &m, edge));
+    assert_eq!(seen.resolve(first, Ok(true)), Verdict::Accept);
+
+    // An explicit prune at `edge + 1` removes slot 1.
+    seen.prune_payload_attestations(store, edge + 1);
+    assert!(!seen.has_payload_attestation(1, 10));
+    assert_eq!(seen.payload_attestation_slot_count(), 0);
+    let pruned = seen.clone();
+
+    // The second copy is IGNORE, and does not add slot 1 again.
+    assert_eq!(seen.resolve(second, Ok(true)), already_seen);
+    assert_eq!(seen, pruned);
+    // A new copy at `edge + 1` is IGNORE for the same reason.
+    assert_eq!(validate_at(&seen, store, &m, edge + 1), already_seen);
+}
+
+#[test]
+fn pending_copies_that_resolve_only_after_a_prune_must_ignore() {
+    let (chain, r) = chain_at_slot_2();
+    let store = &chain.store;
+    let [v, _] = two_of_slot_2(store);
+    let edge = time_at(2) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS;
+    let m = message(10, chain.p, 1);
+    // `None` is an explicit prune. `Some` is a valid message of slot 2 that prunes.
+    for slot_2_message in [None, Some(message(v, r, 2))] {
+        let mut seen = Seen::default();
+        // Two copies pass validation at `edge`. Neither resolves before the prune.
+        let (_, first) = pending(validate_at(&seen, store, &m, edge));
+        let (_, second) = pending(validate_at(&seen, store, &m, edge));
+        match &slot_2_message {
+            Some(m2) => assert_eq!(accept_at(&mut seen, store, m2, edge + 1), Verdict::Accept),
+            None => seen.prune_payload_attestations(store, edge + 1),
+        }
+        let pruned = seen.clone();
+
+        // Slot 1 is not current. Neither copy accepts, and neither adds slot 1 again.
+        for key in [first, second] {
+            assert_eq!(
+                seen.resolve(key, Ok(true)),
+                Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot: 1 }),
+                "{slot_2_message:?}"
+            );
+            assert_eq!(seen, pruned);
+            assert!(!seen.has_payload_attestation(1, 10));
+        }
+    }
+}
+
+#[test]
+fn a_message_of_a_pruned_slot_must_ignore_also_at_an_earlier_time() {
+    let (chain, r) = chain_at_slot_2();
+    let store = &chain.store;
+    let [v, _] = two_of_slot_2(store);
+    let edge = time_at(2) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS;
+    let mut seen = Seen::default();
+    let m = message(10, chain.p, 1);
+    assert_eq!(
+        accept_at(&mut seen, store, &m, mid_slot_1()),
+        Verdict::Accept
+    );
+    assert_eq!(
+        accept_at(&mut seen, store, &message(v, r, 2), edge + 1),
+        Verdict::Accept
+    );
+    assert!(!seen.has_payload_attestation(1, 10));
+    let pruned = seen.clone();
+
+    // The clock goes back. At these times slot 1 is current again.
+    for time_ms in [edge, mid_slot_1()] {
+        assert!(is_current_slot(store, 1, time_ms));
+        // A prune at an earlier time changes nothing.
+        seen.prune_payload_attestations(store, time_ms);
+        assert_eq!(seen, pruned);
+        // A copy of the accepted message is a duplicate.
+        assert_eq!(
+            validate_at(&seen, store, &m, time_ms),
+            Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+                slot: 1,
+                validator_index: 10
+            }),
+            "{time_ms}"
+        );
+        // A message of another validator is not current: slot 1 is before the kept slots.
+        assert_eq!(
+            validate_at(&seen, store, &message(11, chain.p, 1), time_ms),
+            Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot: 1 }),
+            "{time_ms}"
+        );
+    }
+    assert!(seen.has_payload_attestation(2, v));
+}
+
 /// A view with a block of each slot from 1 to `slots` and a slot duration of 1 ms. Each block
 /// is `p` with another slot. Each block has the post-state of `p`, which is also the head
 /// state. At the genesis time, the clock disparity of 500 ms makes each of these slots
