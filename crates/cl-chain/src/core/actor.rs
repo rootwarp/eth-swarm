@@ -44,27 +44,38 @@
 //!   slots before the block: IGNORE, with no VerifyBls call;
 //! - `proposer_index` is past the registry of the parent pre-state: IGNORE, with no VerifyBls
 //!   call. The walk can add an index, so this is no proof;
-//! - the network schedule has no fork at the epoch of the block: IGNORE;
+//! - the parent pre-state shows `proposer_index` slashed, or exited or withdrawable at the
+//!   epoch of the block: IGNORE, with no VerifyBls call. The walk cannot change that, but it is
+//!   no proof about the block. A validator that is not active yet goes on: the walk can
+//!   activate it;
+//! - the network schedule has no fork at the epoch of the block, or `get_domain` on the parent
+//!   pre-state does not give the proposer domain of that fork for that epoch: IGNORE, with no
+//!   VerifyBls call;
 //! - the caller stopped waiting, before and at the end of the VerifyBls call of the proposer
 //!   set: IGNORE, with no kept refusal;
 //! - the proposer signature ([`check_proposer_signature_in`]), with the key of the parent
 //!   pre-state and the proposer domain of the fork that the network schedule gives for the
 //!   epoch of the block ([`schedule_proposer_domain`]): INVALID on an INVALID verdict (kept for
 //!   that signature only), IGNORE on no verdict;
-//! - the walk does not fit in the admission budget ([`AdvanceBudget`]): at most
+//! - the wall clock again, after that VerifyBls call: the block slot is more than
+//!   [`MAX_FUTURE_SLOTS`] ahead of its slot, or it is before genesis: IGNORE;
+//! - the walk does not fit in the admission budget of that slot of the wall clock
+//!   ([`AdvanceBudget`]): at most
 //!   [`MAX_ADVANCE_EPOCHS_PER_SLOT`](super::advance::MAX_ADVANCE_EPOCHS_PER_SLOT) epochs of walk
-//!   for each slot of the wall clock. Charged in full before the walk: IGNORE, with no walk and
-//!   no charge;
+//!   in each slot for all proposers, and one walk in each slot for the proposer of the block.
+//!   Charged to both in full before the walk: IGNORE, with no walk and no charge;
 //! - the walk: the deadline, a caller that stopped waiting, no deposit verdict, or an error in
 //!   the walk is IGNORE;
 //! - the caller stopped waiting: IGNORE;
 //! - `proposer_index` is not the proposer of the block slot in the lookahead of the advanced
 //!   state: INVALID [`StfError::WrongProposer`], kept; a lookahead without that entry is
 //!   IGNORE;
-//! - the key of `proposer_index` or the proposer domain of the epoch of the block on the
-//!   advanced state is not the one of the signature check: the proposer set goes to
-//!   cl-verify again with them, with the same answers as above. Else the verdict holds, and
-//!   there is no second VerifyBls call for it.
+//! - `get_domain` on the advanced state does not give the proposer domain of the signature
+//!   check for the epoch of the block: IGNORE, with no second VerifyBls call and no kept
+//!   refusal;
+//! - the key of `proposer_index` on the advanced state is not the one of the signature check:
+//!   the proposer set goes to cl-verify again with it, with the same answers as above. Else the
+//!   verdict holds, and there is no second VerifyBls call for it.
 //!
 //! Then it runs [`import_block`] on the pre-state: the pre-state of the parent, or the advanced
 //! state. The core sends the signature sets to cl-verify through a [`BlsVerifier`], on the
@@ -94,9 +105,10 @@
 //! verdict (the block can come again and get a verdict in time), a parent without a pre-state
 //! (it can come), a refused payload, the wall-clock bound (the same block is in that bound
 //! once its slot comes, and that check costs no slot loop and no VerifyBls call), a caller
-//! that stopped waiting, a far-parent proposer past the registry of the parent pre-state, the
-//! admission budget, or a refusal of the walk: a later walk can start from a nearer state, or
-//! have more time or budget.
+//! that stopped waiting, a far-parent proposer past the registry of the parent pre-state or one
+//! that it shows slashed, exited or withdrawable, a fork of the parent pre-state or of the
+//! advanced state that is not the schedule fork, the admission budget, or a refusal of the
+//! walk: a later walk can start from a nearer state, or have more time or budget.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
@@ -433,6 +445,22 @@ impl<E: Preset> ChainCore<E> {
         self
     }
 
+    /// The same core that keeps `state` as the state of a walk from the parent `parent_root` at
+    /// the last slot of epoch `epoch - 1` (see [`advance`](super::advance)), in place of an
+    /// earlier one. A test seam: a later walk from that parent can start from `state`, as from a
+    /// state that a walk kept.
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_advanced_state(
+        mut self,
+        parent_root: Root,
+        epoch: Epoch,
+        state: BeaconState<E>,
+    ) -> Self {
+        self.advanced.insert(parent_root, epoch, state);
+        self
+    }
+
     /// The last block the core committed, or the anchor.
     pub fn head(&self) -> Head {
         self.head
@@ -517,10 +545,9 @@ impl<E: Preset> ChainCore<E> {
         let Some(gate) = self.gate.as_deref() else {
             return Outcome::Ignored("no payload gate is set".into());
         };
-        let wall_slot = match self.check_slot(block.message.slot) {
-            Ok(wall_slot) => wall_slot,
-            Err(why) => return Outcome::Ignored(why),
-        };
+        if let Err(why) = self.check_slot(block.message.slot) {
+            return Outcome::Ignored(why);
+        }
         let block_root = block.message.tree_hash_root();
         if self.committed.contains(&block_root) {
             return Outcome::Ignored(format!("block {block_root} is already committed"));
@@ -576,13 +603,28 @@ impl<E: Preset> ChainCore<E> {
                     "proposer {proposer} is past the registry of the state of the parent {parent}"
                 ));
             }
-            // The domain of the network schedule, not of `parent_state.fork`: a fork in the
-            // empty slots changes the fork of the state only in the walk.
+            // The walk does not unslash a validator, or move a set exit or withdrawable epoch
+            // later, so such a proposer cannot propose at the block epoch. The walk can activate
+            // a validator, so one that is not active yet goes on. No proof: it is not kept.
             let epoch = E::epoch_at_slot(slot);
+            if let Some(why) = cannot_propose(parent_state, proposer, epoch) {
+                return Outcome::Ignored(format!(
+                    "proposer {proposer} {why} in the state of the parent {parent}"
+                ));
+            }
+            // The domain of the network schedule at the block epoch. `get_domain` on the parent
+            // state must give it too: else an INVALID verdict with it is no proof. The walk has
+            // no fork upgrade yet, so a block that needs one can come again when it has.
             let gvr = parent_state.genesis_validators_root;
             let Some(domain) = schedule_proposer_domain(&self.config, epoch, gvr) else {
                 return Outcome::Ignored(format!("the network schedule has no fork at {epoch}"));
             };
+            if get_domain(parent_state, DOMAIN_BEACON_PROPOSER, Some(epoch)) != domain {
+                return Outcome::Ignored(format!(
+                    "the fork of the state of the parent {parent} at epoch {epoch} is not the \
+                     fork of the network schedule"
+                ));
+            }
             if reply.is_closed() {
                 return Outcome::Ignored(CALLER_GONE.into());
             }
@@ -593,13 +635,20 @@ impl<E: Preset> ChainCore<E> {
             {
                 return stop;
             }
-            // The walk is charged in full before it starts, and gives nothing back if it stops
-            // early. A block over the budget can come again in a later slot, or from a nearer
-            // kept state.
+            // The VerifyBls call can take up to the deadline: the slot of the walk is the slot of
+            // the clock after it, so the block slot is checked again against that slot.
+            let wall_slot = match self.check_slot(slot) {
+                Ok(wall_slot) => wall_slot,
+                Err(why) => return Outcome::Ignored(why),
+            };
+            // The walk is charged in full before it starts, to the budget of all proposers and
+            // to the budget of its proposer, and gives nothing back if it stops early. A block
+            // over the budget can come again in a later slot, or from a nearer kept state.
             let epochs = gap.div_ceil(E::slots_per_epoch());
-            if !self.budget.take(wall_slot, epochs) {
+            if !self.budget.take(wall_slot, proposer, epochs) {
                 return Outcome::Ignored(format!(
-                    "the walk of {epochs} epochs is over the admission budget of slot {wall_slot}"
+                    "the walk of {epochs} epochs of proposer {proposer} is over the admission \
+                     budget of slot {wall_slot}"
                 ));
             }
             let hooks = &self.hooks;
@@ -642,13 +691,19 @@ impl<E: Preset> ChainCore<E> {
                 });
                 return self.refused.refuse(block_root, None, invalid);
             }
-            // The verdict holds for the key and the domain that it checked. If the advanced
-            // state gives another one, the signature goes to cl-verify again with it.
-            let again = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
-            if again != domain
-                || registry_key(&advanced, proposer) != registry_key(parent_state, proposer)
-            {
-                let checked = check_proposer_signature_in(&advanced, block, again, &verdict);
+            // The verdict holds for the domain that it checked. A walk with a fork upgrade can
+            // give the advanced state another fork at the block epoch: no proof about the block,
+            // so no second VerifyBls call and no kept refusal.
+            if get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch)) != domain {
+                return Outcome::Ignored(format!(
+                    "the fork of the advanced state of the parent {parent} at epoch {epoch} is \
+                     not the fork of the network schedule"
+                ));
+            }
+            // The verdict holds for the key that it checked. If the advanced state gives
+            // another one, the signature goes to cl-verify again with it.
+            if registry_key(&advanced, proposer) != registry_key(parent_state, proposer) {
+                let checked = check_proposer_signature_in(&advanced, block, domain, &verdict);
                 if let Some(stop) =
                     signature_stop(&mut self.refused, block_root, block, reply, checked)
                 {
@@ -711,6 +766,33 @@ impl<E: Preset> ChainCore<E> {
 /// `true` if validator `index` is in the registry of `state`.
 fn in_registry<E: Preset>(state: &BeaconState<E>, index: ValidatorIndex) -> bool {
     registry_key(state, index).is_some()
+}
+
+/// Why validator `index` of `state` cannot propose a block at `epoch`, a later epoch than the
+/// state, or `None`: it is slashed, or exited or withdrawable at `epoch`. Slots without a block
+/// do not unslash a validator, or move a set exit or withdrawable epoch later. `None` for a
+/// validator that is not active yet, and for an index past the registry.
+fn cannot_propose<E: Preset>(
+    state: &BeaconState<E>,
+    index: ValidatorIndex,
+    epoch: Epoch,
+) -> Option<String> {
+    let validator = state.validators.get(usize::try_from(index).ok()?)?;
+    if validator.slashed {
+        Some("is slashed".into())
+    } else if validator.exit_epoch <= epoch {
+        Some(format!(
+            "exits at epoch {}, not after the block epoch {epoch}",
+            validator.exit_epoch
+        ))
+    } else if validator.withdrawable_epoch <= epoch {
+        Some(format!(
+            "is withdrawable at epoch {}, not after the block epoch {epoch}",
+            validator.withdrawable_epoch
+        ))
+    } else {
+        None
+    }
 }
 
 /// The registry key of validator `index` in `state`.

@@ -31,9 +31,17 @@
 //! LRU ([`Advanced::retain`]). A later prune of pre-states at finality must also drop the kept
 //! states of the parents that it prunes.
 //!
-//! - after the proposer signature, the walk must fit in the admission budget of the core
-//!   ([`AdvanceBudget`]): at most [`MAX_ADVANCE_EPOCHS_PER_SLOT`] epochs of walk for each slot
-//!   of the clock of the core. Else it is IGNORE, with no `process_slots`.
+//! - after the proposer signature, the chain core reads its clock again, and the walk must fit
+//!   in the admission budget of that slot of the clock ([`AdvanceBudget`]): at most
+//!   [`MAX_ADVANCE_EPOCHS_PER_SLOT`] epochs of walk in each slot for all proposers, and one walk
+//!   of at most [`MAX_ADVANCE_EPOCHS_PER_PROPOSER_PER_SLOT`] epochs in each slot for each
+//!   proposer. Else it is IGNORE, with no `process_slots`.
+//!
+//! The fairness key of the budget is the claimed `proposer_index` of the block, not a peer: an
+//! import carries no peer. A walk costs a valid signature of that proposer first, and one
+//! proposer has one walk in each slot, so several short walks of one proposer cannot take the
+//! budget of all proposers. One walk of the cap still takes it: the budget of all proposers
+//! holds one such walk in each slot.
 //!
 //! No refusal of the walk is a proof about the block: each is IGNORE, and the core does not
 //! keep it. The block can import later from a nearer state, or with more time.
@@ -58,6 +66,16 @@ pub const MAX_ADVANCED_STATES: usize = 64;
 /// the admission budget holds \[est\]: one walk of [`MAX_ADVANCE_EPOCHS`] epochs, or several
 /// shorter ones.
 pub const MAX_ADVANCE_EPOCHS_PER_SLOT: u64 = 8;
+
+/// The most epochs of walk that the core admits for one proposer in each slot of its clock
+/// \[est\]: one walk of [`MAX_ADVANCE_EPOCHS`] epochs. Each walk takes the full budget of its
+/// proposer for the slot, so one proposer has one walk in each slot.
+pub const MAX_ADVANCE_EPOCHS_PER_PROPOSER_PER_SLOT: u64 = 8;
+
+/// The most proposers that the admission budget keeps a budget for \[est\]. Past it, the
+/// proposer charged least recently goes first. A later walk of that proposer starts from a full
+/// budget of its own, and the budget of all proposers still bounds it.
+pub const MAX_ADVANCE_BUDGET_PROPOSERS: usize = 128;
 
 /// `process_slots` on a state to a slot. `Err` (why, for the log) is IGNORE.
 pub(crate) type Walk<'a, E> = dyn Fn(&mut BeaconState<E>, Slot) -> Result<(), String> + 'a;
@@ -137,19 +155,44 @@ impl<S> Advanced<S> {
     }
 }
 
-/// The admission budget of the walks: a bucket of epochs of walk, on the slots of the clock of
-/// the core. The core is the single writer, so the budget bounds the work of the walks in one
-/// slot, not their concurrency.
-///
-/// The first [`Self::take`] fills the bucket to [`MAX_ADVANCE_EPOCHS_PER_SLOT`]. Each later
-/// slot of the clock adds [`MAX_ADVANCE_EPOCHS_PER_SLOT`], up to that bound: idle slots keep no
-/// more than one slot of work. A clock that goes back adds nothing and empties nothing.
-#[derive(Clone, Debug, Default)]
-pub struct AdvanceBudget {
+/// A bucket of epochs of walk, on the slots of the clock of the core.
+#[derive(Clone, Copy, Debug, Default)]
+struct Bucket {
     /// The epochs of walk left.
     epochs: u64,
     /// The latest slot of the clock that a take saw. `None` before the first take.
     slot: Option<Slot>,
+}
+
+impl Bucket {
+    /// The bucket after the refill of slot `now`, for a bucket of `size` epochs. The first take
+    /// fills it. Each later slot adds `size`, up to `size`: idle slots keep no more than one
+    /// slot of work. A clock that goes back adds nothing and empties nothing.
+    fn refill(self, now: Slot, size: u64) -> Self {
+        let added = self
+            .slot
+            .map_or(size, |last| now.saturating_sub(last).saturating_mul(size));
+        Self {
+            epochs: self.epochs.saturating_add(added).min(size),
+            slot: Some(self.slot.map_or(now, |last| last.max(now))),
+        }
+    }
+}
+
+/// The admission budget of the walks, on the slots of the clock of the core. The core is the
+/// single writer, so the budget bounds the work of the walks in one slot, not their concurrency.
+///
+/// It has a bucket of [`MAX_ADVANCE_EPOCHS_PER_SLOT`] epochs for all proposers, and a bucket of
+/// [`MAX_ADVANCE_EPOCHS_PER_PROPOSER_PER_SLOT`] epochs for each proposer, with the same refill
+/// on the same clock: the first take of a bucket fills it, and each later slot of the clock
+/// fills it again. A clock that goes back adds nothing and empties nothing. The budget keeps the
+/// buckets of at most [`MAX_ADVANCE_BUDGET_PROPOSERS`] proposers.
+#[derive(Clone, Debug, Default)]
+pub struct AdvanceBudget {
+    /// The bucket of all proposers.
+    all: Bucket,
+    /// The bucket of each proposer, the least recently charged first.
+    proposers: Vec<(ValidatorIndex, Bucket)>,
 }
 
 impl AdvanceBudget {
@@ -158,24 +201,49 @@ impl AdvanceBudget {
         Self::default()
     }
 
-    /// Takes `epochs` of walk at slot `now` of the clock, and returns `true`, if the bucket
-    /// holds them after the refill of `now`. Else it takes nothing, and returns `false`. A walk
-    /// that stops early gives nothing back.
-    pub fn take(&mut self, now: Slot, epochs: u64) -> bool {
-        let added = self.slot.map_or(MAX_ADVANCE_EPOCHS_PER_SLOT, |last| {
-            now.saturating_sub(last)
-                .saturating_mul(MAX_ADVANCE_EPOCHS_PER_SLOT)
-        });
-        self.slot = Some(self.slot.map_or(now, |last| last.max(now)));
-        self.epochs = self
-            .epochs
-            .saturating_add(added)
-            .min(MAX_ADVANCE_EPOCHS_PER_SLOT);
-        if epochs > self.epochs {
+    /// Takes a walk of `epochs` epochs for a block of `proposer` at slot `now` of the clock,
+    /// and returns `true`, if both buckets hold it after the refill of `now`: `epochs` from the
+    /// bucket of all proposers, and the full bucket of `proposer`. Else it takes nothing from
+    /// either bucket, and returns `false`. A walk that stops early gives nothing back. A walk of
+    /// no epoch takes nothing.
+    pub fn take(&mut self, now: Slot, proposer: ValidatorIndex, epochs: u64) -> bool {
+        if epochs == 0 {
+            return true;
+        }
+        let at = self
+            .proposers
+            .iter()
+            .position(|(index, _)| *index == proposer);
+        let own = at
+            .map_or_else(Bucket::default, |at| self.proposers[at].1)
+            .refill(now, MAX_ADVANCE_EPOCHS_PER_PROPOSER_PER_SLOT);
+        let all = self.all.refill(now, MAX_ADVANCE_EPOCHS_PER_SLOT);
+        // The walk takes the full bucket of its proposer: one walk for each slot.
+        let own_epochs = epochs.max(MAX_ADVANCE_EPOCHS_PER_PROPOSER_PER_SLOT);
+        if epochs > all.epochs || own_epochs > own.epochs {
             return false;
         }
-        self.epochs -= epochs;
+        self.all = Bucket {
+            epochs: all.epochs - epochs,
+            ..all
+        };
+        if let Some(at) = at {
+            self.proposers.remove(at);
+        }
+        let own = Bucket {
+            epochs: own.epochs - own_epochs,
+            ..own
+        };
+        self.proposers.push((proposer, own));
+        if self.proposers.len() > MAX_ADVANCE_BUDGET_PROPOSERS {
+            self.proposers.remove(0);
+        }
         true
+    }
+
+    /// The number of proposers that the budget keeps a bucket for.
+    pub fn proposers(&self) -> usize {
+        self.proposers.len()
     }
 }
 
@@ -265,15 +333,121 @@ pub(crate) fn advance<E: Preset>(
                 state.slot
             ));
         }
-        // The next last slot of an epoch: one epoch boundary in each step at most.
-        let epoch_end = ((state.slot + 1) / epoch_slots + 1)
-            .saturating_mul(epoch_slots)
-            .saturating_sub(1);
-        let to = epoch_end.min(target);
+        // The next last slot of an epoch: one epoch boundary in each step at most. The walk
+        // keeps a state only at a last slot of an epoch, so `to + 1` starts an epoch.
+        let epoch_end = next_epoch_end(state.slot, epoch_slots);
+        let to = epoch_end.map_or(target, |end| end.min(target));
         walk(&mut state, to)?;
-        if to == epoch_end {
+        if epoch_end == Some(to) {
             advanced.insert(parent, (to + 1) / epoch_slots, state.clone());
         }
     }
     Ok(state)
+}
+
+/// The first slot after `slot` that is the last slot of an epoch of `epoch_slots` slots, or
+/// `None` if there is none up to [`Slot::MAX`].
+fn next_epoch_end(slot: Slot, epoch_slots: u64) -> Option<Slot> {
+    let last = epoch_slots.checked_sub(1)?;
+    let next = slot.checked_add(1)?;
+    (next / epoch_slots * epoch_slots).checked_add(last)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use consensus_types::{EthSpec, Minimal};
+    use std::cell::RefCell;
+    use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
+    use testkit::anchor::load_anchor;
+
+    /// The anchor state of the pinned minimal export, at slot 0.
+    fn anchor_state() -> BeaconState<Minimal> {
+        let pinned = pinned_export().expect("the pinned export must open");
+        let dir = tempfile::tempdir().unwrap();
+        AnchorFiles::genesis(&pinned.export)
+            .unwrap()
+            .write(dir.path())
+            .unwrap();
+        let loaded = load_anchor::<Minimal>(dir.path()).expect("the anchor must load");
+        loaded.into_parts().0
+    }
+
+    #[test]
+    fn the_proposer_of_a_block_is_after_the_slot_of_the_state() {
+        let mut state = anchor_state();
+        let lookahead = |at: usize| state.proposer_lookahead.get(at).copied().unwrap();
+        let (first, sixth, eighth) = (lookahead(1), lookahead(6), lookahead(8));
+        assert!(
+            block_proposer(&state, state.slot).is_err(),
+            "the state slot has no block of the walk"
+        );
+        assert_eq!(block_proposer(&state, 1), Ok(first));
+        state.slot = 5;
+        assert!(block_proposer(&state, 5).is_err());
+        assert!(block_proposer(&state, 4).is_err());
+        assert_eq!(block_proposer(&state, 6), Ok(sixth));
+        // At the last slot of an epoch, a block that opens the next epoch reads the entry
+        // `SLOTS_PER_EPOCH` of the lookahead.
+        state.slot = 7;
+        assert!(block_proposer(&state, 7).is_err());
+        assert_eq!(block_proposer(&state, 8), Ok(eighth));
+        assert!(
+            block_proposer(&state, 16).is_err(),
+            "the lookahead has two epochs"
+        );
+    }
+
+    #[test]
+    fn the_next_epoch_end_is_exact_up_to_the_last_slot() {
+        assert_eq!(next_epoch_end(0, 8), Some(7));
+        assert_eq!(next_epoch_end(6, 8), Some(7));
+        assert_eq!(next_epoch_end(7, 8), Some(15));
+        // 2^64 is a multiple of 8 and of 32, so the last slot ends an epoch.
+        for epoch_slots in [8, 32] {
+            assert_eq!(next_epoch_end(Slot::MAX - 1, epoch_slots), Some(Slot::MAX));
+            assert_eq!(
+                next_epoch_end(Slot::MAX - epoch_slots, epoch_slots),
+                Some(Slot::MAX)
+            );
+            assert_eq!(
+                next_epoch_end(Slot::MAX - epoch_slots - 1, epoch_slots),
+                Some(Slot::MAX - epoch_slots)
+            );
+        }
+        assert_eq!(next_epoch_end(Slot::MAX, 8), None, "no slot is after it");
+        // 2^64 is not a multiple of 6: the next last slot of an epoch is past the last slot.
+        assert_eq!(next_epoch_end(Slot::MAX - 1, 6), None);
+        assert_eq!(next_epoch_end(Slot::MAX - 4, 6), None);
+        assert_eq!(next_epoch_end(Slot::MAX - 5, 6), Some(Slot::MAX - 4));
+        assert_eq!(next_epoch_end(3, 0), None);
+    }
+
+    /// A walk to the slot before the last slot keeps a state only at a last slot of an epoch,
+    /// by the epoch after it, and does not walk to the last slot.
+    #[test]
+    fn a_walk_near_the_last_slot_keeps_states_only_at_ends_of_epochs() {
+        let epoch_slots = Minimal::slots_per_epoch();
+        let parent = Root::repeat_byte(1);
+        let mut pre = anchor_state();
+        pre.slot = Slot::MAX - epoch_slots - 1;
+        let tos = RefCell::new(Vec::new());
+        let walk = |state: &mut BeaconState<Minimal>, to: Slot| {
+            tos.borrow_mut().push(to);
+            state.slot = to;
+            Ok(())
+        };
+        let mut advanced = Advanced::new(8);
+        let state = advance(&mut advanced, parent, &pre, Slot::MAX, &|_| None, &walk).unwrap();
+        assert_eq!(state.slot, Slot::MAX - 1);
+        assert_eq!(*tos.borrow(), vec![Slot::MAX - epoch_slots, Slot::MAX - 1]);
+        assert_eq!(advanced.len(), 1, "one last slot of an epoch on the walk");
+        let epoch = (Slot::MAX - epoch_slots + 1) / epoch_slots;
+        let kept = advanced
+            .peek(&parent, epoch)
+            .expect("the state at an end of an epoch");
+        assert_eq!(kept.slot, Slot::MAX - epoch_slots);
+    }
 }
