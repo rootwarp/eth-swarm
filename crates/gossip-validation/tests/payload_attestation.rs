@@ -726,6 +726,20 @@ fn accept_at<S: StoreView<E>>(
     seen.resolve(key, Ok(true))
 }
 
+/// Validates `m` against `store` at `time_ms`. A pending verdict resolves with a valid
+/// signature. Gives the verdict of a valid copy of `m`.
+fn offer_at<S: StoreView<E>>(
+    seen: &mut Seen,
+    store: &S,
+    m: &PayloadAttestationMessage,
+    time_ms: u64,
+) -> Verdict {
+    match validate_at(seen, store, m, time_ms) {
+        Verdict::Pending { seen_key, .. } => seen.resolve(seen_key, Ok(true)),
+        other => other,
+    }
+}
+
 /// The view of `chain` with the head state `head`.
 fn with_head<'a>(chain: &'a Chain, head: &'a BeaconState<E>) -> Head<'a> {
     Head {
@@ -1316,6 +1330,123 @@ fn a_slot_keeps_at_most_the_validator_limit_and_removes_the_oldest_validator() {
     assert_eq!(accepted.len(), 80);
     assert_eq!(seen.payload_attestation_count(), limit);
     assert_eq!(seen.payload_attestation_slot_count(), 1);
+}
+
+#[test]
+fn an_accepted_validator_must_not_accept_again_when_a_fifth_head_fills_the_slot() {
+    let limit = MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT * PTC_SIZE;
+    let chain = chain_with(96);
+    // Five heads with disjoint PTCs: 80 validators for slot 1, more than the limit of 64.
+    let heads = disjoint_heads(&chain, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT + 1);
+    let (first_heads, last_head) = heads.split_at(MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT);
+    let mut seen = Seen::default();
+    // The PTCs of the first four heads fill slot 1 to the limit.
+    for (k, head) in first_heads.iter().enumerate() {
+        let view = with_head(&chain, head);
+        for validator in ptc_of(k) {
+            let m = message(validator, chain.p, 1);
+            assert_eq!(
+                offer_at(&mut seen, &view, &m, mid_slot_1()),
+                Verdict::Accept
+            );
+        }
+    }
+    assert_eq!(seen.payload_attestation_count(), limit);
+
+    // The fifth head admits 16 more validators of slot 1.
+    let fifth = with_head(&chain, &last_head[0]);
+    let fifth_ptc = ptc_of(MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT);
+    let fifth_verdicts = fifth_ptc.map(|validator| {
+        offer_at(
+            &mut seen,
+            &fifth,
+            &message(validator, chain.p, 1),
+            mid_slot_1(),
+        )
+    });
+
+    // Each validator of the first four heads stays seen. A valid copy under its own head must
+    // not accept again.
+    for (k, head) in first_heads.iter().enumerate() {
+        let view = with_head(&chain, head);
+        for validator in ptc_of(k) {
+            let m = message(validator, chain.p, 1);
+            assert_eq!(
+                offer_at(&mut seen, &view, &m, mid_slot_1()),
+                Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+                    slot: 1,
+                    validator_index: validator
+                }),
+                "{validator}"
+            );
+        }
+    }
+    // No validator of the fifth head accepts.
+    for (validator, verdict) in fifth_ptc.iter().zip(fifth_verdicts) {
+        assert!(
+            matches!(verdict, Verdict::Ignore(_)),
+            "{validator}: {verdict:?}"
+        );
+    }
+    assert_eq!(seen.payload_attestation_count(), limit);
+    assert_eq!(seen.payload_attestation_slot_count(), 1);
+}
+
+#[test]
+fn a_slot_that_the_slot_limit_removes_must_not_accept_again() {
+    let chain = chain();
+    let extra = 4;
+    let slots = (MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS + extra) as Slot;
+    let view = ManySlots::new(&chain, slots);
+    let now = view.genesis_time_ms();
+    let validator = |slot| get_ptc(chain.head_state(), slot).unwrap()[0];
+    let m = |slot| message(validator(slot), view.root(slot), slot);
+    let mut seen = Seen::default();
+    for slot in 1..=slots {
+        assert_eq!(offer_at(&mut seen, &view, &m(slot), now), Verdict::Accept);
+    }
+    // The limit removed the slots 1 to 4.
+    for slot in 1..=slots {
+        assert_eq!(
+            seen.has_payload_attestation(slot, validator(slot)),
+            slot > extra as Slot,
+            "{slot}"
+        );
+    }
+    let full = seen.clone();
+
+    // A valid copy of a message of a removed slot must not accept again. The last removed slot
+    // is a duplicate, and the slots before it are not current.
+    let last_removed = extra as Slot;
+    for slot in 1..=last_removed {
+        let want = if slot == last_removed {
+            IgnoreReason::PayloadAttestationAlreadySeen {
+                slot,
+                validator_index: validator(slot),
+            }
+        } else {
+            IgnoreReason::NotCurrentSlot { slot }
+        };
+        assert_eq!(
+            offer_at(&mut seen, &view, &m(slot), now),
+            Verdict::Ignore(want),
+            "{slot}"
+        );
+        assert_eq!(seen, full, "{slot}");
+    }
+    assert_eq!(seen.min_payload_attestation_slot(), last_removed + 1);
+    // Each kept slot stays a duplicate.
+    for slot in last_removed + 1..=slots {
+        assert_eq!(
+            offer_at(&mut seen, &view, &m(slot), now),
+            Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+                slot,
+                validator_index: validator(slot)
+            }),
+            "{slot}"
+        );
+    }
+    assert_eq!(seen, full);
 }
 
 #[test]
