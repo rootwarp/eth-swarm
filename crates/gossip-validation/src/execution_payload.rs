@@ -6,8 +6,43 @@
 //! envelope past a limit thus fails at deserialization, which the spec allows for the requests
 //! ("These checks MAY be performed when deserializing"). The checks also run here, in spec
 //! order, so that a looser type bound cannot let such an envelope through.
+//!
+//! # Deviation: a bounded `Seen`, and IGNORE before its floor
+//!
+//! The spec's `Seen` keeps each envelope key and each payload (`seen.execution_payload_envelopes`
+//! and `seen.execution_payloads`) for good, and the only slot check of this topic is the
+//! finalized slot (L846-849). The finalized slot does not move while the chain does not
+//! finalize, so a prune by that slot has no bound then. Here [`Seen`] keeps the keys and the
+//! payloads by `payload.slot_number`, with the bounds of [`crate::seen`]: the floor is the
+//! oldest slot that is current at the time of the store ([`crate::oldest_current_slot`] of
+//! [`StoreView::time_ms`]), and `Seen` keeps at most
+//! [`MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS`](crate::MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS)
+//! slots and [`MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT`] keys for each slot. These bounds do not
+//! depend on finality.
+//!
+//! What differs from the spec:
+//!
+//! - An envelope of a slot before the floor is IGNORE ([`IgnoreReason::NotCurrentSlot`]):
+//!   `Seen` does not keep that slot, so it cannot tell a duplicate. The check comes after the
+//!   finalized slot check and before the block slot check, and the duplicate check also reads
+//!   the record of the last pruned slot. The spec accepts such an envelope if it is valid and
+//!   not seen. On a healthy network an envelope arrives in its slot, and a late envelope can
+//!   still come by req/resp (`ExecutionPayloadEnvelopesByRange`,
+//!   `ExecutionPayloadEnvelopesByRoot`).
+//! - A valid envelope of a new block in a full slot is IGNORE
+//!   ([`IgnoreReason::ExecutionPayloadEnvelopeSlotFull`]). A slot has more than one block only
+//!   if its proposer equivocates.
+//! - An envelope whose key the spec has seen, but `Seen` no longer keeps, and whose
+//!   `payload.slot_number` is not the slot of its block can be REJECT for the slot mismatch,
+//!   where the spec gives IGNORE as a duplicate. The mismatch is a proven violation.
+//! - `seen.execution_payloads` has only the payloads of the kept slots. The
+//!   `execution_payload_bid` topic, which is not in this crate yet, reads the payload of
+//!   `bid.parent_block_hash`, and the payload of a parent before the floor is not there.
+//!
+//! IGNORE does not penalize the peer, and no envelope is ACCEPT that the spec does not accept.
 
-use crate::seen::{Seen, SeenKey};
+use crate::payload_attestation::oldest_current_slot;
+use crate::seen::{Seen, SeenKey, MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT};
 use crate::verdict::{IgnoreReason, RejectReason, RequestKind, Verdict};
 use crate::StoreView;
 use consensus_types::gloas::{ExecutionRequests, SignedExecutionPayloadEnvelope};
@@ -89,14 +124,26 @@ pub fn verify_withdrawals_limit<E: EthSpec>(count: usize) -> Result<(), RejectRe
 
 /// `validate_execution_payload_envelope_gossip` (L811-885) up to the signature check.
 ///
-/// It runs the three IGNORE checks and the REJECT checks before the signature in spec order,
-/// and gives the first that fails. If each passes, it gives [`Verdict::Pending`] with the set of
-/// `verify_execution_payload_envelope_signature` on the post-state of the block (the builder
-/// key, or the proposer key for a self-build envelope) and the key of the envelope. The
-/// caller must verify the set and give the result to [`Seen::resolve`], which adds the key to
-/// `Seen` only for a valid signature.
+/// It runs the three IGNORE checks of the spec, the IGNORE check of the floor of `Seen` (not a
+/// spec check, after the finalized slot check), and the REJECT checks before the signature in
+/// spec order, and gives the first that fails. If each passes, it gives [`Verdict::Pending`]
+/// with the set of `verify_execution_payload_envelope_signature` on the post-state of the block
+/// (the builder key, or the proposer key for a self-build envelope) and the key of the
+/// envelope. The caller must verify the set and give the result to [`Seen::resolve`], which
+/// adds the key to `Seen` only for a valid signature.
 ///
-/// The pinned function reads no wall clock, only the finalized slot of the store.
+/// `Seen` has bounds by slot (the deviation of the module documentation). The duplicate check
+/// also reads the record of the last pruned slot
+/// ([`Seen::has_pruned_execution_payload_envelope`]). After the finalized slot check, an
+/// envelope of a slot before the floor of `Seen` ([`Seen::min_execution_payload_envelope_slot`])
+/// is IGNORE as not current, also for a clock of the store that went back. The key has the
+/// oldest current slot at the time of the store ([`StoreView::time_ms`]) and the limit of
+/// envelopes for each slot, [`MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT`], which
+/// [`Seen::resolve`] applies.
+///
+/// The pinned function reads no clock, only the finalized slot of the store. This function
+/// reads the clock of the store only for the key, so no check before the signature depends on
+/// it. A key whose slot is before the oldest current slot is IGNORE in [`Seen::resolve`].
 pub fn validate_execution_payload_envelope_gossip<E, S>(
     seen: &Seen,
     store: &S,
@@ -111,7 +158,13 @@ where
     let block_root = envelope.beacon_block_root;
     let builder_index = envelope.builder_index;
 
-    if seen.has_execution_payload_envelope(block_root, builder_index) {
+    if seen.has_execution_payload_envelope(block_root, builder_index)
+        || seen.has_pruned_execution_payload_envelope(
+            payload.slot_number,
+            block_root,
+            builder_index,
+        )
+    {
         return Verdict::Ignore(IgnoreReason::EnvelopeAlreadySeen {
             block_root,
             builder_index,
@@ -130,6 +183,13 @@ where
         return Verdict::Ignore(IgnoreReason::BeforeFinalizedSlot {
             slot: payload.slot_number,
             finalized_slot,
+        });
+    }
+    // Not a spec check: `Seen` keeps no slot before its floor, so it cannot tell a duplicate
+    // there.
+    if payload.slot_number < seen.min_execution_payload_envelope_slot() {
+        return Verdict::Ignore(IgnoreReason::NotCurrentSlot {
+            slot: payload.slot_number,
         });
     }
 
@@ -174,10 +234,13 @@ where
     Verdict::Pending {
         bls_sets: vec![set],
         seen_key: SeenKey::execution_payload_envelope(
+            payload.slot_number,
             block_root,
             builder_index,
             payload.block_hash,
             payload.gas_limit,
+            oldest_current_slot(store, store.time_ms()),
+            MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT,
         ),
     }
 }

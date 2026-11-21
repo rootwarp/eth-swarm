@@ -26,9 +26,11 @@ use fork_choice::{
     SignatureVerifier, StateProvider, Store,
 };
 use gossip_validation::{
-    validate_execution_payload_envelope_gossip, verify_execution_requests_limits,
-    verify_withdrawals_limit, IgnoreReason, RejectReason, RequestCounts, RequestKind, Seen,
-    SeenKey, StoreView, Verdict,
+    oldest_current_slot, validate_execution_payload_envelope_gossip,
+    verify_execution_requests_limits, verify_withdrawals_limit, IgnoreReason, RejectReason,
+    RequestCounts, RequestKind, Seen, SeenKey, StoreView, Verdict,
+    MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS, MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT,
+    MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS,
 };
 use ssz::{Decode, Encode};
 use ssz_types::FixedVector;
@@ -36,6 +38,7 @@ use state_transition::accessors::{builder_key_version, get_domain};
 use state_transition::testing::{builder, empty_requests, genesis_state, signed_block};
 use state_transition::{state_root, BackendError, StfError};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use tree_hash::TreeHash;
 
@@ -586,6 +589,10 @@ impl StoreView<E> for NoPostStates<'_> {
     fn head_state(&self) -> Option<&BeaconState<E>> {
         StoreView::head_state(self.0)
     }
+
+    fn time_ms(&self) -> u64 {
+        self.0.time_ms()
+    }
 }
 
 #[test]
@@ -915,4 +922,654 @@ fn a_self_build_envelope_must_name_the_proposer_as_signer() {
     assert_eq!(sets[0].signers(), &[SignerRef::Validator(PROPOSER)]);
     assert_eq!(seen.resolve(key, Ok(true)), Verdict::Accept);
     assert!(seen.has_execution_payload_envelope(chain.root, BUILDER_INDEX_SELF_BUILD));
+}
+
+/// The first time at which `slot` is the oldest current slot: the slot before it is past the
+/// clock disparity. A prune at that time removes each slot before `slot`.
+fn prune_time(slot: Slot) -> u64 {
+    time_at(slot) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS + 1
+}
+
+/// `envelope.beacon_block_root` of `signed`.
+fn root(signed: &SignedExecutionPayloadEnvelope<E>) -> Root {
+    signed.message.beacon_block_root
+}
+
+/// The gas limit that `seen` keeps for the payload of `signed`.
+fn gas_limit_of(seen: &Seen, signed: &SignedExecutionPayloadEnvelope<E>) -> Option<u64> {
+    seen.execution_payload(signed.message.payload.block_hash)
+        .map(|payload| payload.gas_limit)
+}
+
+/// The IGNORE of a copy of `signed` whose envelope is already seen.
+fn already_seen(signed: &SignedExecutionPayloadEnvelope<E>) -> Verdict {
+    Verdict::Ignore(IgnoreReason::EnvelopeAlreadySeen {
+        block_root: root(signed),
+        builder_index: signed.message.builder_index,
+    })
+}
+
+/// The IGNORE of an envelope of `slot`, before the floor of `Seen`.
+fn not_current(slot: Slot) -> Verdict {
+    Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot })
+}
+
+/// The verdicts of a signature that is not valid, and of a signature check with no verdict.
+fn invalid_or_unverified() -> [(Result<bool, BackendError>, Verdict); 2] {
+    [
+        (Ok(false), Verdict::Reject(RejectReason::InvalidSignature)),
+        (
+            Err(BackendError("timeout".into())),
+            Verdict::Ignore(IgnoreReason::NoSignatureVerdict),
+        ),
+    ]
+}
+
+fn validate_on<S: StoreView<E>>(
+    seen: &Seen,
+    store: &S,
+    signed: &SignedExecutionPayloadEnvelope<E>,
+) -> Verdict {
+    validate_execution_payload_envelope_gossip(seen, store, signed)
+}
+
+/// Validates `signed` against `store`. A pending verdict resolves with a valid signature.
+/// Gives the verdict of a valid copy of `signed`.
+fn offer<S: StoreView<E>>(
+    seen: &mut Seen,
+    store: &S,
+    signed: &SignedExecutionPayloadEnvelope<E>,
+) -> Verdict {
+    match validate_on(seen, store, signed) {
+        Verdict::Pending { seen_key, .. } => seen.resolve(seen_key, Ok(true)),
+        other => other,
+    }
+}
+
+/// Validates `signed` against the store of `chain`, and resolves the pending verdict with a
+/// valid signature. Gives the verdict of [`Seen::resolve`].
+fn accept(seen: &mut Seen, chain: &Chain, signed: &SignedExecutionPayloadEnvelope<E>) -> Verdict {
+    let (_, key) = pending(validate(seen, chain, signed));
+    seen.resolve(key, Ok(true))
+}
+
+/// The envelope that the bid of `block` commits to, with no requests and the signature
+/// [`SIG`].
+fn envelope_of(block: &BeaconBlock<E>) -> SignedExecutionPayloadEnvelope<E> {
+    let bid = &block.body.signed_execution_payload_bid.message;
+    SignedExecutionPayloadEnvelope {
+        message: ExecutionPayloadEnvelope {
+            payload: payload(block.slot, bid.block_hash, vec![]),
+            execution_requests: empty_requests(),
+            builder_index: bid.builder_index,
+            beacon_block_root: block.tree_hash_root(),
+            parent_beacon_block_root: block.parent_root,
+        },
+        signature: SIG,
+    }
+}
+
+/// A block at `slot` on `parent` by [`PROPOSER`]. The bid of the block is by [`BUILDER`], has
+/// the block hash `block_hash` and commits to no requests.
+fn block_with_hash(parent: Root, slot: Slot, block_hash: Root) -> SignedBeaconBlock<E> {
+    let mut block = block_with_bid(parent, slot, BUILDER, &empty_requests());
+    block
+        .message
+        .body
+        .signed_execution_payload_bid
+        .message
+        .block_hash = block_hash;
+    block
+}
+
+/// The envelopes of four blocks on one store, at the start of slot 2: `a`, the block of
+/// [`chain`], and `d` at slot 1 on the anchor, and `b` and `c` at slot 2 on `a`. Each bid is by
+/// [`BUILDER`] and has its own block hash.
+struct TwoSlots {
+    chain: Chain,
+    a: SignedExecutionPayloadEnvelope<E>,
+    b: SignedExecutionPayloadEnvelope<E>,
+    c: SignedExecutionPayloadEnvelope<E>,
+    d: SignedExecutionPayloadEnvelope<E>,
+}
+
+fn two_slots() -> TwoSlots {
+    let mut chain = chain(BUILDER, &empty_requests());
+    let anchor_root = chain.block.message.parent_root;
+    let d = block_with_hash(anchor_root, 1, Root::repeat_byte(0xd1));
+    on_block(&mut chain.store, &Provider, &d).unwrap();
+    on_tick(&mut chain.store, time_at(2)).unwrap();
+    let b = block_with_hash(chain.root, 2, Root::repeat_byte(0xb2));
+    let c = block_with_hash(chain.root, 2, Root::repeat_byte(0xc2));
+    for block in [&b, &c] {
+        on_block(&mut chain.store, &Provider, block).unwrap();
+    }
+    TwoSlots {
+        a: envelope(&chain, empty_requests()),
+        b: envelope_of(&b.message),
+        c: envelope_of(&c.message),
+        d: envelope_of(&d.message),
+        chain,
+    }
+}
+
+impl TwoSlots {
+    /// Sets the clock of the store to `time_ms`, also to an earlier time.
+    fn tick(&mut self, time_ms: u64) {
+        on_tick(&mut self.chain.store, time_ms).unwrap();
+        assert_eq!(self.chain.store.time_ms(), time_ms);
+    }
+}
+
+/// The end of slot 1 plus the clock disparity: the last time at which slot 1 is current.
+fn edge() -> u64 {
+    time_at(2) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS
+}
+
+#[test]
+fn an_envelope_slot_stays_through_the_clock_disparity_and_a_valid_envelope_then_removes_it() {
+    let mut fx = two_slots();
+    let mut seen = Seen::default();
+    assert_eq!(accept(&mut seen, &fx.chain, &fx.a), Verdict::Accept);
+
+    // At the end of slot 1 plus the clock disparity, slot 1 is still current. A valid envelope
+    // of slot 2 at that time keeps slot 1 and its payload.
+    fx.tick(edge());
+    assert_eq!(accept(&mut seen, &fx.chain, &fx.b), Verdict::Accept);
+    assert!(seen.has_execution_payload_envelope(root(&fx.a), BUILDER));
+    assert_eq!(gas_limit_of(&seen, &fx.a), Some(GAS_LIMIT));
+    assert_eq!(seen.execution_payload_envelope_slot_count(), 2);
+    assert_eq!(seen.min_execution_payload_envelope_slot(), 1);
+    assert_eq!(validate(&seen, &fx.chain, &fx.a), already_seen(&fx.a));
+
+    // One millisecond later, slot 1 is not current. A valid envelope of slot 2 removes it and
+    // its payload.
+    fx.tick(edge() + 1);
+    assert_eq!(accept(&mut seen, &fx.chain, &fx.c), Verdict::Accept);
+    assert!(!seen.has_execution_payload_envelope(root(&fx.a), BUILDER));
+    assert_eq!(gas_limit_of(&seen, &fx.a), None);
+    for kept in [&fx.b, &fx.c] {
+        assert!(seen.has_execution_payload_envelope(root(kept), BUILDER));
+        assert_eq!(gas_limit_of(&seen, kept), Some(GAS_LIMIT));
+    }
+    assert_eq!(seen.execution_payload_envelope_slot_count(), 1);
+    assert_eq!(seen.execution_payload_envelope_count(), 2);
+    assert_eq!(seen.execution_payload_count(), 2);
+    assert_eq!(seen.min_execution_payload_envelope_slot(), 2);
+    // A copy of the accepted envelope of slot 1 is a duplicate. An envelope of another block
+    // of slot 1 is not current.
+    assert_eq!(validate(&seen, &fx.chain, &fx.a), already_seen(&fx.a));
+    assert_eq!(validate(&seen, &fx.chain, &fx.d), not_current(1));
+}
+
+#[test]
+fn an_explicit_prune_removes_an_envelope_slot_only_after_the_clock_disparity() {
+    let fx = two_slots();
+    let store = &fx.chain.store;
+    let mut seen = Seen::default();
+    for signed in [&fx.a, &fx.b] {
+        assert_eq!(accept(&mut seen, &fx.chain, signed), Verdict::Accept);
+    }
+
+    seen.prune_execution_payload_envelopes(store, edge());
+    assert!(seen.has_execution_payload_envelope(root(&fx.a), BUILDER));
+    assert_eq!(gas_limit_of(&seen, &fx.a), Some(GAS_LIMIT));
+    assert_eq!(seen.execution_payload_envelope_slot_count(), 2);
+    assert_eq!(seen.min_execution_payload_envelope_slot(), 1);
+
+    seen.prune_execution_payload_envelopes(store, edge() + 1);
+    assert!(!seen.has_execution_payload_envelope(root(&fx.a), BUILDER));
+    assert_eq!(gas_limit_of(&seen, &fx.a), None);
+    assert!(seen.has_pruned_execution_payload_envelope(1, root(&fx.a), BUILDER));
+    assert!(seen.has_execution_payload_envelope(root(&fx.b), BUILDER));
+    assert_eq!(gas_limit_of(&seen, &fx.b), Some(GAS_LIMIT));
+    assert_eq!(seen.execution_payload_envelope_slot_count(), 1);
+    assert_eq!(seen.execution_payload_envelope_count(), 1);
+    assert_eq!(seen.execution_payload_count(), 1);
+    assert_eq!(seen.min_execution_payload_envelope_slot(), 2);
+}
+
+#[test]
+fn a_pending_duplicate_envelope_across_a_prune_must_ignore() {
+    // `false` is an explicit prune. `true` is a valid envelope of slot 2 that prunes.
+    for automatic in [false, true] {
+        let mut fx = two_slots();
+        fx.tick(edge());
+        let mut seen = Seen::default();
+        // Two copies of the envelope of slot 1 pass validation at `edge`. The first copy
+        // accepts before the prune.
+        let (_, first) = pending(validate(&seen, &fx.chain, &fx.a));
+        let (_, second) = pending(validate(&seen, &fx.chain, &fx.a));
+        assert_eq!(seen.resolve(first, Ok(true)), Verdict::Accept);
+
+        // At `edge + 1`, slot 1 is not current, and a prune removes it.
+        fx.tick(edge() + 1);
+        if automatic {
+            assert_eq!(accept(&mut seen, &fx.chain, &fx.b), Verdict::Accept);
+        } else {
+            seen.prune_execution_payload_envelopes(&fx.chain.store, edge() + 1);
+        }
+        assert!(!seen.has_execution_payload_envelope(root(&fx.a), BUILDER));
+        let pruned = seen.clone();
+
+        // The second copy is IGNORE as a duplicate, and does not add slot 1 again.
+        assert_eq!(
+            seen.resolve(second, Ok(true)),
+            already_seen(&fx.a),
+            "{automatic}"
+        );
+        assert_eq!(seen, pruned, "{automatic}");
+        assert_eq!(
+            validate(&seen, &fx.chain, &fx.a),
+            already_seen(&fx.a),
+            "{automatic}"
+        );
+    }
+}
+
+#[test]
+fn pending_envelopes_that_resolve_only_after_a_prune_must_ignore() {
+    // `false` is an explicit prune. `true` is a valid envelope of slot 2 that prunes.
+    for automatic in [false, true] {
+        let mut fx = two_slots();
+        fx.tick(edge());
+        let mut seen = Seen::default();
+        // Two copies pass validation at `edge`. Neither resolves before the prune.
+        let (_, first) = pending(validate(&seen, &fx.chain, &fx.a));
+        let (_, second) = pending(validate(&seen, &fx.chain, &fx.a));
+        fx.tick(edge() + 1);
+        if automatic {
+            assert_eq!(accept(&mut seen, &fx.chain, &fx.b), Verdict::Accept);
+        } else {
+            seen.prune_execution_payload_envelopes(&fx.chain.store, edge() + 1);
+        }
+        let pruned = seen.clone();
+
+        // Slot 1 is not current. Neither copy accepts, and neither adds slot 1 again.
+        for key in [first, second] {
+            assert_eq!(seen.resolve(key, Ok(true)), not_current(1), "{automatic}");
+            assert_eq!(seen, pruned, "{automatic}");
+        }
+        assert!(!seen.has_execution_payload_envelope(root(&fx.a), BUILDER));
+        assert!(!seen.has_pruned_execution_payload_envelope(1, root(&fx.a), BUILDER));
+        assert_eq!(gas_limit_of(&seen, &fx.a), None);
+    }
+}
+
+#[test]
+fn an_envelope_of_a_pruned_slot_must_ignore_also_at_an_earlier_time() {
+    let mut fx = two_slots();
+    let mut seen = Seen::default();
+    // Copies of slot 1 that pass validation before the prune, and resolve after it.
+    let (_, late_a) = pending(validate(&seen, &fx.chain, &fx.a));
+    let (_, late_d) = pending(validate(&seen, &fx.chain, &fx.d));
+    assert_eq!(accept(&mut seen, &fx.chain, &fx.a), Verdict::Accept);
+    fx.tick(edge() + 1);
+    assert_eq!(accept(&mut seen, &fx.chain, &fx.b), Verdict::Accept);
+    assert_eq!(seen.min_execution_payload_envelope_slot(), 2);
+    let pruned = seen.clone();
+
+    // The clock goes back to times at which slot 1 is current again.
+    for time_ms in [edge(), time_at(2), time_at(1)] {
+        fx.tick(time_ms);
+        // A prune at an earlier time changes nothing.
+        seen.prune_execution_payload_envelopes(&fx.chain.store, time_ms);
+        assert_eq!(seen, pruned, "{time_ms}");
+        // A copy of the accepted envelope of slot 1 is a duplicate. An envelope of another
+        // block of slot 1 is not current.
+        assert_eq!(
+            validate(&seen, &fx.chain, &fx.a),
+            already_seen(&fx.a),
+            "{time_ms}"
+        );
+        assert_eq!(
+            validate(&seen, &fx.chain, &fx.d),
+            not_current(1),
+            "{time_ms}"
+        );
+    }
+
+    // The floor check comes after the block checks and before the slot check.
+    let unknown = Root::repeat_byte(0x42);
+    let mut unknown_block = fx.d.clone();
+    unknown_block.message.beacon_block_root = unknown;
+    assert_eq!(
+        validate(&seen, &fx.chain, &unknown_block),
+        Verdict::Ignore(IgnoreReason::UnknownBlock(unknown))
+    );
+    let mut wrong_slot = fx.c.clone();
+    wrong_slot.message.payload.slot_number = 1;
+    assert_eq!(validate(&seen, &fx.chain, &wrong_slot), not_current(1));
+
+    // The copies that passed validation before the prune do not accept, and do not add slot 1
+    // again.
+    assert_eq!(seen.resolve(late_a, Ok(true)), already_seen(&fx.a));
+    assert_eq!(seen.resolve(late_d, Ok(true)), not_current(1));
+    assert_eq!(seen, pruned);
+
+    // An envelope of a kept slot at the earlier time accepts, and the floor stays.
+    assert_eq!(accept(&mut seen, &fx.chain, &fx.c), Verdict::Accept);
+    assert_eq!(seen.min_execution_payload_envelope_slot(), 2);
+    assert!(seen.has_pruned_execution_payload_envelope(1, root(&fx.a), BUILDER));
+}
+
+#[test]
+fn seen_keeps_the_envelopes_of_the_last_pruned_slot_until_the_floor_moves_again() {
+    let fx = two_slots();
+    let store = &fx.chain.store;
+    let (a, b, d) = (root(&fx.a), root(&fx.b), root(&fx.d));
+    let mut seen = Seen::default();
+    // Two copies of the envelopes of `a` and `b` pass validation at the start of slot 2. The
+    // first copies accept.
+    let [(_, a_first), (_, a_second)] =
+        [(); 2].map(|()| pending(validate(&seen, &fx.chain, &fx.a)));
+    let [(_, b_first), (_, b_second)] =
+        [(); 2].map(|()| pending(validate(&seen, &fx.chain, &fx.b)));
+    assert_eq!(seen.resolve(a_first, Ok(true)), Verdict::Accept);
+    assert_eq!(seen.resolve(b_first, Ok(true)), Verdict::Accept);
+
+    // The floor moves to 2. The record has the envelope of slot 1, for its slot, block and
+    // builder only.
+    seen.prune_execution_payload_envelopes(store, prune_time(2));
+    assert!(seen.has_pruned_execution_payload_envelope(1, a, BUILDER));
+    assert!(!seen.has_pruned_execution_payload_envelope(2, a, BUILDER));
+    assert!(!seen.has_pruned_execution_payload_envelope(1, a, 0));
+    assert!(!seen.has_pruned_execution_payload_envelope(1, d, BUILDER));
+    assert!(!seen.has_pruned_execution_payload_envelope(2, b, BUILDER));
+    let at_floor_2 = seen.clone();
+
+    // The floor moves to 3. The record has the envelope of slot 2 only.
+    seen.prune_execution_payload_envelopes(store, prune_time(3));
+    assert!(!seen.has_pruned_execution_payload_envelope(1, a, BUILDER));
+    assert!(seen.has_pruned_execution_payload_envelope(2, b, BUILDER));
+    assert!(!seen.has_execution_payload_envelope(b, BUILDER));
+    assert_eq!(seen.execution_payload_envelope_count(), 0);
+    assert_eq!(seen.execution_payload_count(), 0);
+    assert_eq!(seen.execution_payload_envelope_slot_count(), 0);
+    let at_floor_3 = seen.clone();
+    assert_eq!(
+        seen.resolve(b_second.clone(), Ok(true)),
+        already_seen(&fx.b)
+    );
+    assert_eq!(seen.resolve(a_second.clone(), Ok(true)), not_current(1));
+    assert_eq!(seen, at_floor_3);
+
+    // From the floor 2, a move to 4 removes the record: slot 3 has no envelope.
+    let mut jumped = at_floor_2;
+    jumped.prune_execution_payload_envelopes(store, prune_time(4));
+    assert!(!jumped.has_pruned_execution_payload_envelope(1, a, BUILDER));
+    assert!(!jumped.has_pruned_execution_payload_envelope(2, b, BUILDER));
+    assert_eq!(jumped.execution_payload_envelope_count(), 0);
+    for (key, slot) in [(a_second, 1), (b_second, 2)] {
+        assert_eq!(jumped.resolve(key, Ok(true)), not_current(slot));
+    }
+}
+
+#[test]
+fn an_invalid_or_unverified_envelope_does_not_prune_seen() {
+    let mut fx = two_slots();
+    let mut seen = Seen::default();
+    assert_eq!(accept(&mut seen, &fx.chain, &fx.a), Verdict::Accept);
+    // A valid envelope of slot 2 at this time removes slot 1.
+    fx.tick(prune_time(2));
+    let before = seen.clone();
+
+    for (signatures, want) in invalid_or_unverified() {
+        let (_, key) = pending(validate(&seen, &fx.chain, &fx.b));
+        assert_eq!(seen.resolve(key, signatures), want);
+        assert_eq!(seen, before);
+    }
+    // A copy that fails a check before the signature gives no key.
+    let b_hash = fx.b.message.payload.block_hash;
+    let mut wrong_slot = fx.b.clone();
+    wrong_slot.message.payload.slot_number = 3;
+    let mut wrong_builder = fx.b.clone();
+    wrong_builder.message.builder_index = 0;
+    let mut wrong_hash = fx.b.clone();
+    wrong_hash.message.payload.block_hash = Root::repeat_byte(0xcc);
+    let mut wrong_requests = fx.b.clone();
+    wrong_requests.message.execution_requests.withdrawals =
+        vec![withdrawal_request()].try_into().unwrap();
+    let requests_root = wrong_requests.message.execution_requests.tree_hash_root();
+    let unknown = Root::repeat_byte(0x42);
+    let mut unknown_block = fx.b.clone();
+    unknown_block.message.beacon_block_root = unknown;
+    for (copy, want) in [
+        (
+            &wrong_slot,
+            Verdict::Reject(RejectReason::SlotMismatch {
+                block: 2,
+                payload: 3,
+            }),
+        ),
+        (
+            &wrong_builder,
+            Verdict::Reject(RejectReason::BuilderIndexMismatch {
+                envelope: 0,
+                bid: BUILDER,
+            }),
+        ),
+        (
+            &wrong_hash,
+            Verdict::Reject(RejectReason::BlockHashMismatch {
+                payload: Root::repeat_byte(0xcc),
+                bid: b_hash,
+            }),
+        ),
+        (
+            &wrong_requests,
+            Verdict::Reject(RejectReason::ExecutionRequestsRootMismatch {
+                envelope: requests_root,
+                bid: empty_requests::<E>().tree_hash_root(),
+            }),
+        ),
+        (
+            &unknown_block,
+            Verdict::Ignore(IgnoreReason::UnknownBlock(unknown)),
+        ),
+    ] {
+        assert_eq!(validate(&seen, &fx.chain, copy), want);
+    }
+    assert_eq!(seen, before);
+    assert!(seen.has_execution_payload_envelope(root(&fx.a), BUILDER));
+    assert_eq!(seen.min_execution_payload_envelope_slot(), 1);
+
+    // The valid copy removes slot 1.
+    assert_eq!(accept(&mut seen, &fx.chain, &fx.b), Verdict::Accept);
+    assert!(!seen.has_execution_payload_envelope(root(&fx.a), BUILDER));
+    assert_eq!(seen.min_execution_payload_envelope_slot(), 2);
+}
+
+/// A view of the store of `chain` with other blocks, a slot duration of 1 ms, and the clock at
+/// the genesis time. Each block is the block of `chain` with another slot and block hash, and
+/// has the post-state of that block. At the genesis time the oldest current slot is 0, so the
+/// clock removes no slot of these blocks.
+struct ManyBlocks<'a> {
+    chain: &'a Chain,
+    blocks: HashMap<Root, BeaconBlock<E>>,
+}
+
+impl<'a> ManyBlocks<'a> {
+    fn new(chain: &'a Chain) -> Self {
+        Self {
+            chain,
+            blocks: HashMap::new(),
+        }
+    }
+
+    /// Adds a block of `slot` whose block hash has `slot` and `index`, and gives its envelope.
+    fn add(&mut self, slot: Slot, index: u8) -> SignedExecutionPayloadEnvelope<E> {
+        let mut hash = [0x77; 32];
+        hash[..8].copy_from_slice(&slot.to_le_bytes());
+        hash[8] = index;
+        let mut block = self.chain.block.message.clone();
+        block.slot = slot;
+        block.body.signed_execution_payload_bid.message.block_hash = Root::from(hash);
+        let signed = envelope_of(&block);
+        self.blocks.insert(block.tree_hash_root(), block);
+        signed
+    }
+}
+
+impl StoreView<E> for ManyBlocks<'_> {
+    fn block(&self, root: Root) -> Option<&BeaconBlock<E>> {
+        self.blocks.get(&root)
+    }
+
+    fn block_state(&self, root: Root) -> Option<&BeaconState<E>> {
+        if self.blocks.contains_key(&root) {
+            self.chain.store.block_state(self.chain.root)
+        } else {
+            None
+        }
+    }
+
+    fn finalized_checkpoint(&self) -> &Checkpoint {
+        self.chain.store.finalized_checkpoint()
+    }
+
+    fn genesis_time_ms(&self) -> u64 {
+        self.chain.store.genesis_time_ms()
+    }
+
+    fn slot_duration_ms(&self) -> NonZeroU64 {
+        NonZeroU64::MIN
+    }
+
+    fn head_state(&self) -> Option<&BeaconState<E>> {
+        StoreView::head_state(&self.chain.store)
+    }
+
+    fn time_ms(&self) -> u64 {
+        self.genesis_time_ms()
+    }
+}
+
+#[test]
+fn seen_keeps_at_most_the_envelope_slot_limit_and_a_removed_slot_must_not_accept_again() {
+    assert_eq!(MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS, 8);
+    let chain = chain(BUILDER, &empty_requests());
+    let mut view = ManyBlocks::new(&chain);
+    let extra = 4;
+    let slots = (MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS + extra) as Slot;
+    let envelopes: Vec<_> = (1..=slots).map(|slot| view.add(slot, 0)).collect();
+    let next = view.add(slots + 1, 0);
+    assert_eq!(oldest_current_slot(&view, view.time_ms()), 0);
+    let mut seen = Seen::default();
+    for signed in &envelopes {
+        assert_eq!(offer(&mut seen, &view, signed), Verdict::Accept);
+        assert!(seen.has_execution_payload_envelope(root(signed), BUILDER));
+        assert!(
+            seen.execution_payload_envelope_slot_count()
+                <= MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS
+        );
+    }
+    assert_eq!(
+        seen.execution_payload_envelope_slot_count(),
+        MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS
+    );
+    assert_eq!(
+        seen.execution_payload_envelope_count(),
+        MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS
+    );
+    assert_eq!(
+        seen.execution_payload_count(),
+        MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS
+    );
+    // The oldest slots go first, with their payloads.
+    for (slot, signed) in (1..).zip(&envelopes) {
+        let kept = slot > extra as Slot;
+        assert_eq!(
+            seen.has_execution_payload_envelope(root(signed), BUILDER),
+            kept,
+            "{slot}"
+        );
+        assert_eq!(gas_limit_of(&seen, signed).is_some(), kept, "{slot}");
+    }
+    let last_removed = extra as Slot;
+    assert_eq!(seen.min_execution_payload_envelope_slot(), last_removed + 1);
+    let full = seen.clone();
+
+    // A valid copy of an envelope of a removed slot must not accept again. The last removed
+    // slot is a duplicate, and the slots before it are not current.
+    for (slot, signed) in (1..=last_removed).zip(&envelopes) {
+        let want = if slot == last_removed {
+            already_seen(signed)
+        } else {
+            not_current(slot)
+        };
+        assert_eq!(offer(&mut seen, &view, signed), want, "{slot}");
+        assert_eq!(seen, full, "{slot}");
+    }
+    // Each kept slot stays a duplicate.
+    for signed in &envelopes[extra..] {
+        assert_eq!(offer(&mut seen, &view, signed), already_seen(signed));
+    }
+    assert_eq!(seen, full);
+
+    // An invalid or unverified envelope of a new slot removes no slot.
+    for (signatures, want) in invalid_or_unverified() {
+        let (_, key) = pending(validate_on(&seen, &view, &next));
+        assert_eq!(seen.resolve(key, signatures), want);
+        assert_eq!(seen, full);
+    }
+    // A valid envelope of a new slot removes the oldest kept slot.
+    let oldest_kept = &envelopes[extra];
+    assert_eq!(offer(&mut seen, &view, &next), Verdict::Accept);
+    assert!(!seen.has_execution_payload_envelope(root(oldest_kept), BUILDER));
+    assert!(seen.has_pruned_execution_payload_envelope(
+        last_removed + 1,
+        root(oldest_kept),
+        BUILDER
+    ));
+    assert_eq!(seen.min_execution_payload_envelope_slot(), last_removed + 2);
+    assert_eq!(
+        seen.execution_payload_envelope_slot_count(),
+        MAX_EXECUTION_PAYLOAD_ENVELOPE_SEEN_SLOTS
+    );
+}
+
+#[test]
+fn a_full_envelope_slot_keeps_each_envelope_and_ignores_a_new_block() {
+    assert_eq!(MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT, 16);
+    let limit = MAX_EXECUTION_PAYLOAD_ENVELOPES_PER_SLOT;
+    let chain = chain(BUILDER, &empty_requests());
+    let mut view = ManyBlocks::new(&chain);
+    // 17 blocks of slot 1, each with its own block hash, and a block of slot 2.
+    let envelopes: Vec<_> = (0..=limit).map(|i| view.add(1, i as u8)).collect();
+    let other_slot = view.add(2, 0);
+    let (kept, new) = (&envelopes[..limit], &envelopes[limit]);
+    let mut seen = Seen::default();
+    for signed in kept {
+        assert_eq!(offer(&mut seen, &view, signed), Verdict::Accept);
+    }
+    assert_eq!(seen.execution_payload_envelope_count(), limit);
+    assert_eq!(seen.execution_payload_count(), limit);
+    assert_eq!(seen.execution_payload_envelope_slot_count(), 1);
+    let full = seen.clone();
+
+    // An invalid or unverified envelope of the new block leaves Seen as it was.
+    for (signatures, want) in invalid_or_unverified() {
+        let (_, key) = pending(validate_on(&seen, &view, new));
+        assert_eq!(seen.resolve(key, signatures), want);
+        assert_eq!(seen, full);
+    }
+    // A valid envelope of the new block is IGNORE: the slot is full. It removes no envelope
+    // and no payload, also a second time.
+    let slot_full = Verdict::Ignore(IgnoreReason::ExecutionPayloadEnvelopeSlotFull { slot: 1 });
+    for _ in 0..2 {
+        assert_eq!(offer(&mut seen, &view, new), slot_full);
+        assert_eq!(seen, full);
+    }
+    assert!(!seen.has_execution_payload_envelope(root(new), BUILDER));
+    assert_eq!(gas_limit_of(&seen, new), None);
+    // Each kept envelope stays a duplicate, and its payload stays.
+    for signed in kept {
+        assert_eq!(validate_on(&seen, &view, signed), already_seen(signed));
+        assert_eq!(gas_limit_of(&seen, signed), Some(GAS_LIMIT));
+    }
+    // Another slot is not full.
+    assert_eq!(offer(&mut seen, &view, &other_slot), Verdict::Accept);
+    assert_eq!(seen.execution_payload_envelope_slot_count(), 2);
+    assert_eq!(seen.execution_payload_envelope_count(), limit + 1);
 }
