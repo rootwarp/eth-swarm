@@ -34,8 +34,9 @@
 //!   place of the parent pre-state;
 //! - `proposer_index` is past the registry of the pre-state: INVALID, kept;
 //! - the caller of the import dropped the receiver of the answer: IGNORE. The core checks this
-//!   here and again before [`import_block`]. A drop before a check stops the import at that
-//!   check: no later VerifyBls call and no commit;
+//!   here, again at the end of the VerifyBls call of the proposer set, and at the end of
+//!   [`import_block`]. A drop before a check stops the import at that check: no later VerifyBls
+//!   call, no commit, and no kept refusal, also of an INVALID verdict;
 //! - the proposer signature ([`check_proposer_signature`]), with the key and the domain of the
 //!   pre-state: INVALID on an INVALID verdict (kept for that signature only), IGNORE on no
 //!   verdict.
@@ -546,7 +547,13 @@ impl<E: Preset> ChainCore<E> {
         }
         // The gossip order: the signature of the proposer before the slot loop, so that a
         // block that its proposer did not sign costs one VerifyBls call and no slot loop.
-        match check_proposer_signature(pre, block, &verdict) {
+        let checked = check_proposer_signature(pre, block, &verdict);
+        // The caller can stop waiting during that VerifyBls call. Then the core keeps no
+        // refusal, also of an INVALID verdict, and sends no more sets.
+        if reply.is_closed() {
+            return Outcome::Ignored(CALLER_GONE.into());
+        }
+        match checked {
             Ok(()) => {}
             Err(NotImported::Invalid(e)) => {
                 let signature = Some(block.signature);
@@ -556,11 +563,13 @@ impl<E: Preset> ChainCore<E> {
             }
             Err(NotImported::Ignored(why)) => return Outcome::Ignored(why),
         }
-        // The caller can stop waiting during that VerifyBls call.
+        let imported = import_block(pre, block, &self.config, &verdict, gate);
+        // The same for the VerifyBls call of the block sets, before any change of the core: no
+        // commit and no kept refusal.
         if reply.is_closed() {
             return Outcome::Ignored(CALLER_GONE.into());
         }
-        match import_block(pre, block, &self.config, &verdict, gate) {
+        match imported {
             Ok(imported) => {
                 self.head = Head {
                     block_root: imported.block_root,
