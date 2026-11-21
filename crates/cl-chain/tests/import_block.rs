@@ -25,18 +25,16 @@ mod support;
 use cl_chain::core::{queue, ChainCore, Head, Outcome, SubmitError, MAX_REFUSED_ROOTS};
 use cl_chain::import::block::{PayloadImportGate, PermitAll};
 use cl_chain::verify::client::{BlsClient, BlsOutcome, BlsVerifier, DEFAULT_MAX_OUTSTANDING};
-use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
+use consensus_types::gloas::SignedBeaconBlock;
 use consensus_types::primitives::{Bytes32, Hash32, Root};
-use consensus_types::signing::{compute_signing_root, DOMAIN_BEACON_PROPOSER};
-use consensus_types::{EthSpec, Minimal};
-use ethswarm_proto::verify::{BlsSet, KeyNamespace, Signer};
-use state_transition::accessors::get_domain;
+use consensus_types::Minimal;
+use ethswarm_proto::verify::{BlsSet, KeyNamespace};
 use state_transition::StfError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{
-    assert_unchanged, fixture, import_one, import_with, ungated_fixture, Answer, FakeVerify, QUEUE,
-    VERIFY_TIMEOUT,
+    assert_unchanged, fixture, import_one, import_with, proposer_set, ungated_fixture, Answer,
+    FakeVerify, QUEUE, VERIFY_TIMEOUT,
 };
 use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
 use testkit::anchor::load_anchor;
@@ -385,29 +383,6 @@ async fn one_verify_deadline_runs_from_the_start_of_the_import() {
             start + VERIFY_TIMEOUT,
             "each call must have the deadline of the start of the import: {call:?}"
         );
-    }
-}
-
-/// The proposer set of `block` on `pre`, the state of its parent: the registry key of
-/// `proposer_index`, and the signing root in the proposer domain of the epoch of the block.
-fn proposer_set(pre: &BeaconState<Minimal>, block: &SignedBeaconBlock<Minimal>) -> BlsSet {
-    let proposer = block.message.proposer_index;
-    let key = pre
-        .validators
-        .get(usize::try_from(proposer).unwrap())
-        .unwrap()
-        .pubkey;
-    let epoch = Minimal::epoch_at_slot(block.message.slot);
-    let domain = get_domain(pre, DOMAIN_BEACON_PROPOSER, Some(epoch));
-    BlsSet {
-        signers: vec![Signer {
-            validator_index: proposer,
-            inline_pubkey: key.to_vec(),
-            namespace: KeyNamespace::Validator as i32,
-            builder: None,
-        }],
-        signing_root: compute_signing_root(&block.message, domain).to_vec(),
-        signature: block.signature.to_vec(),
     }
 }
 

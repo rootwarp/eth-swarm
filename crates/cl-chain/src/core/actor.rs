@@ -67,7 +67,7 @@ use crate::import::block::{
 };
 use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{Root, Slot};
+use consensus_types::primitives::{Epoch, Root, Slot};
 use ethswarm_proto::verify::BlsSet;
 use network_config::ChainConfig;
 use state_transition::{state_root, Preset, StfError};
@@ -356,6 +356,20 @@ impl<E: Preset> ChainCore<E> {
     /// The number of pre-states the core holds, the anchor included.
     pub fn pre_states(&self) -> usize {
         self.snapshots.len()
+    }
+
+    /// `true` if the core keeps a refusal of block `block_root`, for one signature or for each
+    /// (see [Seen roots](#seen-roots)).
+    pub fn is_refused(&self, block_root: &Root) -> bool {
+        self.refused.contains(block_root)
+    }
+
+    /// The post-state of block `parent_root` advanced to the last slot of epoch `epoch - 1`, if
+    /// the core keeps it.
+    pub fn advanced_state(&self, parent_root: &Root, epoch: Epoch) -> Option<&BeaconState<E>> {
+        // The core advances no state yet.
+        let _ = (parent_root, epoch);
+        None
     }
 
     /// Moves the core onto a new OS thread that serves `queue` (see the module docs). Each

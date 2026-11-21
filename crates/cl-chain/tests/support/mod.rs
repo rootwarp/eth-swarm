@@ -7,13 +7,15 @@
 
 use cl_chain::core::{queue, ChainCore, Head, Outcome};
 use cl_chain::import::block::PermitAll;
-use cl_chain::verify::client::{BlsOutcome, BlsVerifier};
-use consensus_types::gloas::SignedBeaconBlock;
+use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
+use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::Root;
-use consensus_types::Minimal;
-use ethswarm_proto::verify::BlsSet;
+use consensus_types::signing::{compute_signing_root, DOMAIN_BEACON_PROPOSER};
+use consensus_types::{EthSpec, Minimal};
+use ethswarm_proto::verify::{BlsSet, KeyNamespace, Signer};
 use network_config::ChainConfig;
 use ssz::Decode;
+use state_transition::accessors::get_domain;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
@@ -220,4 +222,39 @@ pub fn assert_unchanged(core: &ChainCore<Minimal>, anchor: Head, block_root: Roo
         anchor.state_root,
         "the anchor state must not change"
     );
+}
+
+/// A clock that always reads `unix_ms`.
+pub fn clock_at(unix_ms: u128) -> UnixClock {
+    Arc::new(move || unix_ms)
+}
+
+/// The start of slot `slot` of the fixture chain, in Unix milliseconds.
+pub fn slot_start(f: &Fixture, slot: u64) -> u128 {
+    let genesis = f.core.state(&f.anchor.block_root).unwrap().genesis_time;
+    u128::from(genesis) * 1000 + u128::from(slot) * u128::from(f.config.slot_duration_ms())
+}
+
+/// The proposer set of `block` on `pre`, the state that the core checks the proposer on: the
+/// registry key of `proposer_index`, and the signing root in the proposer domain of the epoch
+/// of the block.
+pub fn proposer_set(pre: &BeaconState<Minimal>, block: &SignedBeaconBlock<Minimal>) -> BlsSet {
+    let proposer = block.message.proposer_index;
+    let key = pre
+        .validators
+        .get(usize::try_from(proposer).unwrap())
+        .unwrap()
+        .pubkey;
+    let epoch = Minimal::epoch_at_slot(block.message.slot);
+    let domain = get_domain(pre, DOMAIN_BEACON_PROPOSER, Some(epoch));
+    BlsSet {
+        signers: vec![Signer {
+            validator_index: proposer,
+            inline_pubkey: key.to_vec(),
+            namespace: KeyNamespace::Validator as i32,
+            builder: None,
+        }],
+        signing_root: compute_signing_root(&block.message, domain).to_vec(),
+        signature: block.signature.to_vec(),
+    }
 }
