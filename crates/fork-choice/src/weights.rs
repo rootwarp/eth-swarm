@@ -5,9 +5,9 @@
 //! `on_attestation` and `on_attester_slashing` fill.
 
 use crate::store::{
-    get_checkpoint_block, get_current_slot, get_current_store_epoch, get_parent_payload_status,
-    is_ancestor, is_parent_node_full, is_payload_verified, ptc_size, ForkChoiceNode, LatestMessage,
-    PayloadStatus, Store,
+    compute_start_slot_at_epoch, get_current_slot, get_current_store_epoch,
+    get_parent_payload_status, is_ancestor, is_parent_node_full, is_payload_verified, ptc_size,
+    ForkChoiceNode, LatestMessage, PayloadStatus, Store,
 };
 use crate::{Error, PROPOSER_SCORE_BOOST, REORG_HEAD_WEIGHT_THRESHOLD};
 use consensus_types::gloas::{BeaconBlock, BeaconState, Checkpoint};
@@ -86,7 +86,8 @@ pub fn get_node_children<E: Preset>(
 
 /// `filter_node_tree` (P0 L427-467): a node is viable if a leaf below it is viable. An
 /// explicit stack instead of the spec's recursion, so a long chain cannot overflow the
-/// thread stack.
+/// thread stack. The leaves share one [`CheckpointBlocks`], so the walks to the finalized
+/// checkpoint block pass each block once for the call.
 fn filter_node_tree<E: Preset>(
     store: &Store<E>,
     base: ForkChoiceNode,
@@ -106,6 +107,7 @@ fn filter_node_tree<E: Preset>(
         })
     };
     let mut viable = HashSet::new();
+    let mut checkpoint_blocks = CheckpointBlocks::default();
     let mut stack = vec![frame(base)?];
     while let Some(top) = stack.last_mut() {
         if let Some(&child) = top.children.get(top.next) {
@@ -115,7 +117,7 @@ fn filter_node_tree<E: Preset>(
         }
         let node = top.node;
         let is_viable = if top.children.is_empty() {
-            is_viable_leaf(store, &node)?
+            is_viable_leaf(store, &node, &mut checkpoint_blocks)?
         } else {
             top.any_viable
         };
@@ -132,7 +134,11 @@ fn filter_node_tree<E: Preset>(
 
 /// The leaf case of `filter_node_tree` (P0 L440-467): the voting source and the finalized
 /// checkpoint block agree with the store.
-fn is_viable_leaf<E: Preset>(store: &Store<E>, node: &ForkChoiceNode) -> Result<bool, Error> {
+fn is_viable_leaf<E: Preset>(
+    store: &Store<E>,
+    node: &ForkChoiceNode,
+    checkpoint_blocks: &mut CheckpointBlocks,
+) -> Result<bool, Error> {
     let current_epoch = get_current_store_epoch(store);
     let voting_source = get_voting_source(store, node.root)?;
     let justified = &store.justified_checkpoint;
@@ -141,8 +147,39 @@ fn is_viable_leaf<E: Preset>(store: &Store<E>, node: &ForkChoiceNode) -> Result<
         || voting_source.epoch.saturating_add(2) >= current_epoch;
     let finalized = &store.finalized_checkpoint;
     let correct_finalized = finalized.epoch == GENESIS_EPOCH
-        || finalized.root == get_checkpoint_block(store, node.root, finalized.epoch)?;
+        || finalized.root == checkpoint_blocks.finalized(store, node.root)?;
     Ok(correct_justified && correct_finalized)
+}
+
+/// `get_checkpoint_block(store, root, store.finalized_checkpoint.epoch)` (G L421-428) for the
+/// leaves of one `filter_node_tree`. It keeps the result of each block that a walk passed, and
+/// a later walk stops at the first such block. So a comb of `n` leaves on a chain of depth `d`
+/// costs `O(n + d)` steps, not `O(n * d)`.
+#[derive(Default)]
+struct CheckpointBlocks(HashMap<Root, Root>);
+
+impl CheckpointBlocks {
+    /// The walk of [`crate::get_ancestor`] for the first slot of the finalized epoch, root
+    /// only: it stops at the first block at or before that slot, or at the anchor. A missing
+    /// parent fails with the same error as that walk.
+    fn finalized<E: Preset>(&mut self, store: &Store<E>, root: Root) -> Result<Root, Error> {
+        let first_slot = compute_start_slot_at_epoch::<E>(store.finalized_checkpoint.epoch)?;
+        let mut walked = Vec::new();
+        let mut current = root;
+        let found = loop {
+            if let Some(found) = self.0.get(&current) {
+                break *found;
+            }
+            let block = store.get_block(current)?;
+            if block.slot <= first_slot || current == store.anchor_root {
+                break current;
+            }
+            walked.push(current);
+            current = block.parent_root;
+        };
+        self.0.extend(walked.into_iter().map(|root| (root, found)));
+        Ok(found)
+    }
 }
 
 /// `get_voting_source` (P0 L397-410).
