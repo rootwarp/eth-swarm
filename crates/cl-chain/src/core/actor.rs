@@ -1,6 +1,7 @@
 //! The chain core: the single writer of the chain state.
 //!
-//! [`ChainCore`] holds the head and the pre-states ([`Snapshots`]). [`ChainCore::spawn`] moves
+//! [`ChainCore`] holds the head, the pre-states ([`Snapshots`]) and the states of its walks
+//! over empty slots ([`Advanced`]). [`ChainCore::spawn`] moves
 //! it onto one dedicated OS thread, the only mutator of that state. The thread serves the
 //! queues of [`queue`] until each sender is gone, and then returns the core. Each queue is
 //! bounded: an item for a full queue is refused at once ([`SubmitError::Full`]), and the caller
@@ -23,18 +24,23 @@
 //! - the core refused the block before and kept the refusal: the same answer again;
 //! - the parent has no pre-state: IGNORE;
 //! - the block slot is more than [`PRE_STATE_EPOCHS`] epochs of slots after the slot of the
-//!   parent pre-state: IGNORE, kept. The wall-clock bound does not stop a block at the slot of
-//!   the wall clock on an old pre-state (the anchor stays for good), and the walk from that
-//!   pre-state costs one `process_slot` for each slot;
-//! - `proposer_index` is past the registry of the parent pre-state: INVALID, kept;
-//! - the proposer signature ([`check_proposer_signature`]), with the key of the parent
+//!   parent pre-state: the core first walks the empty slots between them on a copy, to the slot
+//!   before the block ([`advance`](super::advance)). The wall-clock bound does not stop a block
+//!   at the slot of the wall clock on an old pre-state (the anchor stays for good), so the walk
+//!   has its own bounds: a start more than
+//!   [`MAX_ADVANCE_EPOCHS`](super::advance::MAX_ADVANCE_EPOCHS) epochs of slots before the
+//!   block, the deadline, no deposit verdict, or an error in the walk is IGNORE. The checks
+//!   below and the import then run on the advanced state in place of the parent pre-state;
+//! - `proposer_index` is past the registry of the pre-state: INVALID, kept;
+//! - the proposer signature ([`check_proposer_signature`]), with the key and the domain of the
 //!   pre-state: INVALID on an INVALID verdict (kept for that signature only), IGNORE on no
 //!   verdict.
 //!
-//! Then it runs [`import_block`] on the pre-state of the parent. The core sends the signature
-//! sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the caller, with the
-//! deadline of the import: the proposer set in a first VerifyBls call, the block sets in a
-//! second one during the transition. Each VerifyBls call of one import gets the same deadline,
+//! Then it runs [`import_block`] on the pre-state: the pre-state of the parent, or the advanced
+//! state. The core sends the signature sets to cl-verify through a [`BlsVerifier`], on the
+//! Tokio runtime of the caller, with the deadline of the import: the proposer set in a first
+//! VerifyBls call, the block sets in a second one during the transition. The deposit sets of
+//! a walk go in calls before them. Each VerifyBls call of one import gets the same deadline,
 //! and no verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state
 //! root equal to `block.state_root` and a gate that permits the payload: it makes the parent
 //! pre-state the most recently used, keeps the post-state as a pre-state, and the block
@@ -54,16 +60,18 @@
 //! the block and on the pre-state of its parent. A refusal for the proposer signature holds
 //! only for that signature, as the block root does not commit to it. The core does not keep no
 //! verdict (the block can come again and get a verdict in time), a parent without a pre-state
-//! (it can come), a refused payload, or the wall-clock bound: the same block is in that bound
-//! once its slot comes, and that check costs no slot loop and no VerifyBls call.
+//! (it can come), a refused payload, the wall-clock bound (the same block is in that bound
+//! once its slot comes, and that check costs no slot loop and no VerifyBls call), or a refusal
+//! of the walk: a later walk can start from a nearer state, or have more time.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
 
+use super::advance::{advance, Advanced, MAX_ADVANCED_STATES};
 use super::seen::Refused;
 use super::snapshot::{max_pre_states, Snapshots, PRE_STATE_EPOCHS};
 use crate::import::block::{
-    check_proposer_signature, import_block, NotImported, PayloadImportGate,
+    check_proposer_signature, import_block, process_empty_slots, NotImported, PayloadImportGate,
 };
 use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
@@ -264,6 +272,8 @@ pub struct ChainCore<E: Preset> {
     /// `genesis_time` of the anchor state, Unix seconds: the start of slot 0.
     genesis_time: u64,
     snapshots: Snapshots<BeaconState<E>>,
+    /// The states of the walks over empty slots (see [`advance`](super::advance)).
+    advanced: Advanced<BeaconState<E>>,
     /// The root of each block the core committed, and of the anchor (see the module docs).
     committed: HashSet<Root>,
     /// The kept refusals, by block root (see the module docs).
@@ -310,6 +320,7 @@ impl<E: Preset> ChainCore<E> {
             config,
             genesis_time: state.genesis_time,
             snapshots: Snapshots::new(head.block_root, state, max_pre_states::<E>()),
+            advanced: Advanced::new(MAX_ADVANCED_STATES),
             committed: HashSet::from([head.block_root]),
             refused: Refused::new(MAX_REFUSED_ROOTS),
             head,
@@ -365,11 +376,9 @@ impl<E: Preset> ChainCore<E> {
     }
 
     /// The post-state of block `parent_root` advanced to the last slot of epoch `epoch - 1`, if
-    /// the core keeps it.
+    /// the core keeps it (see [`advance`](super::advance)).
     pub fn advanced_state(&self, parent_root: &Root, epoch: Epoch) -> Option<&BeaconState<E>> {
-        // The core advances no state yet.
-        let _ = (parent_root, epoch);
-        None
+        self.advanced.peek(parent_root, epoch)
     }
 
     /// Moves the core onto a new OS thread that serves `queue` (see the module docs). Each
@@ -437,28 +446,50 @@ impl<E: Preset> ChainCore<E> {
         let parent = block.message.parent_root;
         // A peek: the parent becomes the most recently used only if its child commits, so a
         // failed import does not change the order of use.
-        let Some(pre) = self.snapshots.peek(&parent) else {
+        let Some(parent_state) = self.snapshots.peek(&parent) else {
             return Outcome::Ignored(format!("no pre-state for the parent {parent}"));
         };
+        let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
+        let slot = block.message.slot;
         let window = PRE_STATE_EPOCHS * E::slots_per_epoch();
-        if block.message.slot.saturating_sub(pre.slot) > window {
-            let why = format!(
-                "block slot {} is more than {window} slots after the parent state slot {}",
-                block.message.slot, pre.slot
+        let advanced;
+        let pre = if slot.saturating_sub(parent_state.slot) <= window {
+            parent_state
+        } else {
+            // On the clock of the runtime, as the deadline.
+            let out_of_time = || {
+                let _context = runtime.enter();
+                Instant::now() >= deadline
+            };
+            let config = &self.config;
+            let walk = |state: &mut BeaconState<E>, to: Slot| {
+                process_empty_slots(state, to, parent_state, config, &verdict)
+            };
+            let walked = advance(
+                &mut self.advanced,
+                parent,
+                parent_state,
+                slot,
+                &out_of_time,
+                &walk,
             );
-            return self.refused.refuse(block_root, None, Outcome::Ignored(why));
-        }
+            advanced = match walked {
+                Ok(state) => state,
+                // No proof about the block, so the refusal is not kept.
+                Err(why) => return Outcome::Ignored(why),
+            };
+            &advanced
+        };
         // The slot loop can add a validator, but not an active one: its activation waits for
         // the finality of a later epoch than the one that added it, and the loop has no new
-        // attestations to finalize that epoch. So an index past the registry of the parent is
-        // never the proposer, and `process_block_header` refuses it after the slot loop.
+        // attestations to finalize that epoch. So an index past the registry of the pre-state
+        // is never the proposer, and `process_block_header` refuses it after the slot loop.
         // Refused here, it costs no slot loop.
         let proposer = block.message.proposer_index;
         if !usize::try_from(proposer).is_ok_and(|index| index < pre.validators.len()) {
             let invalid = Outcome::Invalid(StfError::UnknownValidator(proposer));
             return self.refused.refuse(block_root, None, invalid);
         }
-        let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
         // The gossip order: the signature of the proposer before the slot loop, so that a
         // block that its proposer did not sign costs one VerifyBls call and no slot loop.
         match check_proposer_signature(pre, block, &verdict) {

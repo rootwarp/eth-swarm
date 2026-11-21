@@ -15,13 +15,14 @@
 #[allow(dead_code)]
 mod support;
 
+use cl_chain::core::advance::Advanced;
 use cl_chain::core::snapshot::PRE_STATE_EPOCHS;
-use cl_chain::core::{ChainCore, Head, Outcome};
+use cl_chain::core::{ChainCore, Head, Outcome, MAX_ADVANCED_STATES, MAX_ADVANCE_EPOCHS};
 use cl_chain::import::block::PermitAll;
 use cl_chain::verify::client::UnixClock;
 use consensus_types::common::PendingDeposit;
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{BLSPubkey, Bytes32, Epoch};
+use consensus_types::primitives::{BLSPubkey, Bytes32, Epoch, Root};
 use consensus_types::{EthSpec, Minimal};
 use crypto_bls::{eth_aggregate_pubkeys, PublicKey};
 use network_config::ChainConfig;
@@ -55,9 +56,70 @@ fn window() -> u64 {
     PRE_STATE_EPOCHS * epoch_slots()
 }
 
-/// The most slots between the start of a walk and the block: eight epochs.
+/// The most slots between the start of a walk and the block.
 fn cap() -> u64 {
-    8 * epoch_slots()
+    MAX_ADVANCE_EPOCHS * epoch_slots()
+}
+
+fn root(byte: u8) -> Root {
+    Root::repeat_byte(byte)
+}
+
+#[test]
+fn the_walk_bounds_are_eight_epochs_and_sixty_four_states() {
+    assert_eq!(MAX_ADVANCE_EPOCHS, 8);
+    assert_eq!(cap(), 64);
+    assert_eq!(MAX_ADVANCED_STATES, 64);
+}
+
+#[test]
+fn the_latest_kept_state_is_of_the_parent_and_not_past_the_epoch() {
+    let mut kept = Advanced::new(8);
+    kept.insert(root(1), 1, 11u64);
+    kept.insert(root(1), 3, 13);
+    kept.insert(root(1), 5, 15);
+    kept.insert(root(2), 4, 24);
+    assert_eq!(kept.latest(&root(1), 4), Some(&13));
+    assert_eq!(kept.latest(&root(1), 9), Some(&15));
+    assert_eq!(kept.latest(&root(1), 0), None);
+    assert_eq!(kept.latest(&root(2), 9), Some(&24));
+    assert_eq!(kept.latest(&root(3), 9), None);
+    assert_eq!(kept.peek(&root(1), 3), Some(&13));
+    assert_eq!(kept.peek(&root(1), 4), None);
+}
+
+#[test]
+fn the_kept_states_are_bounded_and_the_least_recent_goes_first() {
+    let mut kept = Advanced::new(3);
+    kept.insert(root(1), 1, 11u64);
+    kept.insert(root(1), 2, 12);
+    kept.insert(root(2), 1, 21);
+    // A start of a walk makes the state the most recent.
+    assert_eq!(kept.latest(&root(1), 1), Some(&11));
+    kept.insert(root(3), 1, 31);
+    assert_eq!(kept.len(), 3, "the bound must hold");
+    assert_eq!(
+        kept.peek(&root(1), 2),
+        None,
+        "the least recent must go first"
+    );
+    assert_eq!(kept.peek(&root(1), 1), Some(&11));
+    assert_eq!(kept.peek(&root(2), 1), Some(&21));
+    // A peek does not change the order of use.
+    assert_eq!(kept.peek(&root(2), 1), Some(&21));
+    kept.insert(root(4), 1, 41);
+    assert_eq!(kept.peek(&root(2), 1), None);
+    // An insert of a kept key replaces it, and the bound holds.
+    kept.insert(root(4), 1, 42);
+    assert_eq!(kept.len(), 3);
+    assert_eq!(kept.peek(&root(4), 1), Some(&42));
+    for byte in 5..40 {
+        kept.insert(root(byte), 1, u64::from(byte));
+    }
+    assert_eq!(kept.len(), 3);
+    assert_eq!(kept.peek(&root(39), 1), Some(&39), "the newest must stay");
+    assert!(!kept.is_empty());
+    assert_eq!(Advanced::<u64>::new(0).len(), 0);
 }
 
 /// The wall clock of the fixture chain.

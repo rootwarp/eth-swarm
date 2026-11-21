@@ -26,6 +26,10 @@
 //! the same backend, before the slot loop of the transition (the gossip order). The transition
 //! then checks it again with the other sets of the block.
 //!
+//! The pre-state is the post-state of the parent, or that state after [`process_empty_slots`]
+//! to a slot before the block: the walk of the chain core toward a block far after its parent.
+//! The walk sends its deposit verdicts through the same backend.
+//!
 //! Before it returns the post-state, the import asks a [`PayloadImportGate`] about the payload
 //! bid of the block. A refusal is IGNORE. The chain core has no gate until one is set, and
 //! commits nothing without one; a later check of the execution status of the payload will plug
@@ -34,10 +38,11 @@
 use crate::verify::client::BlsOutcome;
 use crate::verify::pubkey_feed::{builder_signer, BuilderFeed};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{BLSPubkey, Epoch, Hash32, Root};
+use consensus_types::primitives::{BLSPubkey, Epoch, Hash32, Root, Slot};
 use crypto_bls::{eth_aggregate_pubkeys, PublicKey};
 use ethswarm_proto::verify::{BlsSet, KeyNamespace, Signer, VerifyOrigin};
 use network_config::ChainConfig;
+use state_transition::per_slot::process_slots;
 use state_transition::signatures::verify_block_signature;
 use state_transition::{
     state_root, state_transition, AggregationError, BackendError, BlsContext, Preset,
@@ -90,9 +95,9 @@ pub enum NotImported {
     Ignored(String),
 }
 
-/// Imports `block` on `pre`, the post-state of its parent (see the module docs). `verdict`
-/// gives one cl-verify verdict for a batch of sets, or none. `gate` can refuse the payload bid
-/// of the block (IGNORE).
+/// Imports `block` on `pre`, the post-state of its parent or that state after
+/// [`process_empty_slots`] (see the module docs). `verdict` gives one cl-verify verdict for a
+/// batch of sets, or none. `gate` can refuse the payload bid of the block (IGNORE).
 pub fn import_block<E: Preset>(
     pre: &BeaconState<E>,
     block: &SignedBeaconBlock<E>,
@@ -100,24 +105,12 @@ pub fn import_block<E: Preset>(
     verdict: &dyn Fn(Vec<BlsSet>) -> BlsOutcome,
     gate: &dyn PayloadImportGate,
 ) -> Result<Imported<E>, NotImported> {
-    let capella_fork_version = config
-        .capella_fork_version()
-        .map_err(|e| NotImported::Ignored(format!("network config: {e}")))?;
-    let schedule = |epoch: Epoch| config.get_blob_parameters(epoch).max_blobs_per_block;
-    let backend = ClVerify {
-        keys: pre,
-        builders: BuilderFeed::new(),
-        verdict,
-    };
-    let bls = BlsContext {
-        backend: &backend,
-        aggregator: &Aggregator,
-        genesis_fork_version: config.genesis_fork_version(),
-        capella_fork_version,
-        blob_schedule: &schedule,
-    };
     let mut post = pre.clone();
-    match state_transition(&mut post, block, true, &bls) {
+    let applied = with_bls(pre, config, verdict, |bls| {
+        state_transition(&mut post, block, true, bls)
+    })
+    .map_err(NotImported::Ignored)?;
+    match applied {
         Ok(()) => {}
         Err(e) if e.proves_invalid() => return Err(NotImported::Invalid(e)),
         Err(e) => return Err(NotImported::Ignored(e.to_string())),
@@ -143,14 +136,16 @@ pub fn import_block<E: Preset>(
     })
 }
 
-/// Checks the proposer signature of `block` on `pre`, the post-state of its parent, before the
+/// Checks the proposer signature of `block` on `pre`, the pre-state of its import, before the
 /// slot loop: the registry key of `proposer_index` in `pre`, and the proposer domain of the
 /// epoch of the block (`block_proposer_signature_set`). The set goes to cl-verify alone,
 /// through `verdict`. An INVALID verdict is [`StfError::InvalidBlockSignature`]; no verdict is
 /// IGNORE.
 ///
-/// `pre` gives the fork version of the domain, so the check is right only while no fork comes
-/// between the parent and the block. The core imports Gloas blocks on Gloas states only.
+/// `pre` is the post-state of the parent, or that state after [`process_empty_slots`] to the
+/// slot before the block. It gives the fork version of the domain, so the check is right only
+/// while no fork comes between `pre` and the block. The core imports Gloas blocks on Gloas
+/// states only.
 pub fn check_proposer_signature<E: Preset>(
     pre: &BeaconState<E>,
     block: &SignedBeaconBlock<E>,
@@ -166,6 +161,50 @@ pub fn check_proposer_signature<E: Preset>(
         Err(e) if e.proves_invalid() => Err(NotImported::Invalid(e)),
         Err(e) => Err(NotImported::Ignored(e.to_string())),
     }
+}
+
+/// Runs `process_slots(state, slot)` over the empty slots after the post-state of a parent:
+/// the walk of the chain core toward a block far after that parent. `keys` gives the keys of
+/// the signers. At each epoch boundary, the deposit verdicts that the boundary needs go to
+/// cl-verify through `verdict`, one call for each deposit. verify.v1 has no signer for a key
+/// that is not in the registry, so such a deposit has no verdict yet. No error of the walk is
+/// a proof about a block: each is `Err`, why for the log (IGNORE).
+pub fn process_empty_slots<E: Preset>(
+    state: &mut BeaconState<E>,
+    slot: Slot,
+    keys: &BeaconState<E>,
+    config: &ChainConfig,
+    verdict: &dyn Fn(Vec<BlsSet>) -> BlsOutcome,
+) -> Result<(), String> {
+    with_bls(keys, config, verdict, |bls| process_slots(state, slot, bls))?
+        .map_err(|e| format!("the empty slots before the block: {e}"))
+}
+
+/// Runs `f` with the BLS context of an import on the network of `config`: each batch of sets
+/// goes to cl-verify through `verdict`, with the keys of `keys`. `Err` if the network config
+/// lacks a value of the context.
+fn with_bls<E: Preset, R>(
+    keys: &BeaconState<E>,
+    config: &ChainConfig,
+    verdict: &dyn Fn(Vec<BlsSet>) -> BlsOutcome,
+    f: impl FnOnce(&BlsContext) -> R,
+) -> Result<R, String> {
+    let capella_fork_version = config
+        .capella_fork_version()
+        .map_err(|e| format!("network config: {e}"))?;
+    let schedule = |epoch: Epoch| config.get_blob_parameters(epoch).max_blobs_per_block;
+    let backend = ClVerify {
+        keys,
+        builders: BuilderFeed::new(),
+        verdict,
+    };
+    Ok(f(&BlsContext {
+        backend: &backend,
+        aggregator: &Aggregator,
+        genesis_fork_version: config.genesis_fork_version(),
+        capella_fork_version,
+        blob_schedule: &schedule,
+    }))
 }
 
 /// The signature backend of an import: each batch goes to cl-verify through `verdict`.
