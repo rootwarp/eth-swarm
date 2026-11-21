@@ -9,7 +9,7 @@ use cl_chain::core::{queue, ChainCore, Head, Outcome};
 use cl_chain::import::block::PermitAll;
 use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::Root;
+use consensus_types::primitives::{Domain, Root};
 use consensus_types::signing::{compute_signing_root, DOMAIN_BEACON_PROPOSER};
 use consensus_types::{EthSpec, Minimal};
 use ethswarm_proto::verify::{BlsSet, KeyNamespace, Signer};
@@ -239,14 +239,24 @@ pub fn slot_start(f: &Fixture, slot: u64) -> u128 {
 /// registry key of `proposer_index`, and the signing root in the proposer domain of the epoch
 /// of the block.
 pub fn proposer_set(pre: &BeaconState<Minimal>, block: &SignedBeaconBlock<Minimal>) -> BlsSet {
+    let epoch = Minimal::epoch_at_slot(block.message.slot);
+    let domain = get_domain(pre, DOMAIN_BEACON_PROPOSER, Some(epoch));
+    proposer_set_in(pre, block, domain)
+}
+
+/// The proposer set of `block` with the registry key of `proposer_index` in `keys`, and the
+/// signing root in `domain`.
+pub fn proposer_set_in(
+    keys: &BeaconState<Minimal>,
+    block: &SignedBeaconBlock<Minimal>,
+    domain: Domain,
+) -> BlsSet {
     let proposer = block.message.proposer_index;
-    let key = pre
+    let key = keys
         .validators
         .get(usize::try_from(proposer).unwrap())
         .unwrap()
         .pubkey;
-    let epoch = Minimal::epoch_at_slot(block.message.slot);
-    let domain = get_domain(pre, DOMAIN_BEACON_PROPOSER, Some(epoch));
     BlsSet {
         signers: vec![Signer {
             validator_index: proposer,
