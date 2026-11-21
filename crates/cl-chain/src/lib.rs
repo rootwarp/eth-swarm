@@ -28,14 +28,15 @@
 //!
 //! [`core`] is the chain core: the single writer thread of the chain state, with its bounded
 //! queues (block import first, then envelope, then gossip commit) and its pre-states. It
-//! imports a block through [`import`] and commits it only on a VALID VerifyBls verdict and a
-//! post-state root equal to `block.state_root`. It verifies an envelope's payload through
-//! cl-verify and the EL's newPayload verdict, and imports nothing once the EL contradicts
-//! itself. Nothing in the service runs it yet.
+//! imports a block through [`import`] and commits it only on a VALID VerifyBls verdict, a
+//! post-state root equal to `block.state_root` and its fork choice store taking the block. It
+//! verifies an envelope's payload through cl-verify and the EL's newPayload verdict, sends
+//! forkchoiceUpdated for its fork choice head, and imports and sends nothing once the EL
+//! contradicts itself. Nothing in the service runs it yet.
 //!
 //! [`engine`] is cl-chain's side of `ethswarm.engine.v1`: the forkchoiceUpdated arguments and
 //! their ordered, latest-wins sender, and the newPayload client and the execution statuses that
-//! the chain core uses. Nothing calls the sender yet.
+//! the chain core uses.
 //!
 //! [`da::custody`] owns the node's custody group count: never decreasing, stored in the column
 //! env, advertised through the MetaData and the ENR, and the column subnets cl-p2p subscribes.

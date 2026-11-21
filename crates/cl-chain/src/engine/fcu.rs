@@ -50,8 +50,8 @@ impl Bid {
     }
 }
 
-/// The fork choice state the arguments come from. The fork choice store implements it once it
-/// exists; until then, tests use views built by hand.
+/// The fork choice state the arguments come from: the chain core's store
+/// ([`crate::core::ChainCore`]), or a view built by hand in tests.
 pub trait ForkchoiceView {
     /// The head node: its block root and its payload status. A Fulu head is FULL.
     fn head(&self) -> (Root, PayloadStatus);
@@ -74,6 +74,14 @@ pub struct ForkchoiceArgs {
     pub finalized_block_hash: Hash32,
     /// `custodyColumns`: the SSZ `CustodyColumnBits`.
     pub custody_columns: [u8; CUSTODY_COLUMN_BYTES],
+}
+
+/// Where the chain core sends forkchoiceUpdated arguments: [`FcuSender`] over engine.v1.
+///
+/// [`FcuSender`]: super::client::FcuSender
+pub trait ForkchoiceSink: Send {
+    /// Sends `args`, without a wait for the EL.
+    fn send(&self, args: ForkchoiceArgs);
 }
 
 impl ForkchoiceArgs {

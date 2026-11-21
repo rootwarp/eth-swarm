@@ -1,6 +1,6 @@
-//! The chain core: the single writer of cl-chain's chain state ([`actor`]), its pre-states
-//! ([`snapshot`]), its walks over empty slots ([`advance`]), the blocks it refused (`seen`) and
-//! the hooks of its envelope import (`envelope`).
+//! The chain core: the single writer of cl-chain's chain state and fork choice ([`actor`]), its
+//! pre-states ([`snapshot`]), its walks over empty slots ([`advance`]), the blocks it refused
+//! (`seen`) and the hooks of its envelope import (`envelope`).
 
 pub mod actor;
 pub mod advance;

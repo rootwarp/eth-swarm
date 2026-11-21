@@ -6,6 +6,7 @@
 //! A fake cl-verify behind `BlsVerifier` gives the VerifyBls verdicts.
 
 use cl_chain::core::{queue, ChainCore, Head, Outcome};
+use cl_chain::engine::fcu::PayloadStatus;
 use cl_chain::import::block::PermitAll;
 use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{
@@ -142,8 +143,8 @@ pub fn fixture() -> Fixture {
     }
 }
 
-/// [`anchored`] with the payload of the anchor verified (`ChainCore::with_payload_verified`),
-/// and no payload gate.
+/// [`anchored`] with the payload of the anchor verified ([`PayloadVerified`]), and no payload
+/// gate.
 ///
 /// The export's blocks on the anchor build on its FULL payload: their bid's
 /// `parent_block_hash` is the anchor bid's `block_hash` (both zero). Its envelope cannot verify:
@@ -158,6 +159,22 @@ pub fn ungated_fixture() -> Fixture {
     }
 }
 
+/// A core with the payload of a block verified in its fork choice store, as if its envelope
+/// imported: `fork_choice::testing::mark_payload_verified` through the test seam
+/// `ChainCore::with_fork_choice`.
+pub trait PayloadVerified {
+    /// The same core with the payload of block `block_root` verified.
+    fn with_payload_verified(self, block_root: Root) -> Self;
+}
+
+impl PayloadVerified for ChainCore<Minimal> {
+    fn with_payload_verified(self, block_root: Root) -> Self {
+        self.with_fork_choice(|store| {
+            fork_choice::testing::mark_payload_verified(store, block_root);
+        })
+    }
+}
+
 /// The core of `ChainCore::from_anchor`, with [`VERIFY_TIMEOUT`], no payload gate and no
 /// verified payload.
 pub fn anchored() -> Fixture {
@@ -168,10 +185,12 @@ pub fn anchored() -> Fixture {
         .write(dir.path())
         .unwrap();
     let loaded = load_anchor::<Minimal>(dir.path()).expect("the anchor must load");
+    // No payload is verified yet: the head is the EMPTY node of the anchor.
     let anchor = Head {
         block_root: loaded.block_root(),
         slot: loaded.slot(),
         state_root: loaded.state_root(),
+        payload_status: PayloadStatus::Empty,
     };
     let (state, block) = loaded.into_parts();
     let core = ChainCore::from_anchor(state, block, pinned.config.clone())

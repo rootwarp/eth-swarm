@@ -14,7 +14,7 @@ use consensus_types::gloas::SignedBeaconBlock;
 use consensus_types::primitives::{Bytes32, Root};
 use consensus_types::{Mainnet, Minimal};
 use state_transition::StfError;
-use support::{export_block, fixture, import_one, Answer};
+use support::{export_block, fixture, import_one, Answer, PayloadVerified};
 use tree_hash::TreeHash;
 
 /// The block type of the fixture.
@@ -198,7 +198,7 @@ async fn a_committed_child_makes_its_parent_the_most_recent() {
 
 #[tokio::test]
 async fn an_evicted_committed_block_again_is_ignored_and_the_head_stays() {
-    let (core, first, _, _) = full_core().await;
+    let (core, first, _, siblings) = full_core().await;
     let first_root = first.message.tree_hash_root();
     // One more commit removes the least recently used pre-state: the one of the first block.
     let (core, last) = sibling(core, &first, 0xff).await;
@@ -208,8 +208,15 @@ async fn an_evicted_committed_block_again_is_ignored_and_the_head_stays() {
         core.state(&first_root).is_none(),
         "the pre-state of the first block must be gone"
     );
+    // Fork choice still holds each sibling. They build on the FULL node of the anchor, with no
+    // votes and no proposer boost (the system clock is far past slot 1): the highest root wins.
     let head = core.head();
-    assert_eq!(head.block_root, last_root);
+    let highest = siblings
+        .iter()
+        .chain([&first_root, &last_root])
+        .max()
+        .unwrap();
+    assert_eq!(head.block_root, *highest);
     let (outcome, core, verify) = import_one(core, first, Answer::Valid).await;
     assert!(
         matches!(outcome, Outcome::Ignored(_)),
