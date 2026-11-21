@@ -36,13 +36,15 @@ use el::{
     sealed, step, Block, El, Item,
 };
 use ethswarm_proto::engine as pb;
-use fork_choice::testing::{remove_checkpoint_state, set_finalized_checkpoint};
+use fork_choice::testing::{
+    remove_checkpoint_state, set_finalized_checkpoint, set_justified_checkpoint,
+};
 use fork_choice::{get_head, is_payload_verified};
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use support::{fixture, Answer, FakeVerify, Fixture};
+use support::{fixture, Answer, FakeVerify, Fixture, PayloadVerified};
 use testkit::mock_el::Reply;
 
 /// Any custody set: each forkchoiceUpdated carries it as configured.
@@ -958,10 +960,8 @@ async fn an_invalid_below_the_finalized_execution_hash_is_an_el_contradiction() 
 /// The `later` core with `c` committed, and its payload `0x32`, which the EL takes
 /// optimistically, imported. With `twin`, a sibling of `c` with the same payload is committed
 /// with `c`, and returned. If the head is the FULL node of `c`, the EL answers `fcu_answer` to its
-/// forkchoiceUpdated, and the core has not taken the answer yet. Then fork choice finalizes `c`
-/// (a test seam stands for a finalizing chain): the finalized execution hash, the
-/// `finalizedBlockHash` the core sends, is the payload of `p`, `0x31`.
-async fn finalized_on_the_payload_of_p(
+/// forkchoiceUpdated, and the core has not taken the answer yet.
+async fn with_the_payload_of_c(
     fcu_answer: Reply,
     twin: bool,
 ) -> (Later, Option<(Block, BeaconState<Minimal>)>) {
@@ -987,11 +987,26 @@ async fn finalized_on_the_payload_of_p(
         assert_eq!(full.head_block_hash, hash(0x32));
         t.sink.answered(&full).await;
     }
+    t.core = core;
+    (t, twin)
+}
+
+/// [`with_the_payload_of_c`], then fork choice finalizes `c` (a test seam stands for a
+/// finalizing chain): the finalized execution hash, the `finalizedBlockHash` the core sends, is
+/// the payload of `p`, `0x31`.
+async fn finalized_on_the_payload_of_p(
+    fcu_answer: Reply,
+    twin: bool,
+) -> (Later, Option<(Block, BeaconState<Minimal>)>) {
+    let (mut t, twin) = with_the_payload_of_c(fcu_answer, twin).await;
+    let (c, _) = &t.c;
     let finalized = Checkpoint {
         epoch: 1,
         root: root(c),
     };
-    t.core = core.with_fork_choice(|store| set_finalized_checkpoint(store, finalized));
+    t.core = t
+        .core
+        .with_fork_choice(|store| set_finalized_checkpoint(store, finalized));
     assert_eq!(
         bid(c).parent_block_hash,
         hash(0x31),
@@ -1132,4 +1147,163 @@ async fn an_fcu_invalid_block_hash_is_a_protocol_fault_that_halts_and_records_no
     assert!(is_payload_verified(core.fork_choice(), root(p)));
     tokio::time::sleep(QUIET).await;
     assert_eq!(t.el.forkchoice_updates().len(), updates);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The justified checkpoint on an invalid payload, and a later INVALID that changes nothing.
+
+/// `outcome`, the answer to a forkchoiceUpdated, as INVALID with `latest_valid_hash`.
+fn invalid_answer(mut outcome: FcuOutcome, latest_valid_hash: Hash32) -> FcuOutcome {
+    outcome.response.status = Some(pb::PayloadStatus {
+        status: pb::PayloadStatusKind::Invalid as i32,
+        latest_valid_hash: latest_valid_hash.0.to_vec(),
+        validation_error: String::new(),
+    });
+    outcome
+}
+
+/// The `later` core where the EL took the payload of `p` optimistically, with `c` on that FULL
+/// payload committed. Fork choice finalizes `p` and justifies `c` (test seams stand for a
+/// finalizing chain), so the finalized execution hash is the execution parent of the payload of
+/// `p`. Then the EL answers INVALID to the forkchoiceUpdated of that payload, with that
+/// execution parent as `latestValidHash`: honest, as it is not below the finalized execution
+/// hash. The justified block builds on a payload that the EL found invalid, and `get_head`
+/// starts there (`bellatrix/optimistic-sync.md`, Re-Orgs: the justified checkpoint becomes
+/// `INVALIDATED`). The core fails closed: it sets the EL contradiction and halts the sender, and
+/// the head, the store and the forkchoiceUpdated calls stay as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_payload_below_the_justified_checkpoint_halts_and_moves_nothing() {
+    let t = later(Reply::Syncing, |_| Reply::Syncing).await;
+    let (p, p_post) = &t.p;
+    let (c, _) = &t.c;
+    let fcu = t.sink.fcu.as_ref().unwrap();
+    let answer = fcu
+        .take_outcome()
+        .expect("the answer to the forkchoiceUpdated of p");
+    assert_eq!(answer.args.head_block_hash, hash(0x31));
+    let core = commit_all(t.core, &[c], &t.verify).await;
+    assert_eq!(core.head(), head_of(c, PayloadStatus::Empty));
+    let finalized = Checkpoint {
+        epoch: 1,
+        root: root(p),
+    };
+    let justified = Checkpoint {
+        epoch: 2,
+        root: root(c),
+    };
+    let core = core.with_fork_choice(|store| {
+        set_finalized_checkpoint(store, finalized);
+        set_justified_checkpoint(store, justified);
+    });
+    let execution_parent = p_post.latest_block_hash;
+    assert_eq!(
+        bid(p).parent_block_hash,
+        execution_parent,
+        "the finalized execution hash"
+    );
+    el_sees(&t.el, t.sink.sent().last().unwrap()).await;
+    let updates = t.el.forkchoice_updates().len();
+    let before = seen(&core, &t.sink);
+
+    t.sink.script(invalid_answer(answer, execution_parent));
+    let (outcome, core) = step(core, Item::Gossip, &t.verify).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    let statuses = core.execution_statuses();
+    assert_eq!(statuses.status(&hash(0x31)), Some(ExecutionStatus::Invalid));
+    assert!(
+        statuses.el_contradiction(),
+        "the justified checkpoint builds on an invalid payload"
+    );
+    assert!(t.sink.halted(), "the core halts the sender");
+    assert_eq!(seen(&core, &t.sink), before, "the head and the store stay");
+    assert!(is_payload_verified(core.fork_choice(), root(p)));
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(t.el.forkchoice_updates().len(), updates);
+}
+
+/// Fork choice justifies `c` (a test seam stands for a justifying chain), and the EL answers
+/// INVALID to the forkchoiceUpdated of the FULL head `c`, with the payload of `p` as
+/// `latestValidHash`: only the justified block's own payload is invalid. `get_head` can stay on
+/// the EMPTY node of `c`, so this is no contradiction: the core does not halt, the payload of `c`
+/// leaves the store, and the head moves to the EMPTY node of `c` with one forkchoiceUpdated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_payload_of_the_justified_block_alone_moves_the_head_to_its_empty_node() {
+    let at_p = Reply::Invalid {
+        lvh: Some(hash(0x31).0),
+    };
+    let (mut t, _) = with_the_payload_of_c(at_p, false).await;
+    let (p, _) = &t.p;
+    let (c, _) = &t.c;
+    assert_eq!(t.core.head(), head_of(c, PayloadStatus::Full));
+    let justified = Checkpoint {
+        epoch: 1,
+        root: root(c),
+    };
+    t.core = t
+        .core
+        .with_fork_choice(|store| set_justified_checkpoint(store, justified));
+    let sent = t.sink.sent().len();
+
+    let (outcome, core) = step(t.core, Item::Gossip, &t.verify).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    let statuses = core.execution_statuses();
+    assert!(!statuses.el_contradiction());
+    assert!(!t.sink.halted(), "the sender must not halt");
+    assert_eq!(
+        [0x31, 0x32].map(|n| statuses.status(&hash(n))),
+        [Some(ExecutionStatus::Valid), Some(ExecutionStatus::Invalid)]
+    );
+    assert!(!is_payload_verified(core.fork_choice(), root(c)));
+    assert!(is_payload_verified(core.fork_choice(), root(p)));
+    assert_eq!(core.head(), head_of(c, PayloadStatus::Empty));
+    let all = t.sink.sent();
+    assert_eq!(all.len(), sent + 1, "one forkchoiceUpdated: {all:?}");
+    let last = all[sent];
+    assert_eq!(
+        (last.head_block_hash, last.safe_block_hash),
+        (hash(0x31), hash(0x31))
+    );
+    el_sees(&t.el, &last).await;
+}
+
+/// A later INVALID that changes no status of the table does not scan the store. The EL answers
+/// INVALID to the forkchoiceUpdated of the FULL head `p`: the payload of `p` is Invalid, it
+/// leaves the store, and the head moves to the EMPTY node of `p`. A test seam puts the payload
+/// back, as a store that still has it, and the core takes the same answer again. The payload is
+/// Invalid already, so no status changed and the payload stays: a scan would take it out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_invalid_that_changes_no_status_does_not_scan_the_store() {
+    let t = later(Reply::Syncing, |_| Reply::Syncing).await;
+    let (p, p_post) = &t.p;
+    let fcu = t.sink.fcu.as_ref().unwrap();
+    let answer = fcu
+        .take_outcome()
+        .expect("the answer to the forkchoiceUpdated of p");
+    let answer = invalid_answer(answer, p_post.latest_block_hash);
+    t.sink.script(answer.clone());
+    let (outcome, core) = step(t.core, Item::Gossip, &t.verify).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    assert_eq!(
+        core.execution_statuses().status(&hash(0x31)),
+        Some(ExecutionStatus::Invalid)
+    );
+    assert!(
+        !is_payload_verified(core.fork_choice(), root(p)),
+        "a new Invalid scans the store"
+    );
+    assert_eq!(core.head(), head_of(p, PayloadStatus::Empty));
+
+    let core = core.with_payload_verified(root(p));
+    let sent = t.sink.sent();
+    t.sink.script(answer);
+    let (outcome, core) = step(core, Item::Gossip, &t.verify).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    assert!(!core.execution_statuses().el_contradiction());
+    assert!(!t.sink.halted());
+    assert!(
+        is_payload_verified(core.fork_choice(), root(p)),
+        "no status changed, so the store must not be scanned"
+    );
+    assert_eq!(core.head(), head_of(p, PayloadStatus::Empty));
+    assert_eq!(t.sink.sent(), sent, "no forkchoiceUpdated");
 }

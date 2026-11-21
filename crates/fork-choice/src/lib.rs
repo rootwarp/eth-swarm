@@ -434,9 +434,10 @@ impl From<AttestationError> for Error {
 /// Test seams. Only tests may enable them: the feature `testing` is for dev-dependencies.
 /// They change the store without the checks of the handlers that they stand for:
 /// `mark_payload_verified` stands for `on_execution_payload_envelope`, so that a test needs
-/// no envelope, `set_finalized_checkpoint` for a finalizing chain, `remove_checkpoint_state`
-/// for a checkpoint state that `store_target_checkpoint_state` did not store, and the others
-/// let a test set a weight without the committees of an attestation.
+/// no envelope, `set_finalized_checkpoint` and `set_justified_checkpoint` for a finalizing or
+/// a justifying chain, `remove_checkpoint_state` for a checkpoint state that
+/// `store_target_checkpoint_state` did not store, and the others let a test set a weight
+/// without the committees of an attestation.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use crate::{LatestMessage, Store};
@@ -448,6 +449,21 @@ pub mod testing {
     /// chain finalizes it.
     pub fn set_finalized_checkpoint<E: Preset>(store: &mut Store<E>, checkpoint: Checkpoint) {
         store.finalized_checkpoint = checkpoint;
+    }
+
+    /// Sets `store.justified_checkpoint` to `checkpoint`, as `update_checkpoints` does when a
+    /// chain justifies it. If the store has no state of that checkpoint, it keeps the post-state
+    /// of its block as one, so that `get_head` can run: the spec's state is that post-state
+    /// advanced to the first slot of the epoch (`store_target_checkpoint_state`).
+    pub fn set_justified_checkpoint<E: Preset>(store: &mut Store<E>, checkpoint: Checkpoint) {
+        if let Some(state) = store.block_states.get(&checkpoint.root) {
+            let key = crate::store::key(&checkpoint);
+            store
+                .checkpoint_states
+                .entry(key)
+                .or_insert_with(|| state.clone());
+        }
+        store.justified_checkpoint = checkpoint;
     }
 
     /// Removes `store.checkpoint_states[checkpoint]`, as a store where

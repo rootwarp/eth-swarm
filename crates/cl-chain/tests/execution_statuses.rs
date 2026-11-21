@@ -584,6 +584,40 @@ fn an_fcu_invalid_block_hash_is_an_el_contradiction_that_records_nothing() {
     }
 }
 
+/// Finality at 2 prunes 1 and 2 from the table. INVALID with a `latestValidHash` as the answer
+/// to a forkchoiceUpdated whose head is 2, the finalized payload that the table no longer has,
+/// calls that payload invalid: an EL contradiction, and it records nothing. The same answer for
+/// a head that the table does not have and that is not finalized (9) is no contradiction, and
+/// records nothing either.
+#[test]
+fn an_fcu_invalid_for_the_pruned_finalized_payload_is_an_el_contradiction_that_records_nothing() {
+    let finalized_at_2 = || {
+        let mut statuses = ExecutionStatuses::new();
+        chain(&mut statuses, &[(1, 0, VALID), (2, 1, OPT), (3, 2, OPT)]);
+        statuses.prune_finalized(&hash(2));
+        assert_eq!(
+            statuses_of(&statuses, [1, 2, 3]),
+            [None, None, Some(Optimistic)],
+            "finality pruned 1 and 2"
+        );
+        statuses
+    };
+    for (head, contradiction) in [(2, true), (9, false)] {
+        let mut statuses = finalized_at_2();
+        assert_eq!(
+            statuses.record_head(hash(head), &invalid(Some(hash(1)))),
+            None
+        );
+        assert_eq!(statuses.el_contradiction(), contradiction, "head {head}");
+        assert_eq!(
+            statuses_of(&statuses, [1, 2, 3, 9]),
+            [None, None, Some(Optimistic), None],
+            "head {head} records nothing"
+        );
+        assert_eq!(statuses.len(), 1);
+    }
+}
+
 /// INVALID with a `null` `latestValidHash` is the Engine API's answer to a payload that does not
 /// hash to the `block_hash` that it claims (`shanghai.md`, from `engine_newPayloadV2`), and a
 /// tampered envelope can claim the hash of an honest payload. So it records nothing: a hash with
@@ -702,6 +736,44 @@ fn an_evicted_invalid_payload_keeps_its_latest_valid_hash_wait() {
         statuses_of(&statuses, [31, 32, 33]),
         [Some(Valid), Some(Invalid), Some(Invalid)],
         "the boundary of the evicted 33 must apply"
+    );
+    assert!(!statuses.el_contradiction());
+}
+
+/// 33 on the missing 32 is Invalid, and its boundary 9 waits for 32. Then 33 loses its full
+/// entry to `MAX_INVALID_PAYLOADS` newer Invalid payloads. A later INVALID for the evicted 33
+/// with `latestValidHash` 31 must replace the wait it keeps: when 32 is recorded, the boundary
+/// 31 applies. 32 must become Invalid and 31 Valid. With the old wait for 9, the walk up from 32
+/// would not find its boundary, and 31 and 32 would stay Optimistic.
+#[test]
+fn an_evicted_invalid_payload_takes_the_wait_of_a_later_latest_valid_hash() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[
+            (31, 30, OPT),
+            (33, 32, OPT),
+            (33, 32, invalid(Some(hash(9)))),
+        ],
+    );
+    for i in 0..u32::try_from(MAX_INVALID_PAYLOADS).unwrap() {
+        statuses.record(wide(i), hash(0xfe), &invalid(Some(hash(0xfe))));
+    }
+    assert_eq!(statuses.len(), MAX_INVALID_PAYLOADS + 1, "33 is evicted");
+    assert_eq!(
+        statuses.record(hash(33), hash(32), &invalid(Some(hash(31)))),
+        Some(Invalid)
+    );
+    assert_eq!(statuses.len(), MAX_INVALID_PAYLOADS + 1, "33 stays evicted");
+    assert_eq!(
+        statuses_of(&statuses, [31, 32, 33]),
+        [Some(Optimistic), None, Some(Invalid)]
+    );
+    assert_eq!(statuses.record(hash(32), hash(31), &OPT), Some(Invalid));
+    assert_eq!(
+        statuses_of(&statuses, [31, 32, 33]),
+        [Some(Valid), Some(Invalid), Some(Invalid)],
+        "the later boundary of the evicted 33 must apply"
     );
     assert!(!statuses.el_contradiction());
 }
