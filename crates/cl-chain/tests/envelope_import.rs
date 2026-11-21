@@ -347,6 +347,15 @@ fn envelope(config: &ChainConfig, block: &Block, post: &State) -> Item {
     Item::Envelope(Box::new(envelope_of(block, post, config)))
 }
 
+/// INVALID for the payload of the envelope of a block whose post-state is `post`, with that
+/// payload's execution parent as `latestValidHash`: the table records the payload `Invalid`. (A
+/// `null` one records nothing.)
+fn invalid_on(post: &State) -> Reply {
+    Reply::Invalid {
+        lvh: Some(post.latest_block_hash.0),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Envelope import.
 
@@ -407,9 +416,9 @@ async fn a_valid_answer_verifies_the_payload_and_a_block_on_it_commits() {
     assert_eq!(el.new_payloads().len(), 1);
 }
 
-/// An INVALID answer rejects the envelope and records its payload `Invalid`. A block whose bid
-/// builds on that payload, or claims it, is then IGNORE before cl-verify, and the core keeps no
-/// refusal of it.
+/// An INVALID answer with a `latestValidHash` rejects the envelope and records its payload
+/// `Invalid`. A block whose bid builds on that payload, or claims it, is then IGNORE before
+/// cl-verify, and the core keeps no refusal of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invalid_answer_rejects_the_envelope_and_refuses_blocks_on_its_payload_hash() {
     let el = El::start().await;
@@ -427,7 +436,7 @@ async fn an_invalid_answer_rejects_the_envelope_and_refuses_blocks_on_its_payloa
     let Fixture { core, config, .. } = f;
     let verify = FakeVerify::new(Answer::Valid);
     let core = commit_all(ready(core, &el), &[&p], &verify).await;
-    el.answer(hash(0x41), Reply::Invalid { lvh: None });
+    el.answer(hash(0x41), invalid_on(&post));
     let roots = [root(&p), root(&claims), root(&builds_on)];
     let before = observe(&core, &roots);
 
@@ -489,7 +498,7 @@ async fn a_syncing_answer_is_optimistic_and_not_permitted_on_an_invalid_parent()
     let core = commit_all(core, &[&c], &verify).await;
 
     // The EL finds that payload INVALID, through the envelope of the sibling.
-    el.answer(hash(0x51), Reply::Invalid { lvh: None });
+    el.answer(hash(0x51), invalid_on(&sibling_post));
     let (outcome, core) = step(core, envelope(&config, &sibling, &sibling_post), &verify).await;
     assert!(
         matches!(outcome, Outcome::InvalidEnvelope(_)),
@@ -515,6 +524,105 @@ async fn a_syncing_answer_is_optimistic_and_not_permitted_on_an_invalid_parent()
     assert!(!statuses.el_contradiction());
     assert!(!core.payload_verified(&root(&c)));
     assert_eq!(observe(&core, &roots), before);
+}
+
+/// A payload verified on SYNCING stays as the table has it when its envelope comes again: that
+/// envelope is IGNORE, with no VerifyBls call and no newPayload, also when the EL would now
+/// answer VALID. Its status changes only through a later verdict on a descendant or a later
+/// fork-choice update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_optimistic_payload_is_not_checked_again_by_its_envelope() {
+    let el = El::start().await;
+    let f = fixture();
+    let (p, post) = payload_block(&f, 0x56, 1);
+    let Fixture { core, config, .. } = f;
+    let verify = FakeVerify::new(Answer::Valid);
+    let core = commit_all(ready(core, &el), &[&p], &verify).await;
+    el.answer(hash(0x56), Reply::Syncing);
+    let (outcome, core) = step(core, envelope(&config, &p, &post), &verify).await;
+    assert_eq!(
+        outcome,
+        Outcome::PayloadVerified {
+            block_root: root(&p)
+        }
+    );
+    assert_eq!(
+        core.execution_statuses().status(&hash(0x56)),
+        Some(ExecutionStatus::Optimistic)
+    );
+
+    el.answer(hash(0x56), Reply::Valid);
+    let roots = [root(&p)];
+    let before = observe(&core, &roots);
+    let calls = verify.calls().len();
+    let (outcome, core) = step(core, envelope(&config, &p, &post), &verify).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    assert_eq!(verify.calls().len(), calls, "no VerifyBls call");
+    assert_eq!(el.new_payloads(), vec![hash(0x56)], "no second newPayload");
+    let statuses = core.execution_statuses();
+    assert_eq!(
+        statuses.status(&hash(0x56)),
+        Some(ExecutionStatus::Optimistic)
+    );
+    assert!(!statuses.el_contradiction());
+    assert_eq!(observe(&core, &roots), before);
+}
+
+/// INVALID with a `null` `latestValidHash` is the Engine API's answer to a payload that does not
+/// hash to the `block_hash` that it claims. A tampered envelope can keep the claimed hash and each
+/// field that the bid binds, and change one that it does not. That answer refuses that envelope
+/// only: the table records no status for the hash and no EL contradiction, and the core state
+/// does not change. The honest envelope of the block then imports on VALID, and a block on its
+/// FULL payload commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tampered_envelope_answered_invalid_with_null_leaves_the_honest_payload_importable() {
+    let el = El::start().await;
+    let f = fixture();
+    let (p, post) = payload_block(&f, 0xc1, 1);
+    let (c, _) = full_child(&f, &p, &post, 0xc2);
+    let Fixture { core, config, .. } = f;
+    let verify = FakeVerify::new(Answer::Valid);
+    let core = commit_all(ready(core, &el), &[&p], &verify).await;
+    let honest = envelope_of(&p, &post, &config);
+    let mut tampered = honest.clone();
+    tampered.message.payload.extra_data = vec![0xee; 4].try_into().unwrap();
+    tampered.message.payload.gas_used = 21_000;
+    assert_eq!(tampered.message.payload.block_hash, hash(0xc1));
+    assert_ne!(tampered, honest);
+
+    el.answer(hash(0xc1), Reply::Invalid { lvh: None });
+    let roots = [root(&p), root(&c)];
+    let before = observe(&core, &roots);
+    let (outcome, core) = step(core, Item::Envelope(Box::new(tampered)), &verify).await;
+    assert!(
+        matches!(outcome, Outcome::InvalidEnvelope(_) | Outcome::Ignored(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        el.new_payloads(),
+        vec![hash(0xc1)],
+        "the tampered payload passes the bid checks and reaches the EL"
+    );
+    let statuses = core.execution_statuses();
+    assert_eq!(statuses.status(&hash(0xc1)), None, "no status for the hash");
+    assert!(!statuses.el_contradiction());
+    assert_eq!(observe(&core, &roots), before, "no core state changes");
+
+    el.answer(hash(0xc1), Reply::Valid);
+    let (outcome, core) = step(core, Item::Envelope(Box::new(honest)), &verify).await;
+    assert_eq!(
+        outcome,
+        Outcome::PayloadVerified {
+            block_root: root(&p)
+        }
+    );
+    assert_eq!(el.new_payloads(), vec![hash(0xc1), hash(0xc1)]);
+    let statuses = core.execution_statuses();
+    assert_eq!(statuses.status(&hash(0xc1)), Some(ExecutionStatus::Valid));
+    assert!(!statuses.el_contradiction());
+    assert!(core.payload_verified(&root(&p)));
+
+    commit_all(core, &[&c], &verify).await;
 }
 
 /// No verdict is IGNORE and records nothing: no cl-engine at the socket, an EL that drops the
@@ -703,8 +811,8 @@ struct Contradicted {
 }
 
 /// Two committed siblings with the same payload hash, and a third committed block with another.
-/// The EL answers VALID to the envelope of the first, and then INVALID to the same payload,
-/// through the envelope of the second: it calls a VALID payload INVALID.
+/// The EL answers VALID to the envelope of the first, and then INVALID with a `latestValidHash` to
+/// the same payload, through the envelope of the second: it calls a VALID payload INVALID.
 async fn contradicted() -> Contradicted {
     let el = El::start().await;
     let f = fixture();
@@ -725,7 +833,7 @@ async fn contradicted() -> Contradicted {
     assert!(!core.execution_statuses().el_contradiction());
     let roots = vec![root(&first), root(&second), root(&pending.0), root(&child)];
     let before = observe(&core, &roots);
-    el.answer(hash(0x71), Reply::Invalid { lvh: None });
+    el.answer(hash(0x71), invalid_on(&second_post));
     let (outcome, core) = step(core, envelope(&config, &second, &second_post), &verify).await;
     Contradicted {
         el,
@@ -859,7 +967,7 @@ async fn each_refused_path_leaves_the_core_state_as_it_was() {
             "an envelope that the EL finds INVALID",
             envelope(&config, &bad, &bad_post),
             Answer::Valid,
-            Some((hash(0xa3), Reply::Invalid { lvh: None })),
+            Some((hash(0xa3), invalid_on(&bad_post))),
         ),
         (
             "a block on an INVALID payload",
@@ -871,7 +979,7 @@ async fn each_refused_path_leaves_the_core_state_as_it_was() {
             "the answer that sets the EL contradiction",
             envelope(&config, &second, &second_post),
             Answer::Valid,
-            Some((hash(0xa1), Reply::Invalid { lvh: None })),
+            Some((hash(0xa1), invalid_on(&second_post))),
         ),
         (
             "an envelope after the EL contradiction",

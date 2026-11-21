@@ -124,8 +124,10 @@
 //! no fork choice store). In order:
 //!
 //! - the EL contradicted itself: IGNORE;
-//! - the payload of `beacon_block_root` is verified, or that block is not committed with a
-//!   pre-state: IGNORE;
+//! - the payload of `beacon_block_root` is verified, an optimistic one (SYNCING or ACCEPTED)
+//!   included, or that block is not committed with a pre-state: IGNORE. Its envelope sent again
+//!   does not check that payload again: its status changes only through a later verdict on a
+//!   descendant or a later fork-choice update;
 //! - no data availability check ([`ChainCore::with_data_availability`]) is set, or the data is
 //!   not available: IGNORE;
 //! - no engine ([`ChainCore::with_engine`]) is set: IGNORE;
@@ -140,6 +142,9 @@
 //!
 //! An imported envelope makes its block's payload verified (VALID, or SYNCING or ACCEPTED: the
 //! table keeps which). A refused one changes nothing but the record of a verdict the EL gave.
+//! INVALID with a `null` `latestValidHash` says that this payload does not hash to the
+//! `block_hash` it claims, so it records nothing: it refuses that envelope only, and the honest
+//! envelope of the block can still import.
 //!
 //! An EL contradiction (a VALID payload called INVALID, or the other way round) stays: the spec
 //! asks for manual intervention. From the answer that sets it, that envelope included, each
@@ -905,6 +910,7 @@ impl<E: Preset> ChainCore<E> {
             return Outcome::Ignored(EL_CONTRADICTION.into());
         }
         let root = signed.message.beacon_block_root;
+        // An optimistic payload too: its envelope sent again does not check it again.
         if self.payload_verified.contains(&root) {
             return Outcome::Ignored(format!("the payload of block {root} is already verified"));
         }

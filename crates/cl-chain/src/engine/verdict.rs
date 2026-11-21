@@ -4,10 +4,10 @@
 //! - **The map** ([`map`], execution-apis `paris.md` L99-118): `VALID` is [`ElVerdict::Valid`]
 //!   only if its `latestValidHash` is the submitted payload's `block_hash` (`paris.md`, payload
 //!   validation, rule 3), else [`Reason::Malformed`]; `INVALID` is [`ElVerdict::Invalid`] with
-//!   `latestValidHash` as given, `null` included; `INVALID_BLOCK_HASH` is
-//!   [`Reason::InvalidBlockHash`], whatever its `latestValidHash`; `SYNCING` and `ACCEPTED` are
-//!   [`ElVerdict::Optimistic`]. It reads one reply: two contradicting replies for one payload are
-//!   the caller's to reconcile.
+//!   `latestValidHash` as given, `null` included (the table records nothing for `null`);
+//!   `INVALID_BLOCK_HASH` is [`Reason::InvalidBlockHash`], whatever its `latestValidHash`;
+//!   `SYNCING` and `ACCEPTED` are [`ElVerdict::Optimistic`]. It reads one reply: two
+//!   contradicting replies for one payload are the caller's to reconcile.
 //! - **Fail closed.** A status this client cannot name, a reply that breaks the contract, an
 //!   error from cl-engine, a failed call and a timeout are [`ElVerdict::NotVerified`], never
 //!   `Valid`: [`map_json`] for the Engine API JSON, [`map_proto`] for engine.v1, where
@@ -33,7 +33,9 @@ pub enum ElVerdict {
     /// `INVALID`, with `latestValidHash` as the EL gave it. `INVALID_BLOCK_HASH` is not this:
     /// see [`Reason::InvalidBlockHash`].
     Invalid {
-        /// `latestValidHash`: `None` when the EL sent `null`.
+        /// `latestValidHash`: `None` when the EL sent `null`. Then the payload sent does not hash
+        /// to the `block_hash` it claims, which says nothing of the payload that has this hash:
+        /// [`ExecutionStatuses::record`] records nothing for it.
         latest_valid_hash: Option<Hash32>,
     },
     /// `SYNCING` or `ACCEPTED`: not verified yet, and not refuted.
@@ -183,9 +185,10 @@ pub enum ExecutionStatus {
     Valid,
     /// Imported on `SYNCING` or `ACCEPTED`, and not `VALID` or `INVALID` yet.
     Optimistic,
-    /// The EL answered `INVALID` for it, or it is in the invalid part of the chain of such an
-    /// answer, or it descends from an `Invalid` payload. `INVALID_BLOCK_HASH` never makes a
-    /// payload `Invalid` ([`Reason::InvalidBlockHash`]).
+    /// The EL answered `INVALID` with a `latestValidHash` for it, or it is in the invalid part of
+    /// the chain of such an answer, or it descends from an `Invalid` payload. `INVALID` with a
+    /// `null` `latestValidHash` and `INVALID_BLOCK_HASH` never make a payload `Invalid`
+    /// ([`Reason::InvalidBlockHash`]).
     Invalid,
 }
 
@@ -252,10 +255,14 @@ enum Walk {
 ///   An `Invalid` payload, or an `Invalid` ancestor on that walk, stays `Invalid`: an EL
 ///   contradiction.
 /// - `Optimistic` makes a payload with no status `Optimistic`, and leaves `Valid` alone.
-/// - `Invalid` makes the payload and every recorded `Optimistic` descendant `Invalid`. A `Valid`
-///   one stays `Valid`: an EL contradiction. `INVALID` is final (`paris.md` L114): a later
-///   `Valid` or `Optimistic` leaves it `Invalid`. A payload recorded on an `Invalid` one is
-///   `Invalid` whatever its verdict: its parent MUST NOT be `INVALIDATED`.
+/// - `Invalid` with a `latestValidHash` makes the payload and every recorded `Optimistic`
+///   descendant `Invalid`. A `Valid` one stays `Valid`: an EL contradiction. `INVALID` is final
+///   (`paris.md` L114): a later `Valid` or `Optimistic` leaves it `Invalid`. A payload recorded
+///   on an `Invalid` one is `Invalid` whatever its verdict: its parent MUST NOT be `INVALIDATED`.
+/// - `Invalid` with a `null` `latestValidHash` records nothing and sets no EL contradiction,
+///   like `NotVerified` below. The Engine API gives it for a payload that does not hash to the
+///   `block_hash` it claims (`shanghai.md`, from `engine_newPayloadV2`), and a tampered envelope
+///   can claim the hash of an honest payload. The import gate still refuses that envelope.
 /// - The `latestValidHash` of an `Invalid` sets a boundary ("How to apply `latestValidHash`
 ///   when payload status is `INVALID`"). The walk goes up every recorded ancestor: an `Invalid`
 ///   one (an earlier walk of the same boundary, or evicted) does not hide a boundary above it,
@@ -264,9 +271,9 @@ enum Walk {
 ///   descendants become `Invalid` as above, and the `latestValidHash` payload and its
 ///   `Optimistic` ancestors become `Valid`. For the zero hash, `invalidBlock` is the first
 ///   execution payload of the chain, and the table knows none above the topmost of the walk, so
-///   that one is. For `null`, or a hash the walk does not find, only the payload is. A walk
-///   that stops at a payload that is not recorded waits for it, and so does a `latestValidHash`
-///   payload that is not recorded yet.
+///   that one is. For a hash the walk does not find, only the payload is. A walk that stops at a
+///   payload that is not recorded waits for it, and so does a `latestValidHash` payload that is
+///   not recorded yet.
 /// - A payload recorded after its children links up with them: a `Valid` child makes it `Valid`
 ///   (with its `Optimistic` ancestors), an `Invalid` one passes `Invalid` down to them, and a
 ///   boundary below it that waited for it is applied again.
@@ -301,14 +308,19 @@ impl ExecutionStatuses {
     }
 
     /// Records `verdict` for the payload `block_hash` whose parent is `parent_hash` (see the
-    /// type docs), and returns the payload's status after it.
+    /// type docs), and returns the payload's status after it. `NotVerified` and `INVALID` with a
+    /// `null` `latestValidHash` record nothing: they return the status the payload already had.
     pub fn record(
         &mut self,
         block_hash: Hash32,
         parent_hash: Hash32,
         verdict: &ElVerdict,
     ) -> Option<ExecutionStatus> {
-        if let ElVerdict::NotVerified(_) = verdict {
+        if let ElVerdict::NotVerified(_)
+        | ElVerdict::Invalid {
+            latest_valid_hash: None,
+        } = verdict
+        {
             return self.status(&block_hash);
         }
         let new = self.get(&block_hash).is_none();
@@ -332,11 +344,17 @@ impl ExecutionStatuses {
         }
         match verdict {
             ElVerdict::Valid => self.make_valid(block_hash),
-            ElVerdict::Invalid { latest_valid_hash } => {
+            ElVerdict::Invalid {
+                latest_valid_hash: Some(boundary),
+            } => {
                 self.invalidate(block_hash);
-                self.apply_boundary(block_hash, *latest_valid_hash);
+                self.apply_boundary(block_hash, *boundary);
             }
-            ElVerdict::Optimistic | ElVerdict::NotVerified(_) => {}
+            ElVerdict::Invalid {
+                latest_valid_hash: None,
+            }
+            | ElVerdict::Optimistic
+            | ElVerdict::NotVerified(_) => {}
         }
         if new {
             self.link(block_hash);
@@ -507,12 +525,9 @@ impl ExecutionStatuses {
         }
     }
 
-    /// Applies `latest_valid_hash`, the boundary of an `INVALID` for the payload `hash` (see the
+    /// Applies `boundary`, the `latestValidHash` of an `INVALID` for the payload `hash` (see the
     /// type docs).
-    fn apply_boundary(&mut self, hash: Hash32, latest_valid_hash: Option<Hash32>) {
-        let Some(boundary) = latest_valid_hash else {
-            return;
-        };
+    fn apply_boundary(&mut self, hash: Hash32, boundary: Hash32) {
         let Some((_, mut at)) = self.get(&hash) else {
             return;
         };
@@ -573,7 +588,7 @@ impl ExecutionStatuses {
             self.make_valid(hash);
         }
         for (waiting, boundary) in self.waiting_below(hash) {
-            self.apply_boundary(waiting, Some(boundary));
+            self.apply_boundary(waiting, boundary);
         }
     }
 

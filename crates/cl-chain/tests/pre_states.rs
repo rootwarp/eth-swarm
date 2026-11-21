@@ -223,3 +223,32 @@ async fn an_evicted_committed_block_again_is_ignored_and_the_head_stays() {
     assert!(core.state(&first_root).is_none());
     assert_eq!(core.pre_states(), max_pre_states::<Minimal>());
 }
+
+/// A block's payload stays verified only while the core holds its pre-state: the commit that
+/// evicts that pre-state from the LRU also drops the block from the verified payloads. The block
+/// stays committed, and a block whose pre-state stays keeps its verified payload.
+#[tokio::test]
+async fn an_evicted_pre_state_drops_its_verified_payload() {
+    let (core, first, _, siblings) = full_core().await;
+    let first_root = first.message.tree_hash_root();
+    let anchor_root = first.message.parent_root;
+    let kept = *siblings.last().unwrap();
+    let core = core
+        .with_payload_verified(first_root)
+        .with_payload_verified(kept);
+    assert!(core.payload_verified(&first_root));
+    // One more commit removes the least recently used pre-state: the one of the first block.
+    let (core, last) = sibling(core, &first, 0xff).await;
+    let core = commit(core, last).await;
+    assert!(
+        core.state(&first_root).is_none(),
+        "the pre-state of the first block must be gone"
+    );
+    assert!(
+        !core.payload_verified(&first_root),
+        "its payload must not stay verified"
+    );
+    assert!(core.is_committed(&first_root), "it must stay committed");
+    assert!(core.payload_verified(&kept));
+    assert!(core.payload_verified(&anchor_root), "the anchor stays");
+}
