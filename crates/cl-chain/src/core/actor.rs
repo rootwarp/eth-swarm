@@ -433,6 +433,22 @@ impl<E: Preset> ChainCore<E> {
         self
     }
 
+    /// The same core that keeps `state` as the state of a walk from the parent `parent_root` at
+    /// the last slot of epoch `epoch - 1` (see [`advance`](super::advance)), in place of an
+    /// earlier one. A test seam: a later walk from that parent can start from `state`, as from a
+    /// state that a walk kept.
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_advanced_state(
+        mut self,
+        parent_root: Root,
+        epoch: Epoch,
+        state: BeaconState<E>,
+    ) -> Self {
+        self.advanced.insert(parent_root, epoch, state);
+        self
+    }
+
     /// The last block the core committed, or the anchor.
     pub fn head(&self) -> Head {
         self.head
