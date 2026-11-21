@@ -69,7 +69,8 @@ pub enum Reason {
     /// says nothing of the payload that has this hash, which can be an honest one (a tampered
     /// envelope can claim it), so it is no verdict on it. Its `latestValidHash` does not count
     /// either: `paris.md` requires `null` with this status, and one from a faulty EL must not
-    /// move a boundary.
+    /// move a boundary. As the answer to a forkchoiceUpdated it is a protocol fault
+    /// ([`ExecutionStatuses::record_head`]).
     InvalidBlockHash,
 }
 
@@ -277,10 +278,11 @@ enum Walk {
 /// - A payload recorded after its children links up with them: a `Valid` child makes it `Valid`
 ///   (with its `Optimistic` ancestors), an `Invalid` one passes `Invalid` down to them, and a
 ///   boundary below it that waited for it is applied again.
-/// - A boundary at or below the finalized payload of the last
-///   [`ExecutionStatuses::prune_finalized`] is an EL contradiction: an `INVALID` for that payload,
-///   or a walk that reaches it (its `latestValidHash` is that payload, an ancestor or the zero
-///   hash). Finality makes those payloads valid. The zero hash finalizes no payload.
+/// - Finality makes the finalized payload of the last [`ExecutionStatuses::prune_finalized`] (the
+///   `finalizedBlockHash`) and its ancestors valid. A `latestValidHash` equal to that payload is
+///   the ordinary boundary above. An `INVALID` for that payload is an EL contradiction, and so is
+///   a walk that reaches it before the boundary: a `latestValidHash` strictly below it, or the
+///   zero hash. The zero hash finalizes no payload.
 /// - `NotVerified` records nothing: a payload without a status stays without one, and an
 ///   earlier status stays as it is.
 ///
@@ -372,7 +374,13 @@ impl ExecutionStatuses {
     /// [`Self::record`] for `verdict`, the answer to a forkchoiceUpdated with the head `head`,
     /// with the parent hash the table has for it. A head without one records nothing, but an
     /// `INVALID` with a `latestValidHash` for the finalized payload is an EL contradiction.
+    /// [`Reason::InvalidBlockHash`] is a newPayload status that a forkchoiceUpdated must not
+    /// answer: a protocol fault, so an EL contradiction, and it records nothing for `head`.
     pub fn record_head(&mut self, head: Hash32, verdict: &ElVerdict) -> Option<ExecutionStatus> {
+        if *verdict == ElVerdict::NotVerified(Reason::InvalidBlockHash) {
+            self.contradiction = true;
+            return self.status(&head);
+        }
         if let Some((_, parent)) = self.get(&head) {
             return self.record(head, parent, verdict);
         }
@@ -462,9 +470,10 @@ impl ExecutionStatuses {
     /// Whether the EL has contradicted itself since the table was made: it called a `Valid`
     /// payload invalid (an `INVALID` for it, or a boundary or a descendant cascade that reaches
     /// it), a finalized one invalid (see the type docs), or an `Invalid` payload valid (a `VALID`
-    /// for it or a descendant, or a `latestValidHash` that names it). The statuses stay as they
-    /// were (see the type docs). It stays `true`: the spec asks for manual intervention, and how
-    /// cl-chain reacts is the caller's to decide.
+    /// for it or a descendant, or a `latestValidHash` that names it), or it answered a
+    /// forkchoiceUpdated with `INVALID_BLOCK_HASH` ([`Self::record_head`]). The statuses stay as
+    /// they were (see the type docs). It stays `true`: the spec asks for manual intervention, and
+    /// how cl-chain reacts is the caller's to decide.
     #[must_use]
     pub fn el_contradiction(&self) -> bool {
         self.contradiction
@@ -555,18 +564,24 @@ impl ExecutionStatuses {
         let Some((_, mut at)) = self.get(&hash) else {
             return;
         };
+        // An INVALID for the finalized payload, whatever its boundary.
+        if self.finalized == Some(hash) {
+            self.contradiction = true;
+            return;
+        }
         let zero = boundary == Hash32::ZERO;
         // The topmost recorded ancestor the walk passed: `invalidBlock` when the walk finds the
         // boundary, and for the zero hash.
         let mut top = None;
         let mut seen = HashSet::new();
         let end = loop {
-            if self.finalized.is_some_and(|f| f == hash || f == at) {
-                self.contradiction = true;
-                return;
-            }
+            // The boundary first: one at the finalized payload is honest.
             if !zero && at == boundary {
                 break Walk::Found;
+            }
+            if self.finalized == Some(at) {
+                self.contradiction = true;
+                return;
             }
             match self.get(&at) {
                 Some((_, parent)) if seen.insert(at) => {

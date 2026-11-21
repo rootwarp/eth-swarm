@@ -22,10 +22,13 @@
 //!   would be refused again.
 //! - **Answers.** The response, `PayloadStatus` included, goes to the caller as it is
 //!   ([`FcuSender::outcomes`], and once each through [`ForkchoiceSink::take_outcome`]), an
-//!   `EngineError` other than the retried ones too. This module reads no verdict from it.
+//!   `EngineError` other than the retried ones too. This module reads no verdict from it. It
+//!   reads the status only to keep an unread `INVALID` or `INVALID_BLOCK_HASH` (with no
+//!   `EngineError`) for `take_outcome`: a later answer does not replace it.
 //! - **Halt** ([`ForkchoiceSink::halt`]). The arguments not taken yet go, a lost call is not put
-//!   back, a call taken but not sent yet is not sent, and the task ends. The chain core halts it
-//!   when the EL contradicts itself.
+//!   back, no later call is sent, and the task ends. The halt is not atomic with a send: a call
+//!   already on its way, or taken just before the halt, can still go out and be answered. The
+//!   chain core halts it when the EL contradicts itself.
 //! - **Metrics.** `chain_fcu_sent_total` (calls sent), `chain_fcu_coalesced_total`, and
 //!   `chain_fcu_errors_total{kind}` ([`FcuErrorKind`]).
 
@@ -243,6 +246,48 @@ impl Slot {
     }
 }
 
+/// The answers [`ForkchoiceSink::take_outcome`] has not given yet.
+#[derive(Default)]
+struct Unread {
+    /// The latest answer.
+    latest: Option<FcuOutcome>,
+    /// The first `INVALID` or `INVALID_BLOCK_HASH` answer: a later answer does not replace it.
+    invalid: Option<FcuOutcome>,
+}
+
+impl Unread {
+    /// Keeps `outcome`, the newest answer.
+    fn put(&mut self, outcome: FcuOutcome) {
+        if self.invalid.is_none() && is_invalid(&outcome.response) {
+            self.invalid = Some(outcome.clone());
+        }
+        self.latest = Some(outcome);
+    }
+
+    /// The unread `INVALID` or `INVALID_BLOCK_HASH` answer first, else the latest: each once.
+    fn take(&mut self) -> Option<FcuOutcome> {
+        let Some(invalid) = self.invalid.take() else {
+            return self.latest.take();
+        };
+        if self.latest.as_ref().is_some_and(|l| l.seq == invalid.seq) {
+            self.latest = None;
+        }
+        Some(invalid)
+    }
+}
+
+/// A status of `INVALID` or `INVALID_BLOCK_HASH`, with no `EngineError`.
+fn is_invalid(response: &pb::ForkchoiceUpdatedResponse) -> bool {
+    use pb::PayloadStatusKind as Kind;
+    response.error.is_none()
+        && response.status.as_ref().is_some_and(|status| {
+            matches!(
+                Kind::try_from(status.status),
+                Ok(Kind::Invalid | Kind::InvalidBlockHash)
+            )
+        })
+}
+
 /// Why a call has no outcome for the caller.
 enum Failed {
     /// Lost on the way to the EL: retried after the backoff.
@@ -259,6 +304,7 @@ struct Task {
     slot: Arc<Slot>,
     metrics: FcuMetrics,
     outcomes: watch::Sender<Option<FcuOutcome>>,
+    unread: Arc<Mutex<Unread>>,
     client: Option<EngineServiceClient<Channel>>,
 }
 
@@ -269,6 +315,7 @@ impl Task {
             match self.call(args).await {
                 Ok(outcome) => {
                     backoff = BACKOFF_MIN;
+                    lock_unread(&self.unread).put(outcome.clone());
                     self.outcomes.send_replace(Some(outcome));
                 }
                 Err(Failed::Refused) => backoff = BACKOFF_MIN,
@@ -306,7 +353,8 @@ impl Task {
                 }
             }
         };
-        // Halted while it connected: the call does not go out.
+        // Halted while it connected: the call does not go out. A halt after this check does not
+        // stop it.
         if self.slot.halted() {
             return Err(Failed::Refused);
         }
@@ -362,8 +410,7 @@ pub struct FcuSender {
     slot: Arc<Slot>,
     metrics: FcuMetrics,
     outcomes: watch::Receiver<Option<FcuOutcome>>,
-    /// The `seq` of the latest answer [`ForkchoiceSink::take_outcome`] gave, 0 before the first.
-    taken: AtomicU64,
+    unread: Arc<Mutex<Unread>>,
     task: JoinHandle<()>,
 }
 
@@ -380,6 +427,7 @@ impl FcuSender {
     ) -> Self {
         let slot = Arc::new(Slot::default());
         let (outcomes_tx, outcomes) = watch::channel(None);
+        let unread = Arc::default();
         let task = Task {
             socket: socket.into(),
             expected_uid,
@@ -387,13 +435,14 @@ impl FcuSender {
             slot: Arc::clone(&slot),
             metrics: metrics.clone(),
             outcomes: outcomes_tx,
+            unread: Arc::clone(&unread),
             client: None,
         };
         Self {
             slot,
             metrics,
             outcomes,
-            taken: AtomicU64::new(0),
+            unread,
             task: tokio::spawn(task.run()),
         }
     }
@@ -405,7 +454,8 @@ impl FcuSender {
         }
     }
 
-    /// The latest answered call, `None` before the first.
+    /// The latest answered call, `None` before the first. Unlike
+    /// [`ForkchoiceSink::take_outcome`], it does not keep an unread `INVALID`.
     #[must_use]
     pub fn outcomes(&self) -> watch::Receiver<Option<FcuOutcome>> {
         self.outcomes.clone()
@@ -418,14 +468,7 @@ impl ForkchoiceSink for FcuSender {
     }
 
     fn take_outcome(&self) -> Option<FcuOutcome> {
-        let latest = self.outcomes.borrow();
-        let seq = latest.as_ref()?.seq;
-        // The task answers in `seq` order, so a newer answer has a higher `seq`.
-        if self.taken.fetch_max(seq, Ordering::Relaxed) < seq {
-            latest.clone()
-        } else {
-            None
-        }
+        lock_unread(&self.unread).take()
     }
 
     fn halt(&self) {
@@ -759,6 +802,10 @@ impl<E: EthSpec> NewPayload<E> for NewPayloadClient {
     ) -> NewPayloadFuture<'a> {
         Box::pin(Self::new_payload(self, envelope, bid))
     }
+}
+
+fn lock_unread(unread: &Mutex<Unread>) -> MutexGuard<'_, Unread> {
+    unread.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A gRPC status of a call lost on the way, after which the connection is opened again.

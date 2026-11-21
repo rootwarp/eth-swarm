@@ -83,7 +83,8 @@ pub struct ForkchoiceArgs {
 pub trait ForkchoiceSink: Send {
     /// Sends `args`, without a wait for the EL.
     fn send(&self, args: ForkchoiceArgs);
-    /// The latest answered call, if this is the first time it is taken.
+    /// An answered call, each once: an `INVALID` or `INVALID_BLOCK_HASH` answer not taken yet
+    /// first (a later answer does not replace it), else the latest if it was not taken yet.
     fn take_outcome(&self) -> Option<FcuOutcome>;
     /// Stops for good: arguments not sent yet are dropped, a lost call is not tried again, and
     /// no later call is sent. A call already on its way can still be answered.

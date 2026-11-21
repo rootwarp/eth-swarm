@@ -121,10 +121,11 @@
 //! prune at finality still runs, as it reads only the finalized checkpoint.
 //!
 //! **A later INVALID.** A newPayload verdict, or an INVALID with a `latestValidHash` that the
-//! EL answers to a forkchoiceUpdated (the core takes the sink's latest answer at the start of
-//! each turn, [`ForkchoiceSink::take_outcome`]), can make payloads `Invalid` that the store has
-//! verified. They leave the store (`invalidate_payloads`), so `get_head` offers no FULL node of
-//! their blocks, and the head moves at once, with its forkchoiceUpdated.
+//! EL answers to a forkchoiceUpdated (the core takes one answer of the sink at the start of each
+//! turn, [`ForkchoiceSink::take_outcome`]: an unread INVALID first, else the latest), can make
+//! payloads `Invalid` that the store has verified. They leave the store (`invalidate_payloads`),
+//! so `get_head` offers no FULL node of their blocks, and the head moves at once, with its
+//! forkchoiceUpdated.
 //! [`ChainCore::payload_verified`] is `true` while the store has the payload and the LRU holds
 //! the pre-state of its block; the checks of an import read the store alone
 //! (`is_payload_verified`).
@@ -134,8 +135,10 @@
 //! does not run and no forkchoiceUpdated is sent: the head and the last arguments sent stay as
 //! they were. The answer that sets it (newPayload or forkchoiceUpdated) moves nothing, and halts
 //! the sink ([`ForkchoiceSink::halt`]): queued arguments and the retries of a lost call never
-//! reach the EL, and a later answer is not read. An INVALID at or below the finalized payload is
-//! such a contradiction ([`ExecutionStatuses`]).
+//! reach the EL, and a later answer is not read. An INVALID for the finalized payload, or with a
+//! `latestValidHash` strictly below it or zero, is such a contradiction; a `latestValidHash`
+//! equal to it is not ([`ExecutionStatuses`]). So is INVALID_BLOCK_HASH as the answer to a
+//! forkchoiceUpdated, a newPayload status: a protocol fault, which records nothing.
 //!
 //! # Seen roots
 //!
@@ -208,7 +211,7 @@ use crate::engine::fcu::{
     forkchoice_args, Bid, ForkchoiceArgs, ForkchoiceSink, ForkchoiceView, PayloadStatus,
     CUSTODY_COLUMN_BYTES,
 };
-use crate::engine::verdict::{map_proto, ElVerdict, ExecutionStatus, ExecutionStatuses};
+use crate::engine::verdict::{map_proto, ElVerdict, ExecutionStatus, ExecutionStatuses, Reason};
 use crate::import::block::{
     check_proposer_signature, check_proposer_signature_in, import_block, process_empty_slots,
     schedule_proposer_domain, NotImported, PayloadImportGate,
@@ -750,8 +753,8 @@ impl<E: Preset> ChainCore<E> {
         while let Some(item) = runtime.block_on(queue.next()) {
             self.turns += 1;
             let turn = self.turns;
-            // Before the item: the finalized payload of the table, then the EL's latest answer
-            // to a forkchoiceUpdated.
+            // Before the item: the finalized payload of the table, then an answer of the EL to a
+            // forkchoiceUpdated.
             self.note_finality();
             self.fcu_answer();
             let (outcome, reply) = match item {
@@ -1145,9 +1148,11 @@ impl<E: Preset> ChainCore<E> {
         }
     }
 
-    /// The sink's latest answer to a forkchoiceUpdated, once (see [Fork choice](#fork-choice)).
-    /// Only INVALID with a `latestValidHash` for the head hash sent counts. Nothing while the
-    /// EL contradiction is set: a call already on its way when the sink halted moves nothing.
+    /// The sink's next answer to a forkchoiceUpdated, once (see [Fork choice](#fork-choice)).
+    /// Only INVALID with a `latestValidHash` for the head hash sent counts, and
+    /// INVALID_BLOCK_HASH, a protocol fault that sets the EL contradiction
+    /// ([`ExecutionStatuses::record_head`]). Nothing while the EL contradiction is set: a call
+    /// already on its way when the sink halted moves nothing.
     fn fcu_answer(&mut self) {
         if self.statuses.el_contradiction() {
             return;
@@ -1162,7 +1167,8 @@ impl<E: Preset> ChainCore<E> {
         let verdict = map_proto(status, head);
         if let ElVerdict::Invalid {
             latest_valid_hash: Some(_),
-        } = verdict
+        }
+        | ElVerdict::NotVerified(Reason::InvalidBlockHash) = verdict
         {
             self.statuses.record_head(head, &verdict);
             self.reconcile();

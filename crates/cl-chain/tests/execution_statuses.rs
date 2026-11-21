@@ -708,7 +708,8 @@ fn an_evicted_invalid_payload_keeps_its_latest_valid_hash_wait() {
 
 /// Finality at 3 drops 3 and its ancestors. An INVALID for 3, or strictly below it, is an EL
 /// contradiction: its `latestValidHash` is an ancestor of 3 (2, for 5 on 4) or the zero hash (for
-/// 5 on 4), or it is for 3 itself. A `latestValidHash` equal to 3 is not: INVALID for 4 with
+/// 5 on 4), or it is for 3 itself, also with the parent of 3 as `latestValidHash` (the boundary
+/// the walk finds first). A `latestValidHash` equal to 3 is not: INVALID for 4 with
 /// `latestValidHash` 3 is the ordinary boundary, and 4 and 5 are Invalid. Above 3 it is not
 /// either: INVALID for 5 with `latestValidHash` 4 makes 4 Valid and 5 Invalid. The finalized
 /// payload of the zero hash is no payload (`hash(0)` is the zero hash): an INVALID with the zero
@@ -730,7 +731,12 @@ fn an_invalid_for_or_strictly_below_the_finalized_payload_is_an_el_contradiction
         statuses.prune_finalized(&hash(3));
         statuses
     };
-    for (n, parent, latest_valid) in [(5, 4, hash(2)), (5, 4, Hash32::ZERO), (3, 2, hash(1))] {
+    for (n, parent, latest_valid) in [
+        (5, 4, hash(2)),
+        (5, 4, Hash32::ZERO),
+        (3, 2, hash(1)),
+        (3, 2, hash(2)),
+    ] {
         let mut statuses = finalized_at_3();
         statuses.record(hash(n), hash(parent), &invalid(Some(latest_valid)));
         assert!(
