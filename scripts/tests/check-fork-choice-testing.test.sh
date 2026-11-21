@@ -127,6 +127,32 @@ crate "$ws" user
 check fail "no fork-choice package (the check would be vacuous)" "$script" \
   "$(workspace absent user)" "exactly one fork-choice package"
 
+# A path crate outside the workspace directory is not a workspace member, but cargo builds it.
+ws="$tmp/outside"
+crate "$ws" $fc "$feature" "$defined"
+crate "$ws" user '[dependencies]' 'helper = { path = "../../outside-ext/helper" }'
+crate "$tmp/outside-ext" helper '[dependencies]' \
+  'fork-choice = { path = "../../outside/fork-choice", features = ["testing"] }'
+check fail "a path crate outside the workspace enables it" "$script" \
+  "$(workspace outside $fc user)" "fork-choice/testing enabled by helper (normal dependency)"
+
+ws="$tmp/outside-owner"
+crate "$ws" user '[dependencies]' \
+  'fork-choice = { path = "../../outside-owner-ext/fork-choice", features = ["testing"] }'
+crate "$tmp/outside-owner-ext" $fc "$feature" "$defined"
+check fail "a member enables it on a fork-choice outside the workspace" "$script" \
+  "$(workspace outside-owner user)" "fork-choice/testing enabled by user (normal dependency)"
+
+# Cargo builds no dev-dependency of a package outside the workspace.
+ws="$tmp/outside-dev"
+crate "$ws" $fc "$feature" "$defined"
+crate "$ws" user '[dev-dependencies]' 'helper = { path = "../../outside-dev-ext/helper" }'
+crate "$tmp/outside-dev-ext" helper '[dev-dependencies]' 'inner = { path = "../inner" }'
+crate "$tmp/outside-dev-ext" inner '[dependencies]' \
+  'fork-choice = { path = "../../outside-dev/fork-choice", features = ["testing"] }'
+check pass "a dev-dependency of a path crate outside the workspace is not built" "$script" \
+  "$(workspace outside-dev $fc user)" "fork-choice/testing OK"
+
 check pass "real workspace" "$script" "$repo/Cargo.toml" "fork-choice/testing OK"
 
 echo "# $passed passed, $failed failed"

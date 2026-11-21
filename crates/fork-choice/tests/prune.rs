@@ -321,6 +321,151 @@ fn a_block_on_a_dropped_branch_is_refused_and_keeps_the_store() {
     assert_eq!(get_head(&f.store), Ok(empty(f.d)));
 }
 
+/// The blocks `b` and `x` of [`finalized`]. The prune drops them.
+fn dropped_branch() -> [SignedBeaconBlock<E>; 2] {
+    let (_, anchor_block) = new_store();
+    let b = child(&anchor_block, 1, 2);
+    let x = child(&b.message, 9, 6);
+    [b, x]
+}
+
+#[test]
+fn a_dropped_block_is_a_known_block_and_keeps_the_store() {
+    let mut f = finalized();
+    tick(&mut f.store, 11);
+    let [b, x] = dropped_branch();
+    assert_eq!([root_of(&b), root_of(&x)], [f.b, f.x]);
+    let before = f.store.clone();
+    // The spec's store keeps every block, and `on_block` returns early for a known block.
+    // The parent of each block is dropped too.
+    for block in [&x, &b] {
+        let root = root_of(block);
+        assert!(f.store.block(root).is_none());
+        assert_eq!(on_block(&mut f.store, &PLAIN, block), Ok(()));
+        assert_eq!(f.store, before);
+        assert!(f.store.block(root).is_none());
+        assert!(f.store.block_or_dropped(root).is_some());
+    }
+    assert_eq!(get_head(&f.store), Ok(empty(f.d)));
+    // A new block on a dropped block is not a known block.
+    let new = child(&x.message, 11, 7);
+    assert_eq!(
+        on_block(&mut f.store, &PLAIN, &new),
+        Err(Error::UnknownParent(f.x))
+    );
+    assert_eq!(f.store, before);
+}
+
+#[test]
+fn a_forgotten_block_stays_a_known_block_and_does_not_go_back_into_the_tree() {
+    let mut f = finalized();
+    // The prune runs in epoch 1. The store keeps the dropped blocks through the end of epoch 3.
+    tick(&mut f.store, 11);
+    tick(&mut f.store, 4 * SLOTS_PER_EPOCH - 1);
+    assert!(f.store.block_or_dropped(f.x).is_some());
+    // The first tick of epoch 4 forgets them.
+    tick(&mut f.store, 4 * SLOTS_PER_EPOCH);
+    let [b, x] = dropped_branch();
+    let before = f.store.clone();
+    for block in [&x, &b] {
+        let root = root_of(block);
+        assert!(f.store.block_or_dropped(root).is_none());
+        assert_eq!(on_block(&mut f.store, &PLAIN, block), Ok(()));
+        assert_eq!(f.store, before);
+        assert!(f.store.block_or_dropped(root).is_none());
+    }
+    // A new block on a forgotten block is not a known block.
+    let new = child(&x.message, 4 * SLOTS_PER_EPOCH, 7);
+    assert_eq!(
+        on_block(&mut f.store, &PLAIN, &new),
+        Err(Error::UnknownParent(f.x))
+    );
+    assert_eq!(f.store, before);
+}
+
+#[test]
+fn a_block_that_the_store_never_had_is_not_a_known_block() {
+    let mut f = finalized();
+    tick(&mut f.store, 11);
+    tick(&mut f.store, 4 * SLOTS_PER_EPOCH);
+    assert!(f.store.block_or_dropped(f.x).is_none());
+    let before = f.store.clone();
+    // The parent of this block is not a block of the store.
+    let unknown = Root::repeat_byte(0x5a);
+    let mut orphan = child(&dropped_branch()[1].message, 4 * SLOTS_PER_EPOCH, 8);
+    orphan.message.parent_root = unknown;
+    assert_eq!(
+        on_block(&mut f.store, &PLAIN, &orphan),
+        Err(Error::UnknownParent(unknown))
+    );
+    assert_eq!(f.store, before);
+    // A new block on a kept block goes into the tree.
+    let d = f.store.block(f.d).unwrap().clone();
+    let new = child(&d, 4 * SLOTS_PER_EPOCH, 8);
+    assert_eq!(on_block(&mut f.store, &PLAIN, &new), Ok(()));
+    assert!(f.store.block(root_of(&new)).is_some());
+}
+
+/// A comb on the finalized block `a` of slot 1, all in slot 13 of epoch 1. The branch `f5` of
+/// slot 5, `f9` on `f5`, and two leaves of slot 10 on `f9` come first. Their checkpoint block
+/// of epoch 1 is `f5`, not `a`, so they are not viable. Then `c` of slot 9 on `a` justifies and
+/// finalizes epoch 1 with `a`. Then a spine of slots 10 to 13 on `c` has one more leaf on each
+/// spine block. The leaves share their ancestors, so a walk of a leaf passes blocks that the
+/// walk of an earlier leaf passed.
+#[test]
+fn the_leaves_of_a_comb_share_ancestors_and_keep_the_filtered_tree_and_the_head() {
+    let (mut store, anchor_block) = new_store();
+    tick(&mut store, 1);
+    let a = child(&anchor_block, 1, 1);
+    on_block(&mut store, &PLAIN, &a).unwrap();
+    tick(&mut store, 13);
+    let f5 = child(&a.message, 5, 2);
+    let f9 = child(&f5.message, 9, 2);
+    let f10 = [child(&f9.message, 10, 2), child(&f9.message, 10, 3)];
+    for block in [&f5, &f9, &f10[0], &f10[1]] {
+        on_block(&mut store, &PLAIN, block).unwrap();
+    }
+    let checkpoint = Checkpoint {
+        epoch: 1,
+        root: root_of(&a),
+    };
+    let c = child(&a.message, 9, 4);
+    on_block(&mut store, &finalizing(checkpoint.clone()), &c).unwrap();
+    assert_eq!(store.finalized_checkpoint(), &checkpoint);
+    store_target_checkpoint_state(&mut store, &PLAIN, &checkpoint).unwrap();
+    let mut spine = vec![c];
+    let mut leaves = Vec::new();
+    for slot in 10..=13 {
+        let parent = spine.last().unwrap().message.clone();
+        let next = child(&parent, slot, 5);
+        let leaf = child(&parent, slot, 6);
+        for block in [&next, &leaf] {
+            on_block(&mut store, &PLAIN, block).unwrap();
+        }
+        spine.push(next);
+        leaves.push(leaf);
+    }
+    let tip = root_of(spine.last().unwrap());
+    assert_eq!(store.proposer_boost_root(), tip);
+    // The viable nodes are `a`, the spine and its leaves, not the branch on `f5`.
+    let viable: std::collections::HashSet<ForkChoiceNode> = [&a]
+        .into_iter()
+        .chain(&spine)
+        .chain(&leaves)
+        .flat_map(|block| [pending(root_of(block)), empty(root_of(block))])
+        .collect();
+    assert_eq!(get_filtered_node_tree(&store), Ok(viable.clone()));
+    assert_eq!(get_head(&store), Ok(empty(tip)));
+    let before = head_and_weights(&store);
+    // The prune drops the anchor only. The walks then stop at `a`.
+    let time = store.time_ms();
+    on_tick(&mut store, time).unwrap();
+    assert!(store.block(anchor_block.tree_hash_root()).is_none());
+    assert!(store.block(root_of(&f10[1])).is_some());
+    assert_eq!(get_filtered_node_tree(&store), Ok(viable));
+    assert_eq!(head_and_weights(&store), before);
+}
+
 /// The proposer of the parent block of the boost scenario.
 const PROPOSER: u8 = 9;
 

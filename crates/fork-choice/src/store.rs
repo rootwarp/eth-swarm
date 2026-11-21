@@ -74,6 +74,11 @@ pub(crate) const PTC_TIMELINESS_INDEX: usize = 1;
 /// the end of epoch `p + 2`, and the first tick of epoch `p + 3` forgets it
 /// (`release_dropped`).
 ///
+/// `forgotten` is not a spec field. It has the roots of the dropped blocks that the store
+/// forgot (`release_dropped`), so that each block that the spec's store has is still a known
+/// block for `on_block` ([`Store::is_known_block`]). It keeps only the roots, 32 bytes for each
+/// block, and it does not forget them.
+///
 /// `children` and `ptc_timely_proposals` are not spec fields. They are indexes of `blocks`,
 /// so that head selection reads the blocks that it needs and does not scan every block for
 /// each node. `children` maps an EMPTY or a FULL node to the roots of the blocks that build
@@ -112,6 +117,7 @@ pub struct Store<E: Preset> {
     pub(crate) children: HashMap<ForkChoiceNode, Vec<Root>>,
     pub(crate) ptc_timely_proposals: BTreeMap<(Slot, ValidatorIndex), Vec<Root>>,
     pub(crate) dropped: HashMap<Root, DroppedBlock<E>>,
+    pub(crate) forgotten: HashSet<Root>,
 }
 
 /// A block that a prune dropped, and its post-state: what `validate_on_attestation`,
@@ -199,6 +205,16 @@ impl<E: Preset> Store<E> {
             Some(state) => Some(state),
             None => self.dropped.get(&root).map(|d| &d.state),
         }
+    }
+
+    /// `root in store.blocks` as the spec's store has it, which keeps every block: a block of
+    /// the store, a block that a prune dropped and the store retains, or a dropped block that
+    /// the store forgot. `on_block` returns early for such a block and does not change the
+    /// store. A forgotten block does not go back into the tree.
+    pub fn is_known_block(&self, root: Root) -> bool {
+        self.blocks.contains_key(&root)
+            || self.dropped.contains_key(&root)
+            || self.forgotten.contains(&root)
     }
 
     /// `store.checkpoint_states[checkpoint]`.
@@ -332,6 +348,7 @@ pub fn get_forkchoice_store<E: Preset>(
         children: HashMap::new(),
         ptc_timely_proposals: BTreeMap::from([(anchor_proposal, vec![anchor_root])]),
         dropped: HashMap::new(),
+        forgotten: HashSet::new(),
         justified_checkpoint,
         finalized_checkpoint,
     })
@@ -506,7 +523,8 @@ pub fn is_ancestor<E: Preset>(
 ///   and every walk up from a descendant stops at or above the finalized block.
 /// - A message for a dropped block supports no node of the subtree ([`crate::get_weight`]).
 /// - A block on a dropped block fails with [`crate::Error::UnknownParent`], where the spec's
-///   store fails the finalized descendant assert.
+///   store fails the finalized descendant assert. A dropped block itself is a known block:
+///   `on_block` returns early for it ([`Store::is_known_block`]).
 /// - The PTC-timely proposals of the previous slot and later stay, also of dropped blocks,
 ///   for the early equivocation check of a later boost.
 ///
@@ -605,7 +623,8 @@ pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
 /// for them. In that window `on_attestation` has every target of an epoch up to `p + 1`, for a
 /// vote from the wire and for a vote from a block. Then the store forgets the dropped blocks,
 /// and `on_attestation` refuses a vote that names one of them, as a block that the store does
-/// not have.
+/// not have. The store keeps the root of each forgotten block in `forgotten`, so `on_block`
+/// still returns early for it ([`Store::is_known_block`]).
 ///
 /// This is a deliberate deviation from the spec: the store does not keep the dropped blocks
 /// and their states forever. The spec's store keeps every block and takes such a vote if it
@@ -634,6 +653,7 @@ pub(crate) fn release_dropped<E: Preset>(store: &mut Store<E>) {
     store
         .checkpoint_states
         .retain(|(_, root), _| !released.contains(root));
+    store.forgotten.extend(released);
 }
 
 /// `get_checkpoint_block` (G L421-428).

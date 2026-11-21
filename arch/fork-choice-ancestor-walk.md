@@ -97,3 +97,17 @@ With the messages that the spec gives the two attesters, the head is `d`. The te
 pins the window itself: at slot 24, the first slot of epoch 3, the store takes a vote from the
 wire for the dropped block `x` with the target `(2, x)`, and the head moves from a kept child
 `e` to `d`.
+
+## Known blocks after a prune
+
+The spec's `on_block` returns early for a block in `store.blocks`, and the spec's store keeps
+every block. So `on_block` returns `Ok` and changes nothing for a block of the store, for a
+dropped block in `Store::dropped`, and for a dropped block that `release_dropped` forgot
+(`Store::is_known_block`). When the store forgets a dropped block, it keeps the root in
+`Store::forgotten`: the root only, 32 bytes, with no block and no state. The block does not
+go back into the tree. A new block on a dropped or a forgotten block still fails with
+`UnknownParent`, where the spec fails the finalized descendant assert, and a block on a root
+that the store never had fails with `UnknownParent` too. So a later gossip check can tell a
+block that the store took from a block that it never had. The store does not forget these
+roots: they grow by 32 bytes for each dropped block, until a later prune policy sets a limit.
+If a limit forgets a root, a new delivery of that block fails with `UnknownParent` again.
