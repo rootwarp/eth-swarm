@@ -36,7 +36,9 @@ use pb::engine_service_client::EngineServiceClient;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -672,6 +674,31 @@ impl NewPayloadClient {
 
     fn lock(&self) -> MutexGuard<'_, Shared> {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The future of a [`NewPayload`] call.
+pub type NewPayloadFuture<'a> = Pin<Box<dyn Future<Output = ElVerdict> + Send + 'a>>;
+
+/// The newPayload call the chain core takes: `engine_newPayloadV5` for an envelope and the bid
+/// it commits to, and the EL's verdict. [`NewPayloadClient`] is the one over engine.v1; the
+/// core is tied to no transport.
+pub trait NewPayload<E: EthSpec>: Send {
+    /// The EL's verdict on `envelope`, whose committed bid is `bid`.
+    fn new_payload<'a>(
+        &'a self,
+        envelope: &'a ExecutionPayloadEnvelope<E>,
+        bid: &'a ExecutionPayloadBid<E>,
+    ) -> NewPayloadFuture<'a>;
+}
+
+impl<E: EthSpec> NewPayload<E> for NewPayloadClient {
+    fn new_payload<'a>(
+        &'a self,
+        envelope: &'a ExecutionPayloadEnvelope<E>,
+        bid: &'a ExecutionPayloadBid<E>,
+    ) -> NewPayloadFuture<'a> {
+        Box::pin(Self::new_payload(self, envelope, bid))
     }
 }
 

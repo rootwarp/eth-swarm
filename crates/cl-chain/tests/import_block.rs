@@ -33,8 +33,8 @@ use state_transition::StfError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{
-    assert_unchanged, fixture, import_one, import_with, proposer_set, ungated_fixture, Answer,
-    FakeVerify, QUEUE, VERIFY_TIMEOUT,
+    anchored, assert_unchanged, fixture, import_one, import_with, proposer_set, some_envelope,
+    ungated_fixture, Answer, FakeVerify, QUEUE, VERIFY_TIMEOUT,
 };
 use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
 use testkit::anchor::load_anchor;
@@ -139,8 +139,9 @@ async fn queue_order() {
     let verify = FakeVerify::new(Answer::Valid);
     let (sender, queue) = queue::<Minimal>(QUEUE);
     // Each item waits in its queue before the writer starts. The import is the last to arrive.
+    // The core has no data availability check, so the envelope is IGNORE.
     let gossip = sender.gossip().unwrap();
-    let envelope = sender.envelope().unwrap();
+    let envelope = sender.envelope(some_envelope(&f)).unwrap();
     let import = sender.import(f.block).unwrap();
     let writer = f
         .core
@@ -170,8 +171,11 @@ async fn full_queue_ignores() {
         sender.import(f.block.clone()).unwrap_err(),
         SubmitError::Full
     );
-    let _envelope = sender.envelope().unwrap();
-    assert_eq!(sender.envelope().unwrap_err(), SubmitError::Full);
+    let _envelope = sender.envelope(some_envelope(&f)).unwrap();
+    assert_eq!(
+        sender.envelope(some_envelope(&f)).unwrap_err(),
+        SubmitError::Full
+    );
     let _gossip = sender.gossip().unwrap();
     assert_eq!(sender.gossip().unwrap_err(), SubmitError::Full);
     drop(queue);
@@ -298,6 +302,46 @@ async fn a_core_commits_only_with_an_explicit_payload_gate() {
     assert!(
         matches!(outcome, Outcome::Committed { .. }),
         "the explicit gate PermitAll must let the block commit: {outcome:?}"
+    );
+}
+
+/// The slot 1 block builds on the FULL payload of the anchor (its bid's `parent_block_hash` is
+/// the anchor bid's `block_hash`). A core that has not verified that payload IGNOREs it before
+/// any state processing, and keeps no refusal: it can come again once the payload is verified.
+#[tokio::test]
+async fn a_block_on_the_unverified_full_payload_of_its_parent_is_ignored_before_cl_verify() {
+    let f = anchored();
+    let block_root = f.block.message.tree_hash_root();
+    let anchor_bid = &f.core.state(&f.anchor.block_root).unwrap();
+    let anchor_bid = &anchor_bid.latest_execution_payload_bid;
+    assert_eq!(
+        f.block
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message
+            .parent_block_hash,
+        anchor_bid.block_hash,
+        "the fixture block must build on the FULL payload of the anchor"
+    );
+    let core = f.core.with_payload_gate(PermitAll);
+    let (outcome, core, verify) = import_one(core, f.block.clone(), Answer::Valid).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    assert!(
+        verify.calls().is_empty(),
+        "a block on an unverified payload must not reach cl-verify"
+    );
+    assert!(
+        !core.is_refused(&block_root),
+        "the refusal must not be kept"
+    );
+    assert_unchanged(&core, f.anchor, block_root);
+
+    let core = core.with_payload_verified(f.anchor.block_root);
+    let (outcome, _, _) = import_one(core, f.block, Answer::Valid).await;
+    assert!(
+        matches!(outcome, Outcome::Committed { .. }),
+        "once the parent payload is verified, the block must commit: {outcome:?}"
     );
 }
 

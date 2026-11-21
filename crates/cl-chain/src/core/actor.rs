@@ -1,7 +1,8 @@
 //! The chain core: the single writer of the chain state.
 //!
-//! [`ChainCore`] holds the head, the pre-states ([`Snapshots`]) and the states of its walks
-//! over empty slots ([`Advanced`]). [`ChainCore::spawn`] moves
+//! [`ChainCore`] holds the head, the pre-states ([`Snapshots`]), the states of its walks over
+//! empty slots ([`Advanced`]), the blocks whose payload is verified and the EL's verdicts
+//! ([`ExecutionStatuses`]). [`ChainCore::spawn`] moves
 //! it onto one dedicated OS thread, the only mutator of that state. The thread serves the
 //! queues of [`queue`] until each sender is gone, and then returns the core. Each queue is
 //! bounded: an item for a full queue is refused at once ([`SubmitError::Full`]), and the caller
@@ -14,6 +15,8 @@
 //! `process_slot` for each slot and the queue senders have no clock and no pre-states. A check
 //! marked *kept* keeps its refusal of the block root (see [Seen roots](#seen-roots)):
 //!
+//! - the EL contradicted itself: IGNORE (see [Envelope import](#envelope-import));
+//! - the table records the bid's `block_hash` or `parent_block_hash` `Invalid`: IGNORE;
 //! - no [`PayloadImportGate`] is set: IGNORE. [`ChainCore::from_anchor`] sets none, so a core
 //!   that misses [`ChainCore::with_payload_gate`] commits nothing
 //!   ([`PermitAll`](crate::import::block::PermitAll) is an explicit opt-in);
@@ -23,6 +26,9 @@
 //! - the core committed the block, or it is the anchor: IGNORE;
 //! - the core refused the block before and kept the refusal: the same answer again;
 //! - the parent has no pre-state: IGNORE;
+//! - the block builds on the FULL payload of its parent (`get_parent_payload_status`: the bid's
+//!   `parent_block_hash` is the `block_hash` of the bid of the parent pre-state) and that payload
+//!   is not verified: IGNORE;
 //! - the block slot is more than [`PRE_STATE_EPOCHS`] epochs of slots after the slot of the
 //!   parent pre-state: the far-parent path below, in place of the checks that follow here;
 //! - `proposer_index` is past the registry of the pre-state: INVALID, kept;
@@ -85,11 +91,12 @@
 //! and no verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state
 //! root equal to `block.state_root` and a gate that permits the payload: it makes the parent
 //! pre-state the most recently used, keeps the post-state as a pre-state, drops the kept walk
-//! states of each parent whose pre-state left the LRU, and the block becomes the head. There is
-//! no fork choice yet, so the head is the last block the core committed. There is no prune of
-//! pre-states at finality yet; when one comes, it must also drop the kept walk states of the
-//! parents that it prunes. On any other outcome the head and the pre-states do not change,
-//! their order of use included. An INVALID outcome of the transition is kept.
+//! states and the verified payload of each block whose pre-state left the LRU, and the block
+//! becomes the head. There is no fork choice yet, so the head is the last block the core
+//! committed. There is no prune of pre-states at finality yet; when one comes, it must also
+//! drop the kept walk states and the verified payloads of the parents that it prunes. On any
+//! other outcome the head and the pre-states do not change, their order of use included. An
+//! INVALID outcome of the transition is kept.
 //!
 //! # Seen roots
 //!
@@ -103,34 +110,67 @@
 //! the block and on the pre-state of its parent. A refusal for the proposer signature holds
 //! only for that signature, as the block root does not commit to it. The core does not keep no
 //! verdict (the block can come again and get a verdict in time), a parent without a pre-state
-//! (it can come), a refused payload, the wall-clock bound (the same block is in that bound
-//! once its slot comes, and that check costs no slot loop and no VerifyBls call), a caller
-//! that stopped waiting, a far-parent proposer past the registry of the parent pre-state or one
-//! that it shows slashed, exited or withdrawable, a fork of the parent pre-state or of the
-//! advanced state that is not the schedule fork, the admission budget, or a refusal of the
-//! walk: a later walk can start from a nearer state, or have more time or budget.
+//! (it can come), a refused payload, a refusal from the EL's verdicts, the wall-clock bound (the
+//! same block is in that bound once its slot comes, and that check costs no slot loop and no
+//! VerifyBls call), a caller that stopped waiting, a far-parent proposer past the registry of
+//! the parent pre-state or one that it shows slashed, exited or withdrawable, a fork of the
+//! parent pre-state or of the advanced state that is not the schedule fork, the admission
+//! budget, or a refusal of the walk: a later walk can start from a nearer state, or have more
+//! time or budget.
 //!
-//! Envelope import and gossip commit are queue kinds only: the core answers each such item
-//! IGNORE and changes nothing.
+//! # Envelope import
+//!
+//! An envelope verifies the payload of a committed block (`on_execution_payload_envelope`, with
+//! no fork choice store). In order:
+//!
+//! - the EL contradicted itself: IGNORE;
+//! - the payload of `beacon_block_root` is verified, or that block is not committed with a
+//!   pre-state: IGNORE;
+//! - no data availability check ([`ChainCore::with_data_availability`]) is set, or the data is
+//!   not available: IGNORE;
+//! - no engine ([`ChainCore::with_engine`]) is set: IGNORE;
+//! - `verify_execution_payload_envelope` on the post-state of the block. The signature goes to
+//!   cl-verify with the deadline of a block import; a failed check is REJECT, no verdict IGNORE.
+//!   Last, the newPayload call runs on the runtime of the core, which waits up to
+//!   [`ChainCore::with_engine_timeout`] ([`DEFAULT_ENGINE_TIMEOUT`]). The core records the
+//!   verdict in its [`ExecutionStatuses`], the only writer of it. If the EL has now contradicted
+//!   itself, the envelope is IGNORE. Else only the table's permit
+//!   ([`ExecutionStatuses::permits_payload_import`]) imports it: INVALID is REJECT, and another
+//!   refusal or no verdict is IGNORE.
+//!
+//! An imported envelope makes its block's payload verified (VALID, or SYNCING or ACCEPTED: the
+//! table keeps which). A refused one changes nothing but the record of a verdict the EL gave.
+//!
+//! An EL contradiction (a VALID payload called INVALID, or the other way round) stays: the spec
+//! asks for manual intervention. From the answer that sets it, that envelope included, each
+//! envelope and block import is IGNORE before any state processing, VerifyBls or newPayload call.
+//!
+//! Gossip commit is a queue kind only: the core answers each item IGNORE and changes nothing.
 
 use super::advance::{
     advance, block_proposer, walk_slots, AdvanceBudget, Advanced, MAX_ADVANCED_STATES,
 };
+use super::envelope::EnvelopeHooks;
 use super::seen::Refused;
 use super::snapshot::{max_pre_states, Snapshots, PRE_STATE_EPOCHS};
+use crate::engine::client::{NewPayload, CALL_TIMEOUT};
+use crate::engine::verdict::{ElVerdict, ExecutionStatus, ExecutionStatuses};
 use crate::import::block::{
     check_proposer_signature, check_proposer_signature_in, import_block, process_empty_slots,
     schedule_proposer_domain, NotImported, PayloadImportGate,
 };
 use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
-use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
+use consensus_types::gloas::{BeaconState, SignedBeaconBlock, SignedExecutionPayloadEnvelope};
 use consensus_types::primitives::{BLSPubkey, Epoch, Root, Slot, ValidatorIndex};
 use consensus_types::signing::DOMAIN_BEACON_PROPOSER;
 use ethswarm_proto::verify::BlsSet;
+use fork_choice::{verify_execution_payload_envelope, DataAvailability, DataAvailabilityCheck};
 use network_config::ChainConfig;
 use state_transition::accessors::get_domain;
 use state_transition::{state_root, Preset, StfError};
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -144,6 +184,11 @@ use tree_hash::TreeHash;
 /// \[est\]: well inside a slot, so a block that has no verdict by then is IGNOREd and can come
 /// again.
 pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The time an envelope import gives the EL's newPayload verdict, from the start of the call
+/// \[est\]: the wait of [`NewPayloadClient`](crate::engine::client::NewPayloadClient) for
+/// cl-engine's answer. The core thread waits for it.
+pub const DEFAULT_ENGINE_TIMEOUT: Duration = CALL_TIMEOUT;
 
 /// The most slots a block can be ahead of the slot of the wall clock: one slot of clock skew
 /// between the core and the proposer. The gossip rule (`MAXIMUM_GOSSIP_CLOCK_DISPARITY`) is
@@ -175,8 +220,17 @@ pub enum Outcome {
         /// The root of the post-state, equal to `block.state_root`.
         state_root: Root,
     },
+    /// The payload of the envelope's block is verified: VALID, or SYNCING or ACCEPTED
+    /// (optimistic).
+    PayloadVerified {
+        /// `envelope.beacon_block_root`.
+        block_root: Root,
+    },
     /// A proven invalid block (REJECT); see [`NotImported::Invalid`]. Nothing is committed.
     Invalid(StfError),
+    /// A proven invalid envelope (REJECT): a failed check of `verify_execution_payload_envelope`,
+    /// or an EL verdict of INVALID. Why, for the log. Nothing is verified.
+    InvalidEnvelope(String),
     /// No verdict and no proof (IGNORE): why, for the log. Nothing is committed.
     Ignored(String),
 }
@@ -245,18 +299,24 @@ struct ImportItem<E: Preset> {
     reply: Reply,
 }
 
+/// An envelope to import, and where its answer goes.
+struct EnvelopeItem<E: Preset> {
+    envelope: Box<SignedExecutionPayloadEnvelope<E>>,
+    reply: Reply,
+}
+
 /// The sending side of the queues of the core.
 #[derive(Clone)]
 pub struct CoreSender<E: Preset> {
     import: mpsc::Sender<ImportItem<E>>,
-    envelope: mpsc::Sender<Reply>,
+    envelope: mpsc::Sender<EnvelopeItem<E>>,
     gossip: mpsc::Sender<Reply>,
 }
 
 /// The receiving side of the queues of the core, for [`ChainCore::spawn`].
 pub struct CoreQueue<E: Preset> {
     import: mpsc::Receiver<ImportItem<E>>,
-    envelope: mpsc::Receiver<Reply>,
+    envelope: mpsc::Receiver<EnvelopeItem<E>>,
     gossip: mpsc::Receiver<Reply>,
 }
 
@@ -295,9 +355,16 @@ impl<E: Preset> CoreSender<E> {
         })
     }
 
-    /// Queues an envelope item. Envelope import is not implemented: the answer is IGNORE.
-    pub fn envelope(&self) -> Result<oneshot::Receiver<Served>, SubmitError> {
-        submit(&self.envelope, |reply| reply)
+    /// Queues `envelope` for import (see the module docs). The answer comes on the receiver; a
+    /// receiver that closes without one means the core stopped (IGNORE).
+    pub fn envelope(
+        &self,
+        envelope: SignedExecutionPayloadEnvelope<E>,
+    ) -> Result<oneshot::Receiver<Served>, SubmitError> {
+        submit(&self.envelope, |reply| EnvelopeItem {
+            envelope: Box::new(envelope),
+            reply,
+        })
     }
 
     /// Queues a gossip commit item. Gossip commit is not implemented: the answer is IGNORE.
@@ -322,7 +389,7 @@ fn submit<T>(
 /// An item of one of the queues.
 enum Item<E: Preset> {
     Import(ImportItem<E>),
-    Envelope(Reply),
+    Envelope(EnvelopeItem<E>),
     Gossip(Reply),
 }
 
@@ -333,7 +400,7 @@ impl<E: Preset> CoreQueue<E> {
         tokio::select! {
             biased;
             Some(item) = self.import.recv() => Some(Item::Import(item)),
-            Some(reply) = self.envelope.recv() => Some(Item::Envelope(reply)),
+            Some(item) = self.envelope.recv() => Some(Item::Envelope(item)),
             Some(reply) = self.gossip.recv() => Some(Item::Gossip(reply)),
             else => None,
         }
@@ -354,10 +421,19 @@ pub struct ChainCore<E: Preset> {
     committed: HashSet<Root>,
     /// The kept refusals, by block root (see the module docs).
     refused: Refused<Outcome>,
+    /// The EL's verdicts on the payloads of the imported envelopes (see the module docs).
+    statuses: ExecutionStatuses,
+    /// The blocks whose payload is verified, among those with a pre-state.
+    payload_verified: HashSet<Root>,
     head: Head,
     verify_timeout: Duration,
+    engine_timeout: Duration,
     /// `None` until [`Self::with_payload_gate`]: no block commits without a gate.
     gate: Option<Box<dyn PayloadImportGate>>,
+    /// `None` until [`Self::with_data_availability`]: no envelope imports without it.
+    data: Option<Box<dyn DataAvailabilityCheck + Send>>,
+    /// `None` until [`Self::with_engine`]: no envelope imports without it.
+    engine: Option<Box<dyn NewPayload<E>>>,
     clock: UnixClock,
     turns: u64,
     hooks: Hooks,
@@ -401,9 +477,14 @@ impl<E: Preset> ChainCore<E> {
             budget: AdvanceBudget::new(),
             committed: HashSet::from([head.block_root]),
             refused: Refused::new(MAX_REFUSED_ROOTS),
+            statuses: ExecutionStatuses::new(),
+            payload_verified: HashSet::new(),
             head,
             verify_timeout: DEFAULT_VERIFY_TIMEOUT,
+            engine_timeout: DEFAULT_ENGINE_TIMEOUT,
             gate: None,
+            data: None,
+            engine: None,
             clock: Arc::new(system_clock),
             turns: 0,
             hooks: Hooks::default(),
@@ -422,6 +503,39 @@ impl<E: Preset> ChainCore<E> {
     #[must_use]
     pub fn with_payload_gate(mut self, gate: impl PayloadImportGate + 'static) -> Self {
         self.gate = Some(Box::new(gate));
+        self
+    }
+
+    /// The same core with `check` as the data availability check of each envelope import.
+    #[must_use]
+    pub fn with_data_availability(
+        mut self,
+        check: impl DataAvailabilityCheck + Send + 'static,
+    ) -> Self {
+        self.data = Some(Box::new(check));
+        self
+    }
+
+    /// The same core with `engine` as the newPayload call of each envelope import.
+    #[must_use]
+    pub fn with_engine(mut self, engine: impl NewPayload<E> + 'static) -> Self {
+        self.engine = Some(Box::new(engine));
+        self
+    }
+
+    /// The same core where each newPayload call has `timeout` for the EL's verdict.
+    #[must_use]
+    pub fn with_engine_timeout(mut self, timeout: Duration) -> Self {
+        self.engine_timeout = timeout;
+        self
+    }
+
+    /// The same core with the payload of block `block_root` verified, as if its envelope
+    /// imported. A test seam, for an anchor whose envelope cannot verify.
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_payload_verified(mut self, block_root: Root) -> Self {
+        self.payload_verified.insert(block_root);
         self
     }
 
@@ -482,6 +596,21 @@ impl<E: Preset> ChainCore<E> {
         self.refused.contains(block_root)
     }
 
+    /// `true` if the core committed block `block_root`, or it is the anchor.
+    pub fn is_committed(&self, block_root: &Root) -> bool {
+        self.committed.contains(block_root)
+    }
+
+    /// `true` if the payload of block `block_root` is verified (see the module docs).
+    pub fn payload_verified(&self, block_root: &Root) -> bool {
+        self.payload_verified.contains(block_root)
+    }
+
+    /// The EL's verdicts that the core recorded, and whether the EL contradicted itself.
+    pub fn execution_statuses(&self) -> &ExecutionStatuses {
+        &self.statuses
+    }
+
     /// The post-state of block `parent_root` advanced to the last slot of epoch `epoch - 1`, if
     /// the core keeps it (see [`advance`](super::advance)).
     pub fn advanced_state(&self, parent_root: &Root, epoch: Epoch) -> Option<&BeaconState<E>> {
@@ -517,7 +646,10 @@ impl<E: Preset> ChainCore<E> {
                     self.import(&item.block, &item.reply, verifier, runtime),
                     item.reply,
                 ),
-                Item::Envelope(reply) => (Outcome::Ignored("no envelope import yet".into()), reply),
+                Item::Envelope(item) => (
+                    self.import_envelope(&item.envelope, verifier, runtime),
+                    item.reply,
+                ),
                 Item::Gossip(reply) => (Outcome::Ignored("no gossip commit yet".into()), reply),
             };
             // A caller that stopped waiting has nothing to answer.
@@ -535,13 +667,16 @@ impl<E: Preset> ChainCore<E> {
         verifier: &Arc<V>,
         runtime: &Handle,
     ) -> Outcome {
-        // In the context of the runtime, so that the deadline is on the clock of its timers. A
-        // timeout past the range of `Instant` gives no time at all: no verdict is IGNORE.
-        let deadline = {
-            let _context = runtime.enter();
-            let now = Instant::now();
-            now.checked_add(self.verify_timeout).unwrap_or(now)
-        };
+        let deadline = self.deadline(runtime);
+        if self.statuses.el_contradiction() {
+            return Outcome::Ignored(EL_CONTRADICTION.into());
+        }
+        let bid = &block.message.body.signed_execution_payload_bid.message;
+        for hash in [bid.block_hash, bid.parent_block_hash] {
+            if self.statuses.status(&hash) == Some(ExecutionStatus::Invalid) {
+                return Outcome::Ignored(format!("the EL found payload {hash} of the bid INVALID"));
+            }
+        }
         let Some(gate) = self.gate.as_deref() else {
             return Outcome::Ignored("no payload gate is set".into());
         };
@@ -561,6 +696,13 @@ impl<E: Preset> ChainCore<E> {
         let Some(parent_state) = self.snapshots.peek(&parent) else {
             return Outcome::Ignored(format!("no pre-state for the parent {parent}"));
         };
+        if bid.parent_block_hash == parent_state.latest_execution_payload_bid.block_hash
+            && !self.payload_verified.contains(&parent)
+        {
+            return Outcome::Ignored(format!(
+                "the payload of the parent {parent} is not verified"
+            ));
+        }
         let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
         let slot = block.message.slot;
         let proposer = block.message.proposer_index;
@@ -734,6 +876,8 @@ impl<E: Preset> ChainCore<E> {
                 // cannot serve an import, as an import needs that pre-state first.
                 let snapshots = &self.snapshots;
                 self.advanced.retain(|parent| snapshots.contains(parent));
+                self.payload_verified
+                    .retain(|root| snapshots.contains(root));
                 self.committed.insert(imported.block_root);
                 Outcome::Committed {
                     block_root: imported.block_root,
@@ -746,6 +890,77 @@ impl<E: Preset> ChainCore<E> {
             }
             Err(NotImported::Ignored(why)) => Outcome::Ignored(why),
         }
+    }
+
+    /// Imports `signed` and verifies its block's payload only if it imports (see the module
+    /// docs).
+    fn import_envelope<V: BlsVerifier + 'static>(
+        &mut self,
+        signed: &SignedExecutionPayloadEnvelope<E>,
+        verifier: &Arc<V>,
+        runtime: &Handle,
+    ) -> Outcome {
+        let deadline = self.deadline(runtime);
+        if self.statuses.el_contradiction() {
+            return Outcome::Ignored(EL_CONTRADICTION.into());
+        }
+        let root = signed.message.beacon_block_root;
+        if self.payload_verified.contains(&root) {
+            return Outcome::Ignored(format!("the payload of block {root} is already verified"));
+        }
+        let committed = self.committed.contains(&root);
+        let Some(state) = self.snapshots.peek(&root).filter(|_| committed) else {
+            return Outcome::Ignored(format!("block {root} is not committed with a pre-state"));
+        };
+        let Some(data) = self.data.as_deref() else {
+            return Outcome::Ignored("no data availability check is set".into());
+        };
+        if data.is_data_available(root) != DataAvailability::Available {
+            return Outcome::Ignored(format!("the data of block {root} is not available"));
+        }
+        let Some(engine) = self.engine.as_deref() else {
+            return Outcome::Ignored("no newPayload engine is set".into());
+        };
+        // `from_anchor` refuses a zero SLOT_DURATION_MS.
+        let Some(slot_ms) = NonZeroU64::new(self.config.slot_duration_ms()) else {
+            return Outcome::Ignored("SLOT_DURATION_MS is 0".into());
+        };
+        let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
+        let hooks = EnvelopeHooks {
+            verdict: &verdict,
+            engine,
+            runtime,
+            timeout: self.engine_timeout,
+            envelope: &signed.message,
+            bid: &state.latest_execution_payload_bid,
+            statuses: RefCell::new(&mut self.statuses),
+            el: Cell::new(None),
+        };
+        let checked = verify_execution_payload_envelope(state, signed, slot_ms, &hooks);
+        let el = hooks.el.get();
+        // The answer that set it is refused too.
+        if self.statuses.el_contradiction() {
+            return Outcome::Ignored(EL_CONTRADICTION.into());
+        }
+        match checked {
+            Ok(()) => {
+                self.payload_verified.insert(root);
+                Outcome::PayloadVerified { block_root: root }
+            }
+            Err(fork_choice::Error::InvalidEnvelope(e)) => Outcome::InvalidEnvelope(e.to_string()),
+            Err(e) if matches!(el, Some(ElVerdict::Invalid { .. })) => {
+                Outcome::InvalidEnvelope(format!("the EL answered INVALID: {e}"))
+            }
+            Err(e) => Outcome::Ignored(e.to_string()),
+        }
+    }
+
+    /// The deadline of the VerifyBls calls of an import that starts now: on the clock of the
+    /// timers of `runtime`. A timeout past the range of `Instant` gives no time at all.
+    fn deadline(&self, runtime: &Handle) -> Instant {
+        let _context = runtime.enter();
+        let now = Instant::now();
+        now.checked_add(self.verify_timeout).unwrap_or(now)
     }
 
     /// The slot of the wall clock. `Err` (why, for the log) if `slot` is more than
@@ -874,6 +1089,9 @@ fn verify<V: BlsVerifier + 'static>(
 
 /// The no-verdict reason of a VerifyBls call without a verdict before its deadline.
 const NO_VERDICT_IN_TIME: &str = "no verdict by the deadline";
+
+/// The IGNORE reason of each import once the EL contradicted itself.
+const EL_CONTRADICTION: &str = "the EL contradicted itself: no import until manual intervention";
 
 /// The IGNORE reason of an import whose caller dropped the receiver of the answer.
 const CALLER_GONE: &str = "the caller stopped waiting for the answer";

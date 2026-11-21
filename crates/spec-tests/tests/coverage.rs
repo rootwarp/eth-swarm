@@ -109,8 +109,8 @@ fn shuffling_case(root: &Path) {
 
 /// The Gloas trees of the state-transition runners, of the fork-choice runner and of the
 /// networking runner that a minimal or mainnet set must hold, each with a handler that its
-/// runner knows.
-const M3_TREES: [(&str, &str); 8] = [
+/// runner knows. The networking runner needs each gossip handler that it runs.
+const M3_TREES: [(&str, &str); 9] = [
     ("sanity", "blocks"),
     ("epoch_processing", "justification_and_finalization"),
     ("operations", "attestation"),
@@ -118,6 +118,7 @@ const M3_TREES: [(&str, &str); 8] = [
     ("rewards", "basic"),
     ("random", "random"),
     ("fork_choice", "on_block"),
+    ("networking", "gossip_execution_payload_envelope"),
     ("networking", "gossip_payload_attestation_message"),
 ];
 
@@ -221,7 +222,7 @@ fn coverage_passes_on_a_fully_read_tree() {
     );
     assert_eq!(placeholders.len(), M3_TREES.len());
     let covered = suite.guard.check(&suite.reads).unwrap();
-    assert_eq!((covered.read, covered.total), (8, 18));
+    assert_eq!((covered.read, covered.total), (8, 19));
 }
 
 #[test]
@@ -748,7 +749,7 @@ fn fork_choice_case_runs_through_the_suite_and_every_file_is_read() {
     );
     run_all(&suite);
     let covered = suite.guard.check(&suite.reads).unwrap();
-    assert_eq!((covered.read, covered.total), (13, 23));
+    assert_eq!((covered.read, covered.total), (13, 24));
 }
 
 #[test]
@@ -789,6 +790,26 @@ fn fork_choice_handler_directories_must_be_known() {
             "{msg}"
         ),
         other => panic!("expected a setup error, got {:?}", other.err()),
+    }
+}
+
+/// A minimal set that lacks one of the gossip handler trees that the networking runner runs
+/// (a partial extract) fails setup and names that tree.
+#[test]
+fn a_minimal_set_without_a_runnable_gossip_handler_tree_fails_setup() {
+    for handler in spec_tests::gossip::RUNNABLE {
+        let tree = minimal_tree();
+        let gone = tree
+            .path()
+            .join(format!("{MINIMAL}/gloas/networking/{handler}"));
+        std::fs::remove_dir_all(&gone).unwrap();
+        match build(tree.path(), &value_yaml_excused(), "minimal") {
+            Err(SuiteError::Setup(msg)) => assert!(
+                msg.contains(&format!("tests/minimal/gloas/networking/{handler}")),
+                "{handler}: {msg}"
+            ),
+            other => panic!("{handler}: expected a setup error, got {:?}", other.err()),
+        }
     }
 }
 

@@ -12,8 +12,9 @@
 //! [`run`]:
 //!
 //! 1. checks the `config.yaml`, if the case has one, as the fork_choice runner does, and also
-//!    `MAXIMUM_GOSSIP_CLOCK_DISPARITY`. Its `GLOAS_FORK_EPOCH` is the fork epoch of the payload
-//!    attestation checks.
+//!    `MAXIMUM_GOSSIP_CLOCK_DISPARITY`: a compared value that is missing or differs fails the
+//!    case. The check reads only the values it compares, so another key, unknown or not, fails
+//!    nothing. Its `GLOAS_FORK_EPOCH` is the fork epoch of the payload attestation checks.
 //! 2. builds the store: `get_forkchoice_store` on the anchor state and the first entry of
 //!    `blocks`, which is not state-transitioned (with no `blocks`, the anchor block of
 //!    `get_store_from_state` of the pyspec helpers). Each later entry ticks the store to its
@@ -28,9 +29,10 @@
 //!    `valid` is ACCEPT, `ignore` IGNORE, `reject` REJECT. The format makes `reason`
 //!    informational, so the runner does not compare it.
 //!
-//! Each input that the runner does not give fails the case: an unknown key, `payload_status`,
-//! a non-empty `seen_partial_data_column_headers`, `subnet_id`, `column_index` and `group_id`,
-//! and `current_time_ms` for an envelope, whose validation takes no time. Thus a case that needs
+//! Each input that the runner does not give fails the case: an unknown key of `meta.yaml`, of a
+//! `blocks` or `messages` entry or of `finalized_checkpoint`, `payload_status`, a non-empty
+//! `seen_partial_data_column_headers`, `subnet_id`, `column_index` and `group_id`, and
+//! `current_time_ms` for an envelope, whose validation takes no time. Thus a case that needs
 //! more than the runner does cannot pass.
 //!
 //! An envelope whose payload withdrawals or execution request lists are longer than the bounds

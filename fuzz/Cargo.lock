@@ -916,6 +916,7 @@ dependencies = [
  "engine-api",
  "ethereum_ssz",
  "ethswarm-proto",
+ "fork-choice",
  "hex",
  "http",
  "http-body-util",
@@ -2026,6 +2027,18 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "fork-choice"
+version = "0.1.0"
+dependencies = [
+ "consensus-types",
+ "sha2 0.10.9",
+ "ssz_types",
+ "state-transition",
+ "thiserror 2.0.21",
+ "tree_hash",
+]
 
 [[package]]
 name = "form_urlencoded"

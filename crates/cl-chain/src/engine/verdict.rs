@@ -238,14 +238,14 @@ enum Walk {
 }
 
 /// The [`ExecutionStatus`] of each payload cl-chain has a verdict for, by its `block_hash`,
-/// with its `parent_hash`. Nothing reads it yet; it will give `execution_optimistic` and the
-/// confirmed and safe hashes. The rules are those of consensus-specs v1.7.0-beta.4,
-/// `specs/bellatrix/optimistic-sync.md`. A payload moves only from `Optimistic`
-/// (`NOT_VALIDATED`) to `Valid` or to `Invalid` ("How to optimistically import blocks"). The
-/// spec leaves out `Valid` to `Invalid` and `Invalid` to `Valid` ("Transitioning from VALID ->
-/// INVALIDATED or INVALIDATED -> VALID"): only a faulty EL asks for them, and they need manual
-/// intervention. So the table keeps both as they are and records the contradiction
-/// ([`ExecutionStatuses::el_contradiction`]).
+/// with its `parent_hash`. The chain core keeps one and gates block and envelope import on it;
+/// it will also give `execution_optimistic` and the confirmed and safe hashes. The rules are
+/// those of consensus-specs v1.7.0-beta.4, `specs/bellatrix/optimistic-sync.md`. A payload
+/// moves only from `Optimistic` (`NOT_VALIDATED`) to `Valid` or to `Invalid` ("How to
+/// optimistically import blocks"). The spec leaves out `Valid` to `Invalid` and `Invalid` to
+/// `Valid` ("Transitioning from VALID -> INVALIDATED or INVALIDATED -> VALID"): only a faulty EL
+/// asks for them, and they need manual intervention. So the table keeps both as they are and
+/// records the contradiction ([`ExecutionStatuses::el_contradiction`]).
 ///
 /// - `Valid` makes the payload `Valid`, and every ancestor still `Optimistic` too, walking the
 ///   recorded parent hashes up to the first ancestor that is not recorded or not `Optimistic`.

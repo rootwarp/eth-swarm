@@ -5,14 +5,14 @@
 //!   ([`fcu::ForkchoiceView`]), and the custody bitmap. Pure.
 //! - [`client`]: [`client::FcuSender`], which sends those arguments to cl-engine in `seq` order,
 //!   latest value wins; and [`client::NewPayloadClient`], which sends an envelope's
-//!   `engine_newPayloadV5` params and gives the EL's verdict.
+//!   `engine_newPayloadV5` params and gives the EL's verdict, as a [`client::NewPayload`].
 //! - [`verdict`]: the verdict of a `PayloadStatusV1` (fail closed: never `Valid` without a
 //!   `VALID` for the submitted payload), the EL verdict import gate, and the execution status
 //!   of each payload, with the optimistic-sync rules, pruning at finality and a bound on the
 //!   `Invalid` payloads it keeps. Pure.
 //!
-//! Nothing calls the sender on head changes, or the newPayload client on import, yet: there
-//! is no block import core and no fork choice store to call them.
+//! The chain core ([`crate::core`]) calls newPayload on envelope import and keeps the execution
+//! statuses. Nothing calls the sender on head changes yet: there is no fork choice store.
 
 pub mod client;
 pub mod fcu;
