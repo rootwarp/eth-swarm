@@ -30,13 +30,16 @@ use fork_choice::{
     StateProvider, Store,
 };
 use gossip_validation::{
-    is_current_slot, validate_payload_attestation_message_gossip, IgnoreReason, RejectReason, Seen,
-    SeenKey, StoreView, Verdict, MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS,
+    is_current_slot, oldest_current_slot, validate_payload_attestation_message_gossip,
+    IgnoreReason, RejectReason, Seen, SeenKey, StoreView, Verdict,
+    MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT,
+    MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS,
 };
 use state_transition::accessors::get_domain;
 use state_transition::caches::get_ptc;
 use state_transition::testing::{genesis_state, signed_block};
 use state_transition::{state_root, BackendError, StfError};
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use tree_hash::TreeHash;
 
@@ -64,6 +67,11 @@ const OTHER_VERSION: [u8; 4] = [9, 9, 9, 9];
 /// The start of `slot`, in milliseconds.
 fn time_at(slot: Slot) -> u64 {
     GENESIS_TIME * 1000 + slot * SLOT_MS
+}
+
+/// The middle of slot 1, in milliseconds.
+fn mid_slot_1() -> u64 {
+    time_at(1) + SLOT_MS / 2
 }
 
 /// Sets the PTC of slot 1 of `state`, a state of epoch 0.
@@ -212,8 +220,13 @@ fn message(validator: ValidatorIndex, root: Root, slot: Slot) -> PayloadAttestat
 /// The set of the signature check of the topic: the key of `validator`, and the signing root
 /// of the data in the PTC domain of the head state at the epoch of the data slot.
 fn expected_set(chain: &Chain, m: &PayloadAttestationMessage) -> SignatureSet {
+    set_on(chain.head_state(), m)
+}
+
+/// The set of the signature check of `m` with the head state `state`.
+fn set_on(state: &BeaconState<E>, m: &PayloadAttestationMessage) -> SignatureSet {
     let epoch = m.data.slot / 8;
-    let domain = get_domain(chain.head_state(), DOMAIN_PTC_ATTESTER, Some(epoch));
+    let domain = get_domain(state, DOMAIN_PTC_ATTESTER, Some(epoch));
     SignatureSet::single(
         SignerRef::Validator(m.validator_index),
         compute_signing_root(&m.data, domain),
@@ -223,7 +236,7 @@ fn expected_set(chain: &Chain, m: &PayloadAttestationMessage) -> SignatureSet {
 
 /// The verdict of `m` at the middle of slot 1, with Gloas from genesis.
 fn validate(seen: &Seen, chain: &Chain, m: &PayloadAttestationMessage) -> Verdict {
-    validate_at(seen, &chain.store, m, time_at(1) + SLOT_MS / 2)
+    validate_at(seen, &chain.store, m, mid_slot_1())
 }
 
 fn validate_at<S: StoreView<E>>(
@@ -678,4 +691,526 @@ fn gossip_and_fork_choice_agree_on_a_retained_and_then_a_forgotten_dropped_block
     );
     assert_eq!(store, before);
     assert_eq!(get_head(&store), Ok(head));
+}
+
+/// Validates `m` against `store` at `time_ms`, and resolves the pending verdict with a valid
+/// signature. Gives the verdict of [`Seen::resolve`].
+fn accept_at<S: StoreView<E>>(
+    seen: &mut Seen,
+    store: &S,
+    m: &PayloadAttestationMessage,
+    time_ms: u64,
+) -> Verdict {
+    let (_, key) = pending(validate_at(seen, store, m, time_ms));
+    seen.resolve(key, Ok(true))
+}
+
+/// The view of `chain` with the head state `head`.
+fn with_head<'a>(chain: &'a Chain, head: &'a BeaconState<E>) -> Head<'a> {
+    Head {
+        store: &chain.store,
+        head: Some(head),
+    }
+}
+
+/// The PTC with the validators `16 * k` to `16 * k + 15`.
+fn ptc_of(k: usize) -> [ValidatorIndex; PTC_SIZE] {
+    std::array::from_fn(|i| (k * PTC_SIZE + i) as ValidatorIndex)
+}
+
+/// `count` head states of slot 1. Head `k` is the head state of `chain` with the PTC
+/// [`ptc_of`]`(k)` for slot 1, so no two heads have a validator in common.
+fn disjoint_heads(chain: &Chain, count: usize) -> Vec<BeaconState<E>> {
+    (0..count)
+        .map(|k| {
+            let mut state = chain.head_state().clone();
+            set_ptc(&mut state, ptc_of(k));
+            state
+        })
+        .collect()
+}
+
+/// [`chain`] at the start of slot 2, with `r`, a block of slot 2 on `p`. `r` gets the proposer
+/// boost and is the head. Its PTC of slot 1 is [`HEAD_PTC`]. Gives the chain and the root of
+/// `r`.
+fn chain_at_slot_2() -> (Chain, Root) {
+    let mut chain = chain();
+    on_tick(&mut chain.store, time_at(2)).unwrap();
+    let p = chain.store.block(chain.p).unwrap().clone();
+    let r = block_on(&p, 2, 3);
+    on_block(&mut chain.store, &Provider, &r).unwrap();
+    let r = r.message.tree_hash_root();
+    assert_eq!(get_head(&chain.store).unwrap().root, r);
+    let head_state = StoreView::head_state(&chain.store).unwrap();
+    assert_eq!(get_ptc(head_state, 1).unwrap().to_vec(), HEAD_PTC.to_vec());
+    (chain, r)
+}
+
+/// Two different validators of the PTC of slot 2 in the head state of `store`.
+fn two_of_slot_2(store: &Store<E>) -> [ValidatorIndex; 2] {
+    let ptc = get_ptc(StoreView::head_state(store).unwrap(), 2).unwrap();
+    let first = ptc[0];
+    let second = *ptc.iter().find(|v| **v != first).unwrap();
+    [first, second]
+}
+
+#[test]
+fn the_oldest_current_slot_is_the_first_slot_in_the_clock_disparity() {
+    let chain = chain();
+    let store = &chain.store;
+    let disparity = MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS;
+    for (time_ms, oldest) in [
+        (0, 0),
+        (time_at(0), 0),
+        (time_at(0) + disparity + 1, 0),
+        (time_at(1) + disparity, 0),
+        (time_at(1) + disparity + 1, 1),
+        (time_at(2) + disparity, 1),
+        (time_at(2) + disparity + 1, 2),
+        (u64::MAX, (u64::MAX - time_at(0) - disparity - 1) / SLOT_MS),
+    ] {
+        assert_eq!(oldest_current_slot(store, time_ms), oldest, "{time_ms}");
+    }
+    // From genesis on, the oldest current slot is current, and the slot before it is not.
+    for slot in 0..4 {
+        for offset in [0, 1, disparity - 1, disparity, disparity + 1, SLOT_MS - 1] {
+            let time_ms = time_at(slot) + offset;
+            let oldest = oldest_current_slot(store, time_ms);
+            assert!(is_current_slot(store, oldest, time_ms), "{time_ms}");
+            assert!(
+                oldest == 0 || !is_current_slot(store, oldest - 1, time_ms),
+                "{time_ms}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_slot_stays_in_seen_through_the_clock_disparity_and_a_valid_message_then_removes_it() {
+    let (chain, r) = chain_at_slot_2();
+    let store = &chain.store;
+    let [v, w] = two_of_slot_2(store);
+    let edge = time_at(2) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS;
+    let mut seen = Seen::default();
+    let m = message(10, chain.p, 1);
+    assert_eq!(
+        accept_at(&mut seen, store, &m, mid_slot_1()),
+        Verdict::Accept
+    );
+
+    // At the end of slot 1 plus the clock disparity, slot 1 is still current. A valid message
+    // of slot 2 at that time keeps slot 1.
+    assert_eq!(
+        accept_at(&mut seen, store, &message(v, r, 2), edge),
+        Verdict::Accept
+    );
+    assert!(seen.has_payload_attestation(1, 10));
+    assert_eq!(seen.payload_attestation_slot_count(), 2);
+    assert_eq!(
+        validate_at(&seen, store, &m, edge),
+        Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+            slot: 1,
+            validator_index: 10
+        })
+    );
+    // A copy of slot 1 that is pending at that time, and resolves after the prune below.
+    let (_, late) = pending(validate_at(&seen, store, &message(11, chain.p, 1), edge));
+
+    // One millisecond later, slot 1 is not current. A valid message of slot 2 removes it.
+    assert_eq!(
+        accept_at(&mut seen, store, &message(w, r, 2), edge + 1),
+        Verdict::Accept
+    );
+    assert!(!seen.has_payload_attestation(1, 10));
+    assert!(seen.has_payload_attestation(2, v));
+    assert!(seen.has_payload_attestation(2, w));
+    assert_eq!(seen.payload_attestation_slot_count(), 1);
+    assert_eq!(seen.payload_attestation_count(), 2);
+    assert_eq!(
+        validate_at(&seen, store, &m, edge + 1),
+        Verdict::Ignore(IgnoreReason::NotCurrentSlot { slot: 1 })
+    );
+
+    // The late copy accepts, and does not add slot 1 again.
+    assert_eq!(seen.resolve(late, Ok(true)), Verdict::Accept);
+    assert!(!seen.has_payload_attestation(1, 11));
+    assert_eq!(seen.payload_attestation_slot_count(), 1);
+    assert_eq!(seen.payload_attestation_count(), 2);
+}
+
+#[test]
+fn an_explicit_prune_removes_a_slot_only_after_the_clock_disparity() {
+    let (chain, r) = chain_at_slot_2();
+    let store = &chain.store;
+    let [v, w] = two_of_slot_2(store);
+    let edge = time_at(2) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS;
+    let mut seen = Seen::default();
+    let m = message(10, chain.p, 1);
+    assert_eq!(
+        accept_at(&mut seen, store, &m, mid_slot_1()),
+        Verdict::Accept
+    );
+    assert_eq!(
+        accept_at(&mut seen, store, &message(v, r, 2), time_at(2)),
+        Verdict::Accept
+    );
+
+    seen.prune_payload_attestations(store, edge);
+    assert!(seen.has_payload_attestation(1, 10));
+    assert_eq!(seen.payload_attestation_slot_count(), 2);
+    assert_eq!(
+        validate_at(&seen, store, &m, edge),
+        Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+            slot: 1,
+            validator_index: 10
+        })
+    );
+
+    seen.prune_payload_attestations(store, edge + 1);
+    assert!(!seen.has_payload_attestation(1, 10));
+    assert!(seen.has_payload_attestation(2, v));
+    assert_eq!(seen.payload_attestation_slot_count(), 1);
+    assert_eq!(seen.payload_attestation_count(), 1);
+
+    // A prune by slot removes each slot before that slot. A copy of slot 2 that resolves
+    // after it accepts, and does not add slot 2 again.
+    let (_, late) = pending(validate_at(&seen, store, &message(w, r, 2), time_at(2)));
+    seen.prune_payload_attestations_before(3);
+    assert_eq!(seen.payload_attestation_count(), 0);
+    assert_eq!(seen.payload_attestation_slot_count(), 0);
+    assert_eq!(seen.resolve(late, Ok(true)), Verdict::Accept);
+    assert_eq!(seen.payload_attestation_count(), 0);
+}
+
+/// A view with a block of each slot from 1 to `slots` and a slot duration of 1 ms. Each block
+/// is `p` with another slot. Each block has the post-state of `p`, which is also the head
+/// state. At the genesis time, the clock disparity of 500 ms makes each of these slots
+/// current, and the oldest current slot is 0.
+struct ManySlots<'a> {
+    chain: &'a Chain,
+    roots: Vec<Root>,
+    blocks: HashMap<Root, BeaconBlock<E>>,
+}
+
+impl<'a> ManySlots<'a> {
+    fn new(chain: &'a Chain, slots: Slot) -> Self {
+        let mut roots = Vec::new();
+        let mut blocks = HashMap::new();
+        for slot in 1..=slots {
+            let mut block = chain.store.block(chain.p).unwrap().clone();
+            block.slot = slot;
+            let root = block.tree_hash_root();
+            roots.push(root);
+            blocks.insert(root, block);
+        }
+        Self {
+            chain,
+            roots,
+            blocks,
+        }
+    }
+
+    /// The root of the block of `slot`.
+    fn root(&self, slot: Slot) -> Root {
+        self.roots[slot as usize - 1]
+    }
+}
+
+impl StoreView<E> for ManySlots<'_> {
+    fn block(&self, root: Root) -> Option<&BeaconBlock<E>> {
+        self.blocks.get(&root)
+    }
+
+    fn block_state(&self, root: Root) -> Option<&BeaconState<E>> {
+        self.blocks
+            .contains_key(&root)
+            .then(|| self.chain.head_state())
+    }
+
+    fn finalized_checkpoint(&self) -> &Checkpoint {
+        self.chain.store.finalized_checkpoint()
+    }
+
+    fn genesis_time_ms(&self) -> u64 {
+        self.chain.store.genesis_time_ms()
+    }
+
+    fn slot_duration_ms(&self) -> NonZeroU64 {
+        NonZeroU64::MIN
+    }
+
+    fn head_state(&self) -> Option<&BeaconState<E>> {
+        Some(self.chain.head_state())
+    }
+}
+
+#[test]
+fn seen_keeps_at_most_the_slot_limit_and_removes_the_oldest_slot() {
+    assert_eq!(MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS, 8);
+    let chain = chain();
+    let extra = 4;
+    let slots = (MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS + extra) as Slot;
+    let view = ManySlots::new(&chain, slots);
+    let now = view.genesis_time_ms();
+    assert_eq!(oldest_current_slot(&view, now), 0);
+    let validator = |slot| get_ptc(chain.head_state(), slot).unwrap()[0];
+    let mut seen = Seen::default();
+    for slot in 1..=slots {
+        let m = message(validator(slot), view.root(slot), slot);
+        assert_eq!(accept_at(&mut seen, &view, &m, now), Verdict::Accept);
+        assert!(seen.has_payload_attestation(slot, validator(slot)));
+        assert!(seen.payload_attestation_slot_count() <= MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS);
+    }
+    assert_eq!(
+        seen.payload_attestation_slot_count(),
+        MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS
+    );
+    assert_eq!(
+        seen.payload_attestation_count(),
+        MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS
+    );
+    // The oldest slots go first.
+    for slot in 1..=slots {
+        assert_eq!(
+            seen.has_payload_attestation(slot, validator(slot)),
+            slot > extra as Slot,
+            "{slot}"
+        );
+    }
+}
+
+#[test]
+fn a_head_change_in_a_slot_admits_the_ptc_of_each_head() {
+    let chain = chain();
+    let q_state = chain.store.block_state(chain.q).unwrap();
+    let q_head = with_head(&chain, q_state);
+    let mut seen = Seen::default();
+    // Each validator of the PTC of the head `p`.
+    for validator in HEAD_PTC {
+        let m = message(validator, chain.p, 1);
+        assert_eq!(
+            accept_at(&mut seen, &chain.store, &m, mid_slot_1()),
+            Verdict::Accept
+        );
+    }
+    // The head changes to `q`. Each validator of its PTC passes too, with the signature domain
+    // of `q`. Slot 1 then has more validators than `PTC_SIZE`, and keeps each of them.
+    for validator in OTHER_PTC {
+        let m = message(validator, chain.q, 1);
+        let (sets, key) = pending(validate_at(&seen, &q_head, &m, mid_slot_1()));
+        assert_eq!(sets, vec![set_on(q_state, &m)]);
+        assert_eq!(seen.resolve(key, Ok(true)), Verdict::Accept);
+    }
+    assert_eq!(seen.payload_attestation_count(), 2 * PTC_SIZE);
+    assert_eq!(seen.payload_attestation_slot_count(), 1);
+    for validator in HEAD_PTC.iter().chain(&OTHER_PTC) {
+        assert!(seen.has_payload_attestation(1, *validator), "{validator}");
+    }
+    // The head changes back to `p`. Each validator of its PTC is still seen.
+    for validator in HEAD_PTC {
+        assert_eq!(
+            validate(&seen, &chain, &message(validator, chain.p, 1)),
+            Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+                slot: 1,
+                validator_index: validator
+            })
+        );
+    }
+}
+
+#[test]
+fn a_slot_keeps_at_most_the_validator_limit_and_removes_the_oldest_validator() {
+    assert_eq!(MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT, 4);
+    let limit = MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT * PTC_SIZE;
+    let chain = chain_with(96);
+    // Five heads with disjoint PTCs: 80 validators for slot 1, more than the limit of 64.
+    let heads = disjoint_heads(&chain, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT + 1);
+    let mut seen = Seen::default();
+    let mut accepted = Vec::new();
+    for (k, head) in heads.iter().enumerate() {
+        let view = with_head(&chain, head);
+        for validator in ptc_of(k) {
+            let m = message(validator, chain.p, 1);
+            assert_eq!(
+                accept_at(&mut seen, &view, &m, mid_slot_1()),
+                Verdict::Accept
+            );
+            accepted.push(validator);
+            assert_eq!(seen.payload_attestation_count(), accepted.len().min(limit));
+            // Seen keeps the last `limit` validators, and removes only the oldest.
+            let first_kept = accepted.len().saturating_sub(limit);
+            for (i, v) in accepted.iter().enumerate() {
+                assert_eq!(seen.has_payload_attestation(1, *v), i >= first_kept, "{v}");
+            }
+        }
+    }
+    assert_eq!(accepted.len(), 80);
+    assert_eq!(seen.payload_attestation_count(), limit);
+    assert_eq!(seen.payload_attestation_slot_count(), 1);
+}
+
+#[test]
+fn an_invalid_copy_at_the_validator_limit_removes_no_validator() {
+    let chain = chain_with(96);
+    let heads = disjoint_heads(&chain, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT + 1);
+    let mut seen = Seen::default();
+    // The PTCs of the first four heads fill slot 1 to the limit.
+    for (k, head) in heads
+        .iter()
+        .enumerate()
+        .take(MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT)
+    {
+        let view = with_head(&chain, head);
+        for validator in ptc_of(k) {
+            let m = message(validator, chain.p, 1);
+            assert_eq!(
+                accept_at(&mut seen, &view, &m, mid_slot_1()),
+                Verdict::Accept
+            );
+        }
+    }
+    assert_eq!(seen.payload_attestation_count(), 64);
+    let full = seen.clone();
+
+    // 64 is in the PTC of the fifth head only. Under the first head it is not in the PTC.
+    let m = message(64, chain.p, 1);
+    assert_eq!(
+        validate_at(&seen, &with_head(&chain, &heads[0]), &m, mid_slot_1()),
+        Verdict::Reject(RejectReason::NotInPtc {
+            validator_index: 64,
+            slot: 1
+        })
+    );
+    assert_eq!(seen, full);
+    // Under the fifth head, an invalid signature and no verdict leave Seen as it was.
+    let fifth = with_head(&chain, &heads[4]);
+    for (signatures, want) in [
+        (Ok(false), Verdict::Reject(RejectReason::InvalidSignature)),
+        (
+            Err(BackendError("timeout".into())),
+            Verdict::Ignore(IgnoreReason::NoSignatureVerdict),
+        ),
+    ] {
+        let (_, key) = pending(validate_at(&seen, &fifth, &m, mid_slot_1()));
+        assert_eq!(seen.resolve(key, signatures), want);
+        assert_eq!(seen, full);
+        assert!(seen.has_payload_attestation(1, 0));
+        assert!(!seen.has_payload_attestation(1, 64));
+    }
+
+    // A valid copy accepts, and removes only the oldest validator.
+    assert_eq!(
+        accept_at(&mut seen, &fifth, &m, mid_slot_1()),
+        Verdict::Accept
+    );
+    assert!(seen.has_payload_attestation(1, 64));
+    assert!(!seen.has_payload_attestation(1, 0));
+    for validator in 1..64 {
+        assert!(seen.has_payload_attestation(1, validator), "{validator}");
+    }
+    assert_eq!(seen.payload_attestation_count(), 64);
+}
+
+#[test]
+fn an_invalid_copy_does_not_prune_seen() {
+    let (chain, r) = chain_at_slot_2();
+    let store = &chain.store;
+    let [v, _] = two_of_slot_2(store);
+    let mut seen = Seen::default();
+    let m = message(10, chain.p, 1);
+    assert_eq!(
+        accept_at(&mut seen, store, &m, mid_slot_1()),
+        Verdict::Accept
+    );
+    let before = seen.clone();
+
+    // A valid message of slot 2 at this time would remove slot 1.
+    let late = time_at(2) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS + 1;
+    let copy = message(v, r, 2);
+    for (signatures, want) in [
+        (Ok(false), Verdict::Reject(RejectReason::InvalidSignature)),
+        (
+            Err(BackendError("timeout".into())),
+            Verdict::Ignore(IgnoreReason::NoSignatureVerdict),
+        ),
+    ] {
+        let (_, key) = pending(validate_at(&seen, store, &copy, late));
+        assert_eq!(seen.resolve(key, signatures), want);
+        assert_eq!(seen, before);
+        assert!(seen.has_payload_attestation(1, 10));
+    }
+    // A validator outside the PTC rejects before the signature, and Seen does not change.
+    let ptc = get_ptc(StoreView::head_state(store).unwrap(), 2).unwrap();
+    let outsider = (0..64).find(|i| !ptc.contains(i)).unwrap();
+    assert_eq!(
+        validate_at(&seen, store, &message(outsider, r, 2), late),
+        Verdict::Reject(RejectReason::NotInPtc {
+            validator_index: outsider,
+            slot: 2
+        })
+    );
+    assert_eq!(seen, before);
+
+    // The valid copy removes slot 1.
+    assert_eq!(accept_at(&mut seen, store, &copy, late), Verdict::Accept);
+    assert!(!seen.has_payload_attestation(1, 10));
+    assert!(seen.has_payload_attestation(2, v));
+}
+
+#[test]
+fn a_copy_outside_the_ptc_of_the_head_does_not_stop_a_copy_after_a_head_change() {
+    let chain = chain();
+    let q_state = chain.store.block_state(chain.q).unwrap();
+    let q_head = with_head(&chain, q_state);
+    let mut seen = Seen::default();
+    let m = message(30, chain.q, 1);
+    // Under the head `p`, 30 is not in the PTC.
+    assert_eq!(
+        validate(&seen, &chain, &m),
+        Verdict::Reject(RejectReason::NotInPtc {
+            validator_index: 30,
+            slot: 1
+        })
+    );
+    assert_eq!(seen, Seen::default());
+    // Under the head `q`, an invalid signature and no verdict leave Seen as it was.
+    for (signatures, want) in [
+        (Ok(false), Verdict::Reject(RejectReason::InvalidSignature)),
+        (
+            Err(BackendError("timeout".into())),
+            Verdict::Ignore(IgnoreReason::NoSignatureVerdict),
+        ),
+    ] {
+        let (_, key) = pending(validate_at(&seen, &q_head, &m, mid_slot_1()));
+        assert_eq!(seen.resolve(key, signatures), want);
+        assert_eq!(seen, Seen::default());
+    }
+    // A valid copy under the head `q` accepts.
+    let (sets, key) = pending(validate_at(&seen, &q_head, &m, mid_slot_1()));
+    assert_eq!(sets, vec![set_on(q_state, &m)]);
+    assert_eq!(seen.resolve(key, Ok(true)), Verdict::Accept);
+    assert!(seen.has_payload_attestation(1, 30));
+    assert_eq!(seen.payload_attestation_count(), 1);
+}
+
+#[test]
+fn seen_equality_does_not_depend_on_the_order_of_the_keys() {
+    let chain = chain();
+    let mut first = Seen::default();
+    let mut second = Seen::default();
+    for validator in [10, 11, 12] {
+        let m = message(validator, chain.p, 1);
+        assert_eq!(
+            accept_at(&mut first, &chain.store, &m, mid_slot_1()),
+            Verdict::Accept
+        );
+    }
+    for validator in [12, 10, 11] {
+        let m = message(validator, chain.p, 1);
+        assert_eq!(
+            accept_at(&mut second, &chain.store, &m, mid_slot_1()),
+            Verdict::Accept
+        );
+    }
+    assert_eq!(first, second);
 }
