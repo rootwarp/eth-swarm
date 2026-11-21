@@ -34,8 +34,8 @@ mod support;
 use cl_chain::core::advance::{AdvanceBudget, Advanced};
 use cl_chain::core::snapshot::PRE_STATE_EPOCHS;
 use cl_chain::core::{
-    queue, ChainCore, Head, Outcome, Served, MAX_ADVANCED_STATES, MAX_ADVANCE_EPOCHS,
-    MAX_ADVANCE_EPOCHS_PER_SLOT,
+    queue, ChainCore, Head, Outcome, Served, MAX_ADVANCED_STATES, MAX_ADVANCE_BUDGET_PROPOSERS,
+    MAX_ADVANCE_EPOCHS, MAX_ADVANCE_EPOCHS_PER_PROPOSER_PER_SLOT, MAX_ADVANCE_EPOCHS_PER_SLOT,
 };
 use cl_chain::import::block::PermitAll;
 use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
@@ -97,29 +97,85 @@ fn the_walk_bounds_are_eight_epochs_and_sixty_four_states() {
     assert_eq!(cap(), 64);
     assert_eq!(MAX_ADVANCED_STATES, 64);
     assert_eq!(MAX_ADVANCE_EPOCHS_PER_SLOT, 8);
+    // A walk of the cap fits in the budget of one proposer.
+    assert_eq!(MAX_ADVANCE_EPOCHS_PER_PROPOSER_PER_SLOT, MAX_ADVANCE_EPOCHS);
+    assert_eq!(MAX_ADVANCE_BUDGET_PROPOSERS, 128);
 }
 
 #[test]
 fn the_admission_budget_refills_with_the_clock_up_to_one_slot() {
     let mut budget = AdvanceBudget::new();
+    // Each take is for another proposer, so the budget of all proposers is the bound.
+    let mut proposers = 0..;
+    let mut take = |now, epochs| budget.take(now, proposers.next().unwrap(), epochs);
     // The first take fills the bucket.
-    assert!(budget.take(10, 5));
-    assert!(budget.take(10, 3));
-    assert!(!budget.take(10, 1), "eight epochs in one slot");
+    assert!(take(10, 5));
+    assert!(take(10, 3));
+    assert!(!take(10, 1), "eight epochs in one slot");
     // A take over the budget takes nothing.
-    assert!(budget.take(11, 8));
-    assert!(!budget.take(11, 1));
+    assert!(take(11, 8));
+    assert!(!take(11, 1));
     // Idle slots add no more than one slot of work.
-    assert!(!budget.take(20, 9));
-    assert!(budget.take(20, 8));
+    assert!(!take(20, 9));
+    assert!(take(20, 8));
     // A clock that goes back adds nothing and empties nothing.
-    assert!(!budget.take(15, 1));
-    assert!(budget.take(21, 2));
-    assert!(budget.take(19, 6));
-    assert!(!budget.take(21, 1));
-    assert!(budget.take(22, 8));
+    assert!(!take(15, 1));
+    assert!(take(21, 2));
+    assert!(take(19, 6));
+    assert!(!take(21, 1));
+    assert!(take(22, 8));
     // A zero walk always fits.
-    assert!(budget.take(22, 0));
+    assert!(take(22, 0));
+}
+
+#[test]
+fn one_proposer_has_one_walk_in_each_slot_of_the_clock() {
+    let mut budget = AdvanceBudget::new();
+    // A walk takes the full budget of its proposer, also a short walk.
+    assert!(budget.take(10, 1, 3));
+    assert!(
+        !budget.take(10, 1, 1),
+        "a second walk of proposer 1 in the slot"
+    );
+    // Another proposer can take the rest of the budget of all proposers.
+    assert!(!budget.take(10, 2, 6));
+    assert!(budget.take(10, 2, 5));
+    assert!(!budget.take(10, 3, 1), "eight epochs in one slot");
+    // The next slot fills both budgets again. A walk of no epoch takes nothing.
+    assert!(budget.take(11, 1, 8));
+    assert!(budget.take(11, 1, 0));
+    assert!(!budget.take(11, 1, 1));
+    // A clock that goes back adds nothing to the budget of a proposer.
+    assert!(budget.take(13, 2, 1));
+    assert!(!budget.take(12, 2, 1));
+    assert!(
+        budget.take(12, 3, 1),
+        "a refused take keeps no budget of its proposer"
+    );
+}
+
+#[test]
+fn the_admission_budget_keeps_the_proposers_charged_last() {
+    let mut budget = AdvanceBudget::new();
+    let bound = u64::try_from(MAX_ADVANCE_BUDGET_PROPOSERS).unwrap();
+    // One walk of each proposer, each in its own slot of the clock.
+    for proposer in 0..=bound {
+        assert!(budget.take(proposer, proposer, 1), "proposer {proposer}");
+    }
+    assert_eq!(
+        budget.proposers(),
+        MAX_ADVANCE_BUDGET_PROPOSERS,
+        "the bound must hold"
+    );
+    // A clock that goes back adds nothing to the budget of a proposer that stays. Proposer 0,
+    // charged first, went: a later walk of it starts from a full budget of its own.
+    assert!(!budget.take(1, 1, 1), "proposer 1 stays");
+    assert!(budget.take(0, 0, 1), "proposer 0 went");
+    assert_eq!(budget.proposers(), MAX_ADVANCE_BUDGET_PROPOSERS);
+    assert!(
+        budget.take(1, 1, 1),
+        "proposer 1 went after proposer 0 came back"
+    );
 }
 
 #[test]
@@ -609,9 +665,9 @@ fn claimed_by(f: &Fixture, slot: u64, proposer: u64) -> Block {
     block
 }
 
-/// Slots without a block cannot unslash a validator, or move its exit epoch or its
-/// withdrawable epoch back. So a validator that the parent state shows slashed, or exited or
-/// withdrawable at the block epoch, cannot propose the block.
+/// Slots without a block do not unslash a validator, or move a set exit epoch or withdrawable
+/// epoch later. So a validator that the parent state shows slashed, or exited or withdrawable at
+/// the block epoch, cannot propose the block.
 #[tokio::test]
 async fn a_far_block_of_a_slashed_exited_or_withdrawable_proposer_is_ignored_before_cl_verify() {
     let slot = window() + 4;
