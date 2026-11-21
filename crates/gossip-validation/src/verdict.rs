@@ -57,6 +57,14 @@ pub enum IgnoreReason {
         /// `validator_index`.
         validator_index: ValidatorIndex,
     },
+    /// `Seen` keeps the most payload attestation validators for this slot
+    /// ([`crate::MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT`] times `PTC_SIZE`). A new validator
+    /// of the slot is IGNORE, and each validator that `Seen` keeps stays a duplicate. Not a
+    /// proof against the message.
+    PayloadAttestationSlotFull {
+        /// `data.slot`.
+        slot: Slot,
+    },
     /// The slot of the message is not the current slot, with `MAXIMUM_GOSSIP_CLOCK_DISPARITY`
     /// on both ends.
     NotCurrentSlot {

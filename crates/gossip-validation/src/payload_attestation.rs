@@ -86,7 +86,11 @@ where
 /// to [`Seen::resolve`], which adds the key to `Seen` only for a valid signature. The key also
 /// has the oldest current slot at `current_time_ms` ([`oldest_current_slot`]) and the limit of
 /// validators for each slot, `MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT * PTC_SIZE`, which
-/// [`Seen::resolve`] applies.
+/// [`Seen::resolve`] applies: a valid key of a new validator of a full slot is IGNORE there
+/// ([`IgnoreReason::PayloadAttestationSlotFull`]). This function does not check the limit, so a
+/// copy at a full slot gets the same checks as any other: REJECT for a proven violation (for
+/// example a validator outside the PTC), and IGNORE with no change to `Seen` for a signature
+/// with no verdict.
 ///
 /// `Seen` removes the keys of the slots before its floor
 /// ([`Seen::min_payload_attestation_slot`]). A message of such a slot is IGNORE: as a duplicate

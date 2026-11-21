@@ -88,16 +88,50 @@ message with a valid signature changes them:
   floor moves again, so a second copy of an accepted message is still a duplicate, and any
   other message before the floor is not current. A clock that goes back does not change this.
 - At most `MAX_PAYLOAD_ATTESTATION_SEEN_SLOTS` (8) slots. A new slot past the limit removes the
-  oldest slot.
+  oldest slot, and the floor moves past it as for a prune. Thus a message of the removed slot is
+  IGNORE, never ACCEPT: a duplicate if the record of the last pruned slot has its key, else not
+  current.
 - At most `MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT` (4) times `PTC_SIZE` validators for each
-  slot: 64 in the minimal preset and 2,048 in the mainnet preset. A new validator past the
-  limit removes the oldest validator of the slot.
+  slot: 64 in the minimal preset and 2,048 in the mainnet preset. At that limit, a valid key of
+  a new validator of the slot is IGNORE (`IgnoreReason::PayloadAttestationSlotFull { slot }`),
+  and `Seen` does not change.
 
-A key that one of the two limits removes lets a second copy of its message pass again, where
-the spec ignores it. That copy is a duplicate of a valid message, not an invalid message, and
-the limits never make a valid first copy IGNORE. A first copy that is pending when its slot
-goes before the floor is IGNORE as not current. The tests in
-`crates/gossip-validation/tests/payload_attestation.rs` pin each bound: the 500 ms edge with an
-automatic and an explicit prune, pending copies across a prune, a clock that goes back, the
-slot limit, a head change that admits two PTCs in one slot, the per-slot limit with five heads,
-and invalid copies that change nothing.
+### Why a full slot ignores a new validator
+
+There are three ways to bound the validators of a slot:
+
+- **Remove the oldest validator of the slot (first in, first out).** A removed key is not a
+  duplicate any more, so a valid copy of its message passes again and is ACCEPT a second time.
+  Any peer can send such a copy again: it needs no key, only a message that it received. With
+  five heads of disjoint PTCs in one slot, each validator of the first head can be ACCEPT again,
+  and each of these copies removes the next oldest validator. Thus the copies can go on until
+  the slot is past the clock disparity, and each ACCEPT forwards the message and gives it to
+  fork choice again.
+- **Keep a record of each removed validator.** A second copy is then IGNORE, but the record
+  grows by one key for each new validator of the slot, so the slot has no bound again.
+- **IGNORE a new validator of a full slot.** `Seen` stays at the limit, and each validator that
+  it keeps stays a duplicate until the floor passes its slot. No copy of a message is ACCEPT
+  twice. The cost is that a valid first message of a new validator of a full slot is IGNORE:
+  this node does not forward it, and does not penalize its peer. A slot is full only after the
+  head changed in the slot to at least four PTCs with different validators.
+
+This client uses the third way. The check of the limit is in `Seen::resolve`, not in the
+validation function. Thus a copy at a full slot gets each check of the topic: a validator
+outside the PTC, or an invalid signature, is still REJECT, and a signature with no verdict is
+still IGNORE with no change to `Seen`.
+
+A first copy that is pending when its slot goes before the floor is IGNORE as not current. The
+tests in `crates/gossip-validation/tests/payload_attestation.rs` pin each bound: the 500 ms
+edge with an automatic and an explicit prune, pending copies across a prune, a clock that goes
+back, the slot limit (`seen_keeps_at_most_the_slot_limit_and_removes_the_oldest_slot`,
+`a_slot_that_the_slot_limit_removes_must_not_accept_again`), a head change that admits two PTCs
+in one slot, the per-slot limit with five heads
+(`an_accepted_validator_must_not_accept_again_when_a_fifth_head_fills_the_slot`,
+`a_full_slot_keeps_each_validator_and_ignores_a_new_validator`), and invalid copies that change
+nothing (`an_invalid_copy_at_the_validator_limit_removes_no_validator`,
+`an_invalid_copy_does_not_prune_seen`).
+
+The only public prune is `Seen::prune_payload_attestations(store, current_time_ms)`. It prunes
+by the oldest current slot of the time, and an earlier time does nothing: the floor, the keys
+and the record of the last pruned slot stay as they are. The prune by slot is private to
+`seen.rs`, so no caller can give a floor that is not from the clock.

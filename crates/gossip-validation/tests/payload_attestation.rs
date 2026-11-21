@@ -69,6 +69,12 @@ fn time_at(slot: Slot) -> u64 {
     GENESIS_TIME * 1000 + slot * SLOT_MS
 }
 
+/// The first time at which `slot` is the oldest current slot: the slot before it is past the
+/// clock disparity. A prune at that time removes each slot before `slot`.
+fn prune_time(slot: Slot) -> u64 {
+    time_at(slot) + MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS + 1
+}
+
 /// The middle of slot 1, in milliseconds.
 fn mid_slot_1() -> u64 {
     time_at(1) + SLOT_MS / 2
@@ -920,10 +926,10 @@ fn an_explicit_prune_removes_a_slot_only_after_the_clock_disparity() {
     assert_eq!(seen.payload_attestation_slot_count(), 1);
     assert_eq!(seen.payload_attestation_count(), 1);
 
-    // A prune by slot removes each slot before that slot. A copy of slot 2 that resolves
-    // after it is IGNORE, and does not add slot 2 again.
+    // Once slot 2 is past the clock disparity, a prune removes it. A copy of slot 2 that
+    // resolves after the prune is IGNORE, and does not add slot 2 again.
     let (_, late) = pending(validate_at(&seen, store, &message(w, r, 2), time_at(2)));
-    seen.prune_payload_attestations_before(3);
+    seen.prune_payload_attestations(store, prune_time(3));
     assert_eq!(seen.payload_attestation_count(), 0);
     assert_eq!(seen.payload_attestation_slot_count(), 0);
     assert_eq!(
@@ -1074,7 +1080,7 @@ fn a_message_of_a_pruned_slot_must_ignore_also_at_an_earlier_time() {
 }
 
 #[test]
-fn a_prune_with_an_earlier_time_or_slot_does_not_lower_the_floor() {
+fn a_prune_with_an_earlier_time_does_not_lower_the_floor() {
     let (chain, r) = chain_at_slot_2();
     let store = &chain.store;
     let [v, _] = two_of_slot_2(store);
@@ -1094,11 +1100,13 @@ fn a_prune_with_an_earlier_time_or_slot_does_not_lower_the_floor() {
     assert_eq!(seen.min_payload_attestation_slot(), 2);
     let pruned = seen.clone();
 
-    // An earlier time, an earlier slot, or the same slot changes nothing.
+    // An earlier time, or a time whose oldest current slot is at or before the floor, changes
+    // nothing.
     seen.prune_payload_attestations(store, edge);
     seen.prune_payload_attestations(store, mid_slot_1());
     for slot in [0, 1, 2] {
-        seen.prune_payload_attestations_before(slot);
+        assert_eq!(oldest_current_slot(store, prune_time(slot)), slot);
+        seen.prune_payload_attestations(store, prune_time(slot));
     }
     assert_eq!(seen, pruned);
     assert_eq!(seen.min_payload_attestation_slot(), 2);
@@ -1126,14 +1134,14 @@ fn seen_keeps_the_keys_of_the_last_pruned_slot_until_the_floor_moves_again() {
     assert_eq!(seen.resolve(m2_first, Ok(true)), Verdict::Accept);
 
     // The floor moves to 2. The record has the key of slot 1.
-    seen.prune_payload_attestations_before(2);
+    seen.prune_payload_attestations(store, prune_time(2));
     assert!(seen.has_pruned_payload_attestation(1, 10));
     assert!(!seen.has_pruned_payload_attestation(2, v));
     assert!(!seen.has_pruned_payload_attestation(1, 11));
     let at_floor_2 = seen.clone();
 
     // The floor moves to 3. The record has the key of slot 2 only.
-    seen.prune_payload_attestations_before(3);
+    seen.prune_payload_attestations(store, prune_time(3));
     assert!(!seen.has_pruned_payload_attestation(1, 10));
     assert!(seen.has_pruned_payload_attestation(2, v));
     assert!(!seen.has_payload_attestation(2, v));
@@ -1153,7 +1161,7 @@ fn seen_keeps_the_keys_of_the_last_pruned_slot_until_the_floor_moves_again() {
 
     // From the floor 2, a move to 4 removes the record: slot 3 has no key.
     let mut jumped = at_floor_2;
-    jumped.prune_payload_attestations_before(4);
+    jumped.prune_payload_attestations(store, prune_time(4));
     assert!(!jumped.has_pruned_payload_attestation(1, 10));
     assert!(!jumped.has_pruned_payload_attestation(2, v));
     assert_eq!(jumped.payload_attestation_count(), 0);
@@ -1302,34 +1310,61 @@ fn a_head_change_in_a_slot_admits_the_ptc_of_each_head() {
 }
 
 #[test]
-fn a_slot_keeps_at_most_the_validator_limit_and_removes_the_oldest_validator() {
+fn a_full_slot_keeps_each_validator_and_ignores_a_new_validator() {
     assert_eq!(MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT, 4);
     let limit = MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT * PTC_SIZE;
     let chain = chain_with(96);
     // Five heads with disjoint PTCs: 80 validators for slot 1, more than the limit of 64.
     let heads = disjoint_heads(&chain, MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT + 1);
     let mut seen = Seen::default();
-    let mut accepted = Vec::new();
+    let mut offered = Vec::new();
     for (k, head) in heads.iter().enumerate() {
         let view = with_head(&chain, head);
         for validator in ptc_of(k) {
             let m = message(validator, chain.p, 1);
-            assert_eq!(
-                accept_at(&mut seen, &view, &m, mid_slot_1()),
-                Verdict::Accept
-            );
-            accepted.push(validator);
-            assert_eq!(seen.payload_attestation_count(), accepted.len().min(limit));
-            // Seen keeps the last `limit` validators, and removes only the oldest.
-            let first_kept = accepted.len().saturating_sub(limit);
-            for (i, v) in accepted.iter().enumerate() {
-                assert_eq!(seen.has_payload_attestation(1, *v), i >= first_kept, "{v}");
+            let before = seen.clone();
+            let verdict = offer_at(&mut seen, &view, &m, mid_slot_1());
+            offered.push(validator);
+            // The first `limit` validators accept. Each validator after them is IGNORE, and
+            // Seen does not change.
+            if offered.len() <= limit {
+                assert_eq!(verdict, Verdict::Accept, "{validator}");
+            } else {
+                assert_eq!(
+                    verdict,
+                    Verdict::Ignore(IgnoreReason::PayloadAttestationSlotFull { slot: 1 }),
+                    "{validator}"
+                );
+                assert_eq!(seen, before, "{validator}");
+            }
+            assert_eq!(seen.payload_attestation_count(), offered.len().min(limit));
+            // Seen keeps the first `limit` validators, and removes none of them.
+            for (i, v) in offered.iter().enumerate() {
+                assert_eq!(seen.has_payload_attestation(1, *v), i < limit, "{v}");
             }
         }
     }
-    assert_eq!(accepted.len(), 80);
+    assert_eq!(offered.len(), 80);
     assert_eq!(seen.payload_attestation_count(), limit);
     assert_eq!(seen.payload_attestation_slot_count(), 1);
+    // A copy of the message of each kept validator is a duplicate.
+    for (k, head) in heads
+        .iter()
+        .enumerate()
+        .take(MAX_PAYLOAD_ATTESTATION_HEADS_PER_SLOT)
+    {
+        let view = with_head(&chain, head);
+        for validator in ptc_of(k) {
+            assert_eq!(
+                validate_at(&seen, &view, &message(validator, chain.p, 1), mid_slot_1()),
+                Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+                    slot: 1,
+                    validator_index: validator
+                }),
+                "{validator}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1381,12 +1416,11 @@ fn an_accepted_validator_must_not_accept_again_when_a_fifth_head_fills_the_slot(
             );
         }
     }
-    // No validator of the fifth head accepts.
+    // No validator of the fifth head accepts: the slot is full.
+    let slot_full = Verdict::Ignore(IgnoreReason::PayloadAttestationSlotFull { slot: 1 });
     for (validator, verdict) in fifth_ptc.iter().zip(fifth_verdicts) {
-        assert!(
-            matches!(verdict, Verdict::Ignore(_)),
-            "{validator}: {verdict:?}"
-        );
+        assert_eq!(verdict, slot_full, "{validator}");
+        assert!(!seen.has_payload_attestation(1, *validator), "{validator}");
     }
     assert_eq!(seen.payload_attestation_count(), limit);
     assert_eq!(seen.payload_attestation_slot_count(), 1);
@@ -1498,14 +1532,14 @@ fn an_invalid_copy_at_the_validator_limit_removes_no_validator() {
         assert!(!seen.has_payload_attestation(1, 64));
     }
 
-    // A valid copy accepts, and removes only the oldest validator.
+    // A valid copy is IGNORE: the slot is full. It removes no validator.
     assert_eq!(
         accept_at(&mut seen, &fifth, &m, mid_slot_1()),
-        Verdict::Accept
+        Verdict::Ignore(IgnoreReason::PayloadAttestationSlotFull { slot: 1 })
     );
-    assert!(seen.has_payload_attestation(1, 64));
-    assert!(!seen.has_payload_attestation(1, 0));
-    for validator in 1..64 {
+    assert_eq!(seen, full);
+    assert!(!seen.has_payload_attestation(1, 64));
+    for validator in 0..64 {
         assert!(seen.has_payload_attestation(1, validator), "{validator}");
     }
     assert_eq!(seen.payload_attestation_count(), 64);
