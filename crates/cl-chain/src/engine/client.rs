@@ -378,6 +378,12 @@ impl ForkchoiceSink for FcuSender {
     fn send(&self, args: ForkchoiceArgs) {
         Self::send(self, args);
     }
+
+    fn take_outcome(&self) -> Option<FcuOutcome> {
+        None
+    }
+
+    fn halt(&self) {}
 }
 
 impl Drop for FcuSender {

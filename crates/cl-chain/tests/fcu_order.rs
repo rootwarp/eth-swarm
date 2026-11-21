@@ -1,9 +1,10 @@
 //! [`FcuSender`] against a mock `ethswarm.engine.v1` server on a Unix socket: latest wins after
-//! a stall, `seq` keeps increasing across a reconnect, and the request carries the custody bits
-//! and no payload attributes. Also the `[chain.engine]` config of its socket.
+//! a stall, `seq` keeps increasing across a reconnect, the request carries the custody bits and
+//! no payload attributes, a halted sender sends nothing more, and the caller takes each answer
+//! once. Also the `[chain.engine]` config of its socket.
 
-use cl_chain::engine::client::{EngineSeq, FcuErrorKind, FcuMetrics, FcuSender};
-use cl_chain::engine::fcu::{custody_column_bits, ForkchoiceArgs};
+use cl_chain::engine::client::{EngineSeq, FcuErrorKind, FcuMetrics, FcuSender, BACKOFF_MIN};
+use cl_chain::engine::fcu::{custody_column_bits, ForkchoiceArgs, ForkchoiceSink};
 use cl_chain::probe::service::CHAIN_METHODS;
 use consensus_types::das;
 use consensus_types::primitives::{Hash32, U256};
@@ -249,6 +250,88 @@ async fn seq_increases_across_reconnect() {
     let third = next(&mut arrived).await;
     assert!(third.seq > second.seq, "{} after {}", third.seq, second.seq);
     answered(&sender, third.seq).await;
+    server.stop().await;
+}
+
+/// The EL stalls on a call, and newer arguments wait in the slot. The halt drops them: the
+/// stalled call is still answered, and nothing more is sent, a later send included.
+#[tokio::test]
+async fn a_halted_sender_drops_the_queued_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine.sock");
+    let (mock, mut arrived) = MockEngine::new(0);
+    let server = Server::start(&path, mock.clone());
+    let (sender, metrics, _registry) = sender(&path);
+    sender.send(args(1));
+    let first = next(&mut arrived).await;
+    sender.send(args(2));
+    ForkchoiceSink::halt(&sender);
+    sender.send(args(3));
+    mock.gate.add_permits(16);
+    let outcome = answered(&sender, first.seq).await;
+    assert_eq!(
+        outcome.args,
+        args(1),
+        "the call on its way is still answered"
+    );
+    let more = tokio::time::timeout(Duration::from_millis(300), arrived.recv()).await;
+    assert!(more.is_err(), "a call was sent after the halt: {more:?}");
+    assert_eq!(mock.heads(), [hash(1).to_vec()]);
+    assert_eq!(metrics.sent(), 1);
+    server.stop().await;
+}
+
+/// cl-engine goes away, and the call is lost: the sender would try it again after the backoff.
+/// Halted before that, it does not, also once cl-engine is back.
+#[tokio::test]
+async fn a_halted_sender_does_not_retry_a_lost_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine.sock");
+    let (mock, mut arrived) = MockEngine::new(Semaphore::MAX_PERMITS);
+    let server = Server::start(&path, mock);
+    let (sender, metrics, _registry) = sender(&path);
+    sender.send(args(1));
+    let first = next(&mut arrived).await;
+    answered(&sender, first.seq).await;
+    server.stop().await;
+    std::fs::remove_file(&path).unwrap();
+    sender.send(args(2));
+    let failed = || metrics.errors(FcuErrorKind::Connect) + metrics.errors(FcuErrorKind::Rpc);
+    tokio::time::timeout(WAIT, async {
+        while failed() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the sender sees cl-engine gone");
+    ForkchoiceSink::halt(&sender);
+    let (mock, mut arrived) = MockEngine::new(Semaphore::MAX_PERMITS);
+    let server = Server::start(&path, mock.clone());
+    // Past the backoff of the next try, and the one after it.
+    let more = tokio::time::timeout(BACKOFF_MIN * 3, arrived.recv()).await;
+    assert!(more.is_err(), "the lost call was tried again: {more:?}");
+    assert!(mock.heads().is_empty());
+    server.stop().await;
+}
+
+/// The caller takes each answer once ([`ForkchoiceSink::take_outcome`]): none before the first
+/// answer, the latest one after it, and none again until a newer one comes.
+#[tokio::test]
+async fn the_caller_takes_each_answer_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine.sock");
+    let (mock, mut arrived) = MockEngine::new(Semaphore::MAX_PERMITS);
+    let server = Server::start(&path, mock);
+    let (sender, _metrics, _registry) = sender(&path);
+    assert_eq!(sender.take_outcome(), None);
+    for n in [1, 2] {
+        sender.send(args(n));
+        let call = next(&mut arrived).await;
+        answered(&sender, call.seq).await;
+        let taken = sender.take_outcome().expect("a new answer");
+        assert_eq!((taken.seq, taken.args), (call.seq, args(n)));
+        assert_eq!(sender.take_outcome(), None, "the same answer again");
+    }
     server.stop().await;
 }
 

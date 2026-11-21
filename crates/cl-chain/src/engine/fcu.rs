@@ -20,6 +20,7 @@
 //! - **Payload attributes**: none. v1 builds no blocks, so the request has no
 //!   `payload_attributes`, and cl-engine sends `null` with `engine_forkchoiceUpdatedV4`.
 
+use super::client::FcuOutcome;
 pub use crate::persist::durable::PayloadStatus;
 use consensus_types::das::NUMBER_OF_COLUMNS;
 use consensus_types::primitives::{ColumnIndex, Hash32, Root};
@@ -82,6 +83,11 @@ pub struct ForkchoiceArgs {
 pub trait ForkchoiceSink: Send {
     /// Sends `args`, without a wait for the EL.
     fn send(&self, args: ForkchoiceArgs);
+    /// The latest answered call, if this is the first time it is taken.
+    fn take_outcome(&self) -> Option<FcuOutcome>;
+    /// Stops for good: arguments not sent yet are dropped, a lost call is not tried again, and
+    /// no later call is sent. A call already on its way can still be answered.
+    fn halt(&self);
 }
 
 impl ForkchoiceArgs {
