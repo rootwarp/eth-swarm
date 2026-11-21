@@ -22,14 +22,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 const GENESIS_EPOCH: u64 = 0;
 
 /// `get_head` (G L638-670). The parts of `get_weight` that are the same for each node are
-/// computed once for the call (`Boost`), not once for each node.
+/// computed once for the call (`Weigh`), not once for each node.
 pub fn get_head<E: Preset>(store: &Store<E>) -> Result<ForkChoiceNode, Error> {
     let nodes = get_filtered_node_tree(store)?;
     let justified_root = store.justified_checkpoint.root;
     if nodes.is_empty() {
         return Ok(ForkChoiceNode::new(justified_root, PayloadStatus::Empty));
     }
-    let mut boost = None;
+    let mut weigh = Weigh::default();
     let mut head = ForkChoiceNode::new(justified_root, PayloadStatus::Pending);
     loop {
         let mut best: Option<((Gwei, Root, u8), ForkChoiceNode)> = None;
@@ -38,7 +38,7 @@ pub fn get_head<E: Preset>(store: &Store<E>) -> Result<ForkChoiceNode, Error> {
                 continue;
             }
             let key = (
-                weight(store, &child, &mut boost)?,
+                weight(store, &child, &mut weigh)?,
                 child.root,
                 get_payload_status_tiebreaker(store, &child)?,
             );
@@ -199,28 +199,39 @@ fn get_voting_source<E: Preset>(store: &Store<E>, block_root: Root) -> Result<Ch
     }
 }
 
-/// `get_weight` (G L567-589).
+/// `get_weight` (G L567-589). Not in the spec: a vote or a proposer boost on an invalidated FULL
+/// branch adds no weight ([`Invalidated`]).
 pub fn get_weight<E: Preset>(store: &Store<E>, node: &ForkChoiceNode) -> Result<Gwei, Error> {
-    weight(store, node, &mut None)
+    weight(store, node, &mut Weigh::default())
 }
 
-/// `get_weight` with the [`Boost`] of the caller. `boost` is computed at the first node that
-/// is not a payload decision of the previous slot (`is_previous_slot_payload_decision`). The
-/// spec first reads the justified state and `should_apply_proposer_boost` at that node too, so
-/// the call fails where the spec fails.
+/// The parts of `get_weight` that are the same for each node of one call: the [`Boost`], and
+/// the blocks that a walk found on an invalidated FULL branch or not ([`Invalidated`]).
+#[derive(Default)]
+struct Weigh {
+    boost: Option<Boost>,
+    invalidated: Invalidated,
+}
+
+/// `get_weight` with the [`Weigh`] of the caller. The [`Boost`] is computed at the first node
+/// that is not a payload decision of the previous slot (`is_previous_slot_payload_decision`).
+/// The spec first reads the justified state and `should_apply_proposer_boost` at that node too,
+/// so the call fails where the spec fails.
 fn weight<E: Preset>(
     store: &Store<E>,
     node: &ForkChoiceNode,
-    boost: &mut Option<Boost>,
+    weigh: &mut Weigh,
 ) -> Result<Gwei, Error> {
     if is_previous_slot_payload_decision(store, node)? {
         return Ok(0);
     }
     let state = store.justified_state()?;
-    let attestation_score = get_attestation_score(store, node, state)?;
-    let boost = match boost {
+    let attestation_score = get_attestation_score(store, node, state, &mut weigh.invalidated)?;
+    let boost = match &mut weigh.boost {
         Some(boost) => boost,
-        None => boost.insert(Boost::new(store, state)?),
+        None => weigh
+            .boost
+            .insert(Boost::new(store, state, &mut weigh.invalidated)?),
     };
     let proposer_score = boost.proposer_score(node)?;
     attestation_score
@@ -228,9 +239,63 @@ fn weight<E: Preset>(
         .ok_or(Error::Overflow)
 }
 
+/// Not in the spec: which blocks are on an invalidated FULL branch, for one call. Such a block
+/// builds, on its chain down to the anchor, on the FULL node of a block whose payload is not in
+/// `store.payloads`: `on_block` takes a block on a FULL node only while that payload is
+/// verified, so the payload left the store ([`crate::invalidate_payloads`]).
+/// `bellatrix/optimistic-sync.md`: the weights of an `INVALIDATED` block must not be applied to
+/// its ancestors. So a vote or a proposer boost on such a branch adds no weight to any node. The
+/// EMPTY node of the block of that payload, and the blocks on it, keep their weight.
+///
+/// It keeps the answer for each block that a walk passed, and a later walk stops at the first
+/// such block, as [`CheckpointBlocks`] does.
+#[derive(Default)]
+struct Invalidated(HashMap<Root, bool>);
+
+impl Invalidated {
+    /// Whether `node` is on an invalidated FULL branch: a FULL node whose payload is not in
+    /// `store.payloads` (`on_attestation` takes a vote for a FULL node only while its payload is
+    /// verified), or a node of a block on such a branch.
+    fn contains<E: Preset>(
+        &mut self,
+        store: &Store<E>,
+        node: &ForkChoiceNode,
+    ) -> Result<bool, Error> {
+        if node.payload_status == PayloadStatus::Full && !is_payload_verified(store, node.root) {
+            return Ok(true);
+        }
+        self.has_block(store, node.root)
+    }
+
+    /// Whether block `root` is on an invalidated FULL branch: it, or a block below it down to
+    /// the anchor, builds on the FULL node of a block whose payload is not in `store.payloads`.
+    fn has_block<E: Preset>(&mut self, store: &Store<E>, root: Root) -> Result<bool, Error> {
+        let mut walked = Vec::new();
+        let mut current = root;
+        let found = loop {
+            if let Some(found) = self.0.get(&current) {
+                break *found;
+            }
+            if current == store.anchor_root {
+                break false;
+            }
+            let block = store.get_block(current)?;
+            walked.push(current);
+            if is_parent_node_full(store, block)? && !is_payload_verified(store, block.parent_root)
+            {
+                break true;
+            }
+            current = block.parent_root;
+        };
+        self.0.extend(walked.into_iter().map(|root| (root, found)));
+        Ok(found)
+    }
+}
+
 /// The proposer boost part of `get_weight` (G L578-588), which does not depend on the node.
 enum Boost {
-    /// `should_apply_proposer_boost` is false.
+    /// `should_apply_proposer_boost` is false, or the boosted block is on an invalidated FULL
+    /// branch.
     Off,
     On {
         /// The status of each block on the chain of the PENDING node of the boosted block
@@ -244,9 +309,15 @@ enum Boost {
 }
 
 impl Boost {
-    fn new<E: Preset>(store: &Store<E>, state: &BeaconState<E>) -> Result<Self, Error> {
+    /// Not in the spec: also [`Self::Off`] for a boosted block on an invalidated FULL branch
+    /// ([`Invalidated`]), which adds no weight.
+    fn new<E: Preset>(
+        store: &Store<E>,
+        state: &BeaconState<E>,
+        invalidated: &mut Invalidated,
+    ) -> Result<Self, Error> {
         let root = store.proposer_boost_root;
-        if !should_apply_proposer_boost(store)? {
+        if !should_apply_proposer_boost(store)? || invalidated.has_block(store, root)? {
             return Ok(Self::Off);
         }
         let mut chain = HashMap::new();
@@ -288,10 +359,14 @@ impl Boost {
 /// a block that a message names, and `on_attestation` can still set a message for a dropped
 /// block. Such a block is not a descendant of the finalized block, so in the spec's store,
 /// which keeps it, the message supports no node that the pruned store keeps.
+///
+/// Not in the spec: a message whose supported node is on an invalidated FULL branch counts for
+/// no node ([`Invalidated`]). The message stays in `store.latest_messages`.
 fn get_attestation_score<E: Preset>(
     store: &Store<E>,
     node: &ForkChoiceNode,
     state: &BeaconState<E>,
+    invalidated: &mut Invalidated,
 ) -> Result<Gwei, Error> {
     let epoch = get_current_epoch(state);
     let mut score: Gwei = 0;
@@ -311,7 +386,8 @@ fn get_attestation_score<E: Preset>(
         let Some(block) = store.blocks.get(&message.root) else {
             continue;
         };
-        if is_ancestor(store, get_supported_node(block, message), *node)? {
+        let supported = get_supported_node(block, message);
+        if is_ancestor(store, supported, *node)? && !invalidated.contains(store, &supported)? {
             score = score
                 .checked_add(validator.effective_balance)
                 .ok_or(Error::Overflow)?;
@@ -450,7 +526,8 @@ fn is_head_weak<E: Preset>(store: &Store<E>, head_root: Root) -> Result<bool, Er
         calculate_committee_fraction(justified_state, REORG_HEAD_WEIGHT_THRESHOLD)?;
     let head_block = store.get_block(head_root)?;
     let head_node = ForkChoiceNode::new(head_root, PayloadStatus::Pending);
-    let mut head_weight = get_attestation_score(store, &head_node, justified_state)?;
+    let invalidated = &mut Invalidated::default();
+    let mut head_weight = get_attestation_score(store, &head_node, justified_state, invalidated)?;
     if !store.equivocating_indices.is_empty() {
         let head_state = store.get_block_state(head_root)?;
         let epoch = E::epoch_at_slot(head_block.slot);

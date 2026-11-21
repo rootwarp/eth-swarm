@@ -306,6 +306,8 @@ pub struct ExecutionStatuses {
     finalized: Option<Hash32>,
     /// See [`ExecutionStatuses::el_contradiction`].
     contradiction: bool,
+    /// A payload became `Invalid` since the last [`ExecutionStatuses::take_invalidated`].
+    invalidated: bool,
 }
 
 impl ExecutionStatuses {
@@ -471,12 +473,27 @@ impl ExecutionStatuses {
     /// payload invalid (an `INVALID` for it, or a boundary or a descendant cascade that reaches
     /// it), a finalized one invalid (see the type docs), or an `Invalid` payload valid (a `VALID`
     /// for it or a descendant, or a `latestValidHash` that names it), or it answered a
-    /// forkchoiceUpdated with `INVALID_BLOCK_HASH` ([`Self::record_head`]). The statuses stay as
-    /// they were (see the type docs). It stays `true`: the spec asks for manual intervention, and
-    /// how cl-chain reacts is the caller's to decide.
+    /// forkchoiceUpdated with `INVALID_BLOCK_HASH` ([`Self::record_head`]). The chain core also
+    /// sets it when the justified checkpoint builds on an `Invalid` payload
+    /// ([`Self::set_contradiction`]). The statuses stay as they were (see the type docs). It stays
+    /// `true`: the spec asks for manual intervention, and how cl-chain reacts is the caller's to
+    /// decide.
     #[must_use]
     pub fn el_contradiction(&self) -> bool {
         self.contradiction
+    }
+
+    /// Sets [`Self::el_contradiction`] for a contradiction that the caller found between the
+    /// EL's verdicts and the chain, so that fail-closed stays one latch.
+    pub(crate) fn set_contradiction(&mut self) {
+        self.contradiction = true;
+    }
+
+    /// Whether a payload became `Invalid` since the last call, and clears it. Only a new
+    /// `Invalid` payload can make a payload that the caller holds verified invalid: a status
+    /// never leaves `Invalid` (see the type docs).
+    pub(crate) fn take_invalidated(&mut self) -> bool {
+        std::mem::take(&mut self.invalidated)
     }
 
     /// How many payloads have a full entry: an evicted `Invalid` payload (see
@@ -549,6 +566,7 @@ impl ExecutionStatuses {
                         };
                         self.invalid.insert(self.next_order, at);
                         self.next_order += 1;
+                        self.invalidated = true;
                     }
                 }
             }
