@@ -588,17 +588,22 @@ impl Waiting {
     }
 }
 
-/// A fake cl-verify that gives the answers of `inner`. After each call, the caller of the
-/// import stops waiting.
+/// A fake cl-verify that gives the answers of `inner`. At the end of call `on_call` (1 is the
+/// first call), the caller of the import stops waiting. The other calls do not drop the
+/// receiver.
 struct StopsWaiting {
     inner: Arc<FakeVerify>,
     waiting: Waiting,
+    on_call: usize,
 }
 
 impl BlsVerifier for StopsWaiting {
     async fn verify_sets(&self, sets: Vec<BlsSet>, deadline: Instant) -> BlsOutcome {
         let outcome = self.inner.verify_sets(sets, deadline).await;
-        self.waiting.stop();
+        // The core waits for each call, so the calls do not overlap.
+        if self.inner.called().len() == self.on_call {
+            self.waiting.stop();
+        }
         outcome
     }
 }
@@ -842,6 +847,7 @@ async fn an_import_whose_caller_stops_waiting_during_the_proposer_check_does_not
     let stops = Arc::new(StopsWaiting {
         inner: Arc::clone(&verify),
         waiting: waiting.clone(),
+        on_call: 1,
     });
     let watched = import_watched(core, block.clone(), stops, &waiting, None).await;
     assert_eq!(
@@ -866,4 +872,94 @@ async fn an_import_whose_caller_stops_waiting_during_the_proposer_check_does_not
         committed(&block),
         "the block must be able to come again"
     );
+}
+
+#[tokio::test]
+async fn an_import_whose_caller_stops_waiting_during_the_block_sets_does_not_commit() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let slot = window() + 4;
+    let (block, _) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+    let block_root = block.message.tree_hash_root();
+    let core = f.core.with_clock(wall.at(slot));
+    let verify = FakeVerify::new(Answer::Valid);
+    let waiting = Waiting::default();
+    // The fake cl-verify gives VALID to the proposer set and to the block sets. It drops the
+    // receiver at the end of the second call, the call of the block sets.
+    let stops = Arc::new(StopsWaiting {
+        inner: Arc::clone(&verify),
+        waiting: waiting.clone(),
+        on_call: 2,
+    });
+    let watched = import_watched(core, block.clone(), stops, &waiting, None).await;
+    assert_eq!(
+        watched.outcome, None,
+        "the fake cl-verify must drop the receiver"
+    );
+    assert_eq!(
+        verify.calls().len(),
+        2,
+        "the proposer set and the block sets must go to cl-verify"
+    );
+    let core = watched.core;
+    assert_unchanged(&core, f.anchor, block_root);
+    assert!(
+        !core.is_refused(&block_root),
+        "the core must not keep the refusal of a stopped import"
+    );
+
+    // A committed root comes back as IGNORE before cl-verify. Two calls show a full import.
+    let (outcome, core, verify) = import_one(core, block.clone(), Answer::Valid).await;
+    assert_eq!(
+        outcome,
+        committed(&block),
+        "the block must be able to come again"
+    );
+    assert_eq!(verify.calls().len(), 2);
+    assert_eq!(core.head(), head_of(&block));
+}
+
+#[tokio::test]
+async fn an_invalid_verdict_after_the_caller_stops_waiting_is_not_kept() {
+    // INVALID for the proposer set (call 1), and INVALID for the block sets (call 2).
+    let cases = [
+        (vec![Answer::Invalid], 1),
+        (vec![Answer::Valid, Answer::Invalid], 2),
+    ];
+    for (answers, on_call) in cases {
+        let f = fixture();
+        let wall = Wall::of(&f);
+        let slot = window() + 4;
+        let (block, _) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+        let block_root = block.message.tree_hash_root();
+        let core = f.core.with_clock(wall.at(slot));
+        let verify = FakeVerify::answers(answers);
+        let waiting = Waiting::default();
+        // The fake cl-verify drops the receiver at the end of call `on_call`, and then gives
+        // INVALID.
+        let stops = Arc::new(StopsWaiting {
+            inner: Arc::clone(&verify),
+            waiting: waiting.clone(),
+            on_call,
+        });
+        let watched = import_watched(core, block.clone(), stops, &waiting, None).await;
+        assert_eq!(
+            watched.outcome, None,
+            "call {on_call}: the fake cl-verify must drop the receiver"
+        );
+        assert_eq!(verify.calls().len(), on_call, "call {on_call}");
+        let core = watched.core;
+        assert_unchanged(&core, f.anchor, block_root);
+        assert!(
+            !core.is_refused(&block_root),
+            "call {on_call}: the core must not keep an INVALID verdict of a stopped import"
+        );
+
+        let (outcome, _, _) = import_one(core, block.clone(), Answer::Valid).await;
+        assert_eq!(
+            outcome,
+            committed(&block),
+            "call {on_call}: the block must be able to come again"
+        );
+    }
 }
