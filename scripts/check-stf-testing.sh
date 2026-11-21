@@ -13,6 +13,13 @@
 # The same rules hold for the `testing` feature of another package: the second argument names
 # it (scripts/check-fork-choice-testing.sh checks `fork-choice/testing` this way).
 #
+# The rules hold for each package that cargo builds from a path: the workspace members, and the
+# path crates outside the workspace directory, which `cargo metadata --no-deps` does not list.
+# The check follows each path dependency of a member (any kind) and the normal and build path
+# dependencies of an outside crate (cargo builds no dev-dependency of a package outside the
+# workspace), and reads each outside crate with its own `cargo metadata --no-deps --offline`. So
+# it resolves nothing and fetches nothing.
+#
 # Usage: scripts/check-stf-testing.sh [path/to/workspace/Cargo.toml] [package]
 #   (default: this repo, and the package state-transition)
 # Env: CARGO (default `cargo`). Needs python3. Works with bash 3.2.
@@ -30,11 +37,39 @@ if ((rc != 0)); then
   exit 1
 fi
 printf '%s' "$meta" | python3 -I -c '
-import sys, json
+import sys, json, os, subprocess
 
-OWNER, FEATURE = sys.argv[1], "testing"
+OWNER, CARGO, FEATURE = sys.argv[1], sys.argv[2], "testing"
 meta = json.load(sys.stdin)
 pkgs = meta["packages"]
+
+def real(path):
+    return os.path.realpath(path)
+
+# The path crates outside the workspace, reached through path dependencies.
+seen = {real(p["manifest_path"]) for p in pkgs}
+queue = [(p, True) for p in pkgs]
+while queue:
+    p, member = queue.pop()
+    for d in p["dependencies"]:
+        if d.get("path") is None or (d["kind"] == "dev" and not member):
+            continue
+        manifest = real(os.path.join(d["path"], "Cargo.toml"))
+        if manifest in seen:
+            continue
+        seen.add(manifest)
+        out = subprocess.run([CARGO, "metadata", "--no-deps", "--offline", "--format-version",
+                              "1", "--manifest-path", manifest], capture_output=True, text=True)
+        if out.returncode != 0:
+            sys.exit("ERROR: cargo metadata failed for %s (exit %d):\n%s"
+                     % (manifest, out.returncode, out.stderr))
+        found = [q for q in json.loads(out.stdout)["packages"]
+                 if real(q["manifest_path"]) == manifest]
+        if len(found) != 1:
+            sys.exit("ERROR: no package at %s" % manifest)
+        pkgs.append(found[0])
+        queue.append((found[0], False))
+
 owner = [p for p in pkgs if p["name"] == OWNER]
 if len(owner) != 1:
     sys.exit("ERROR: want exactly one %s package, found %d" % (OWNER, len(owner)))
@@ -64,4 +99,4 @@ for e in errors:
 if errors:
     sys.exit(1)
 print("%s/%s OK (enabled by dev-dependencies only)" % (OWNER, FEATURE))
-' "$package"
+' "$package" "$cargo"
