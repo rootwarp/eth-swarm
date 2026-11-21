@@ -26,6 +26,11 @@
 //! it reached. A later walk from the same parent starts from the latest of them, so it does not
 //! walk those slots again.
 //!
+//! An import reads a kept state only after it finds the pre-state of the parent. So after each
+//! new pre-state, the chain core drops the kept states of each parent whose pre-state left the
+//! LRU ([`Advanced::retain`]). A later prune of pre-states at finality must also drop the kept
+//! states of the parents that it prunes.
+//!
 //! - after the proposer signature, the walk must fit in the admission budget of the core
 //!   ([`AdvanceBudget`]): at most [`MAX_ADVANCE_EPOCHS_PER_SLOT`] epochs of walk for each slot
 //!   of the clock of the core. Else it is IGNORE, with no `process_slots`.
@@ -113,6 +118,12 @@ impl<S> Advanced<S> {
         if self.entries.len() > self.max {
             self.entries.remove(0);
         }
+    }
+
+    /// Keeps only the states of the parents for which `keep` is `true`. The order of use of
+    /// those states does not change.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Root) -> bool) {
+        self.entries.retain(|((parent, _), _)| keep(parent));
     }
 
     /// The number of states.

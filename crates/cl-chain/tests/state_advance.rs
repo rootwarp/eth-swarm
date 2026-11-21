@@ -164,6 +164,28 @@ fn the_kept_states_are_bounded_and_the_least_recent_goes_first() {
     assert_eq!(Advanced::<u64>::new(0).len(), 0);
 }
 
+#[test]
+fn a_retain_keeps_the_states_of_the_parents_that_stay() {
+    let mut kept = Advanced::new(8);
+    kept.insert(root(1), 1, 11u64);
+    kept.insert(root(2), 1, 21);
+    kept.insert(root(1), 2, 12);
+    kept.insert(root(3), 1, 31);
+    kept.retain(|parent| *parent != root(1));
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept.peek(&root(1), 1), None);
+    assert_eq!(kept.peek(&root(1), 2), None);
+    assert_eq!(kept.peek(&root(2), 1), Some(&21));
+    assert_eq!(kept.peek(&root(3), 1), Some(&31));
+    // The order of use does not change: 2 is still the least recent, and goes at the next
+    // insert past the bound.
+    for byte in 4..11 {
+        kept.insert(root(byte), 1, u64::from(byte));
+    }
+    assert_eq!(kept.peek(&root(2), 1), None);
+    assert_eq!(kept.peek(&root(3), 1), Some(&31));
+}
+
 /// The wall clock of the fixture chain.
 struct Wall {
     genesis_ms: u128,

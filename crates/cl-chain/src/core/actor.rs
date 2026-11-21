@@ -74,10 +74,12 @@
 //! a walk go in calls between them. Each VerifyBls call of one import gets the same deadline,
 //! and no verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state
 //! root equal to `block.state_root` and a gate that permits the payload: it makes the parent
-//! pre-state the most recently used, keeps the post-state as a pre-state, and the block
-//! becomes the head. There is no fork choice yet, so the head is the last block the core
-//! committed. On any other outcome the head and the pre-states do not change, their order of
-//! use included. An INVALID outcome of the transition is kept.
+//! pre-state the most recently used, keeps the post-state as a pre-state, drops the kept walk
+//! states of each parent whose pre-state left the LRU, and the block becomes the head. There is
+//! no fork choice yet, so the head is the last block the core committed. There is no prune of
+//! pre-states at finality yet; when one comes, it must also drop the kept walk states of the
+//! parents that it prunes. On any other outcome the head and the pre-states do not change,
+//! their order of use included. An INVALID outcome of the transition is kept.
 //!
 //! # Seen roots
 //!
@@ -671,6 +673,10 @@ impl<E: Preset> ChainCore<E> {
                 };
                 self.snapshots.promote(&parent);
                 self.snapshots.insert(imported.block_root, imported.post);
+                // The insert can drop the pre-state of a parent. Its kept walk states then
+                // cannot serve an import, as an import needs that pre-state first.
+                let snapshots = &self.snapshots;
+                self.advanced.retain(|parent| snapshots.contains(parent));
                 self.committed.insert(imported.block_root);
                 Outcome::Committed {
                     block_root: imported.block_root,

@@ -8,6 +8,11 @@
 //!
 //! The bound is provisional. It holds until the state retention of the store binds the disk
 //! budget of states (the last two per-epoch states plus the finalized one).
+//!
+//! [`Snapshots::insert`] is the only path that drops a pre-state. The chain core then drops the
+//! states that its walks keep for that parent (see [`advance`](super::advance)). There is no
+//! prune at finality yet; when one comes, it must also drop the kept walk states of the
+//! parents that it prunes.
 
 use consensus_types::primitives::Root;
 use consensus_types::EthSpec;
@@ -67,6 +72,12 @@ impl<S> Snapshots<S> {
             .iter()
             .find(|(r, _)| r == root)
             .map(|(_, state)| state)
+    }
+
+    /// `true` if the core holds the pre-state of block `root`, the anchor included. The order
+    /// of use does not change.
+    pub fn contains(&self, root: &Root) -> bool {
+        self.peek(root).is_some()
     }
 
     /// Keeps `state` as the pre-state of the children of block `root`, the most recently used.

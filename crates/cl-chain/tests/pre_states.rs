@@ -82,6 +82,20 @@ fn a_promote_makes_a_pre_state_the_most_recent() {
 }
 
 #[test]
+fn contains_is_true_for_the_anchor_and_the_kept_pre_states() {
+    let mut lru = Snapshots::new(root(0), 0u8, 3);
+    lru.insert(root(1), 1);
+    lru.insert(root(2), 2);
+    assert!(lru.contains(&root(0)));
+    assert!(lru.contains(&root(1)));
+    assert!(!lru.contains(&root(9)));
+    // A contains does not change the order of use: 1 is still the least recent.
+    lru.insert(root(3), 3);
+    assert!(!lru.contains(&root(1)));
+    assert!(lru.contains(&root(0)), "the anchor must stay");
+}
+
+#[test]
 fn a_peek_does_not_change_the_order_of_use() {
     let mut lru = Snapshots::new(root(0), 0u8, 3);
     lru.insert(root(1), 1);
