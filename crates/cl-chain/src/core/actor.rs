@@ -51,8 +51,7 @@
 //!   pre-state and the proposer domain of the fork that the network schedule gives for the
 //!   epoch of the block ([`schedule_proposer_domain`]): INVALID on an INVALID verdict (kept for
 //!   that signature only), IGNORE on no verdict;
-//! - the walk does not fit in the admission budget
-//!   ([`AdvanceBudget`](super::advance::AdvanceBudget)): at most
+//! - the walk does not fit in the admission budget ([`AdvanceBudget`]): at most
 //!   [`MAX_ADVANCE_EPOCHS_PER_SLOT`](super::advance::MAX_ADVANCE_EPOCHS_PER_SLOT) epochs of walk
 //!   for each slot of the wall clock. Charged in full before the walk: IGNORE, with no walk and
 //!   no charge;
