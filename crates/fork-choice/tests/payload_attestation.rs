@@ -5,9 +5,14 @@
 //! state at the slot of the block. The anchor state sets the PTC of slot 1, so the tests know
 //! the PTC position of each member. The verifier gives the signature verdict that each test
 //! chooses, and records each call.
+//!
+//! The provider does not move the PTC window. In a state of epoch 1, the PTC of slot 9 is the
+//! entry that a state of epoch 0 has for slot 1, so the PTC that a test sets for slot 1 is also
+//! the PTC of slot 9 in the later states.
 
 use consensus_types::gloas::{
-    BeaconBlock, BeaconState, PayloadAttestationData, PayloadAttestationMessage, SignedBeaconBlock,
+    BeaconBlock, BeaconState, Checkpoint, PayloadAttestationData, PayloadAttestationMessage,
+    SignedBeaconBlock,
 };
 use consensus_types::primitives::{BLSSignature, Root, Slot, ValidatorIndex};
 use consensus_types::signing::{
@@ -16,9 +21,9 @@ use consensus_types::signing::{
 use consensus_types::Minimal;
 use fork_choice::testing::mark_payload_verified;
 use fork_choice::{
-    get_forkchoice_store, get_head, on_block, on_payload_attestation_message, on_tick, Error,
-    ForkChoiceNode, PayloadAttestationError, PayloadStatus, SignatureVerifier, StateProvider,
-    Store,
+    get_forkchoice_store, get_head, on_block, on_payload_attestation_message, on_tick,
+    store_target_checkpoint_state, Error, ForkChoiceNode, PayloadAttestationError, PayloadStatus,
+    SignatureVerifier, StateProvider, Store,
 };
 use state_transition::accessors::get_domain;
 use state_transition::caches::get_ptc;
@@ -43,6 +48,13 @@ const DISTINCT: [ValidatorIndex; PTC_SIZE] = [
 ];
 /// A validator that is not in [`DISTINCT`].
 const OUTSIDER: ValidatorIndex = 40;
+/// The PTC of slot 1 in the post-state of a block of [`OtherPtc`]: validator `48 + i` at
+/// position `i`. It has no validator of [`DISTINCT`].
+const OTHER_PTC: [ValidatorIndex; PTC_SIZE] = [
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+];
+/// The fork version of the post-state of a block of [`OtherPtc`].
+const OTHER_VERSION: [u8; 4] = [9, 9, 9, 9];
 
 fn time_at(slot: Slot) -> u64 {
     GENESIS_TIME * 1000 + slot * SLOT_MS
@@ -69,6 +81,57 @@ impl StateProvider<E> for Provider {
         state.slot = slot;
         Ok(())
     }
+}
+
+/// [`Provider`], and the post-state has the PTC [`OTHER_PTC`] for slot 1 and the fork version
+/// [`OTHER_VERSION`].
+struct OtherPtc;
+
+impl StateProvider<E> for OtherPtc {
+    fn state_transition(
+        &self,
+        state: &mut BeaconState<E>,
+        block: &SignedBeaconBlock<E>,
+    ) -> Result<(), StfError> {
+        Provider.state_transition(state, block)?;
+        set_ptc(state, OTHER_PTC);
+        state.fork.current_version = OTHER_VERSION;
+        Ok(())
+    }
+
+    fn process_slots(&self, state: &mut BeaconState<E>, slot: Slot) -> Result<(), StfError> {
+        Provider.process_slots(state, slot)
+    }
+}
+
+/// [`Provider`], and the post-state justifies and finalizes the checkpoint.
+struct Finalizing(Checkpoint);
+
+impl StateProvider<E> for Finalizing {
+    fn state_transition(
+        &self,
+        state: &mut BeaconState<E>,
+        block: &SignedBeaconBlock<E>,
+    ) -> Result<(), StfError> {
+        Provider.state_transition(state, block)?;
+        state.current_justified_checkpoint = self.0.clone();
+        state.finalized_checkpoint = self.0.clone();
+        Ok(())
+    }
+
+    fn process_slots(&self, state: &mut BeaconState<E>, slot: Slot) -> Result<(), StfError> {
+        Provider.process_slots(state, slot)
+    }
+}
+
+/// Sets the PTC of slot 1 of `state`, a state of epoch 0, to `ptc`.
+fn set_ptc(state: &mut BeaconState<E>, ptc: [ValidatorIndex; PTC_SIZE]) {
+    let mut committee = get_ptc(state, 1).unwrap();
+    for (member, validator) in committee.iter_mut().zip(ptc) {
+        *member = validator;
+    }
+    // In epoch 0, the PTC of slot 1 is at index `SLOTS_PER_EPOCH + 1`.
+    *state.ptc_window.get_mut(9).unwrap() = committee;
 }
 
 /// A verifier with a fixed verdict. It records the slot of the state and the sets of each call.
@@ -125,12 +188,7 @@ struct Chain {
 fn chain_with_ptc(ptc: [ValidatorIndex; PTC_SIZE]) -> Chain {
     let mut state = genesis_state::<E>(&[32_000_000_000; 64]);
     state.genesis_time = GENESIS_TIME;
-    // The state is in epoch 0, so the PTC of slot 1 is at index `SLOTS_PER_EPOCH + 1`.
-    let mut committee = get_ptc(&state, 1).unwrap();
-    for (member, validator) in committee.iter_mut().zip(ptc) {
-        *member = validator;
-    }
-    *state.ptc_window.get_mut(9).unwrap() = committee;
+    set_ptc(&mut state, ptc);
     assert_eq!(get_ptc(&state, 1).unwrap().to_vec(), ptc.to_vec());
     let mut anchor = signed_block::<E>(0, 0).message;
     anchor.state_root = state_root(&mut state).unwrap();
@@ -149,8 +207,13 @@ fn chain() -> Chain {
 
 /// A block at `slot` on the EMPTY node of `parent` by proposer `tag`.
 fn child(parent: &BeaconBlock<E>, slot: Slot, tag: u8) -> SignedBeaconBlock<E> {
+    child_of(parent.tree_hash_root(), slot, tag)
+}
+
+/// A block at `slot` on the EMPTY node of the block `parent_root` by proposer `tag`.
+fn child_of(parent_root: Root, slot: Slot, tag: u8) -> SignedBeaconBlock<E> {
     let mut block = signed_block::<E>(slot, u64::from(tag));
-    block.message.parent_root = parent.tree_hash_root();
+    block.message.parent_root = parent_root;
     let bid = &mut block.message.body.signed_execution_payload_bid.message;
     bid.parent_block_hash = Root::repeat_byte(0xee);
     bid.block_hash = Root::repeat_byte(tag);
@@ -194,6 +257,18 @@ fn votes_of(store: &Store<E>, root: Root) -> (Vec<Option<bool>>, Vec<Option<bool
 
 fn invalid(error: PayloadAttestationError) -> Result<(), Error> {
     Err(Error::InvalidPayloadAttestation(error))
+}
+
+/// The set of the signature check of `m` on `state`: the key of the validator, and the signing
+/// root of the data in the PTC domain of `state` at the epoch of the data slot.
+fn set_on(state: &BeaconState<E>, m: &PayloadAttestationMessage) -> SignatureSet {
+    let epoch = m.data.slot / 8;
+    let domain = get_domain(state, DOMAIN_PTC_ATTESTER, Some(epoch));
+    SignatureSet::single(
+        SignerRef::Validator(m.validator_index),
+        compute_signing_root(&m.data, domain),
+        m.signature,
+    )
 }
 
 #[test]
@@ -458,5 +533,182 @@ fn votes_past_the_thresholds_make_the_full_payload_win_the_tiebreak() {
             Ok(want),
             "timely {timely}, available {available}"
         );
+    }
+}
+
+#[test]
+fn a_message_for_a_block_that_is_not_the_head_reads_the_post_state_of_that_block() {
+    let mut c = chain();
+    // `competing` is a second block of slot 1. It comes after `p`, so `p` keeps the proposer
+    // boost and stays the head.
+    let competing = child_of(c.p.message.parent_root, 1, 7);
+    on_block(&mut c.store, &OtherPtc, &competing).unwrap();
+    let competing = competing.message.tree_hash_root();
+    assert_eq!(get_head(&c.store).unwrap().root, c.root);
+    let state = c.store.block_state(competing).unwrap().clone();
+    let head_state = c.store.block_state(c.root).unwrap().clone();
+    assert_eq!(get_ptc(&state, 1).unwrap().to_vec(), OTHER_PTC.to_vec());
+    assert_eq!(get_ptc(&head_state, 1).unwrap().to_vec(), DISTINCT.to_vec());
+
+    // 49 is at position 1 of the PTC of `competing`, and not in the PTC of the head. The
+    // signature set has the domain of the post-state of `competing`, not of the head state.
+    let m = message(49, competing, 1, true, false);
+    let set = set_on(&state, &m);
+    assert_ne!(set, set_on(&head_state, &m));
+    let verifier = accept();
+    assert_eq!(
+        on_payload_attestation_message(&mut c.store, &verifier, &m, false),
+        Ok(())
+    );
+    assert_eq!(verifier.calls(), vec![(1, vec![set])]);
+    assert_eq!(
+        votes_of(&c.store, competing),
+        (votes(&[1], true), votes(&[1], false))
+    );
+    // The votes of the head do not change.
+    assert_eq!(
+        votes_of(&c.store, c.root),
+        (votes(&[], true), votes(&[], true))
+    );
+
+    // 10 is in the PTC of the head, and not in the PTC of `competing`.
+    let before = c.store.clone();
+    for is_from_block in [false, true] {
+        let verifier = accept();
+        let m = message(10, competing, 1, true, true);
+        assert_eq!(
+            on_payload_attestation_message(&mut c.store, &verifier, &m, is_from_block),
+            invalid(PayloadAttestationError::NotInPtc {
+                validator: 10,
+                slot: 1
+            })
+        );
+        assert!(verifier.calls().is_empty());
+        assert_eq!(c.store, before);
+    }
+}
+
+/// A store in which the finality prune at slot 9 dropped the block `b`.
+struct Pruned {
+    store: Store<E>,
+    b: Root,
+}
+
+/// The anchor at slot 0 with the PTC [`DISTINCT`] for slot 1, `p` and `x` at slot 1 on it, `b`
+/// of [`OtherPtc`] at slot 9 on `x`, and `c` at slot 9 on `p`. The post-state of `c` justifies
+/// and finalizes epoch 1 (first slot 8) with `p`. The blocks of slot 9 come after the
+/// attestation deadline, so neither gets the proposer boost, and the next tick in slot 9
+/// prunes: it drops the anchor, `x` and `b`.
+///
+/// The prune in epoch 1 keeps the dropped blocks and their post-states through the end of
+/// epoch 3 (slot 31). The head is `c`, whose PTC of slot 9 is [`DISTINCT`]. The PTC of slot 9
+/// of `b` is [`OTHER_PTC`].
+fn pruned() -> Pruned {
+    let mut c = chain();
+    let x = child_of(c.p.message.parent_root, 1, 2);
+    on_block(&mut c.store, &Provider, &x).unwrap();
+    let late = time_at(9) + SLOT_MS / 2;
+    on_tick(&mut c.store, late).unwrap();
+    let b = child(&x.message, 9, 3);
+    on_block(&mut c.store, &OtherPtc, &b).unwrap();
+    let checkpoint = Checkpoint {
+        epoch: 1,
+        root: c.root,
+    };
+    let finalizing = child(&c.p.message, 9, 4);
+    on_block(&mut c.store, &Finalizing(checkpoint.clone()), &finalizing).unwrap();
+    assert_eq!(c.store.finalized_checkpoint(), &checkpoint);
+    // On the spec path, `on_attestation` stores the state of the justified checkpoint.
+    store_target_checkpoint_state(&mut c.store, &Provider, &checkpoint).unwrap();
+    on_tick(&mut c.store, late).unwrap();
+    let b = b.message.tree_hash_root();
+    assert!(c.store.block(b).is_none());
+    assert!(c.store.block_or_dropped(b).is_some());
+    let head = get_head(&c.store).unwrap().root;
+    assert_eq!(head, finalizing.message.tree_hash_root());
+    let head_state = c.store.block_state(head).unwrap();
+    assert_eq!(get_ptc(head_state, 9).unwrap().to_vec(), DISTINCT.to_vec());
+    let state = c.store.block_state_or_dropped(b).unwrap();
+    assert_eq!(get_ptc(state, 9).unwrap().to_vec(), OTHER_PTC.to_vec());
+    Pruned { store: c.store, b }
+}
+
+#[test]
+fn a_message_for_a_retained_dropped_block_checks_its_state_and_writes_no_vote() {
+    let mut f = pruned();
+    let state = f.store.block_state_or_dropped(f.b).unwrap().clone();
+    let head = get_head(&f.store).unwrap();
+    let before = f.store.clone();
+
+    // 49 is at position 1 of the PTC of `b`, and not in the PTC of the head. The message
+    // passes, but the store has no votes of `b`, so nothing changes.
+    let m = message(49, f.b, 9, true, true);
+    for is_from_block in [false, true] {
+        let verifier = accept();
+        assert_eq!(
+            on_payload_attestation_message(&mut f.store, &verifier, &m, is_from_block),
+            Ok(())
+        );
+        // A message from the wire has the signature set of the post-state of `b`.
+        let want = if is_from_block {
+            vec![]
+        } else {
+            vec![(9, vec![set_on(&state, &m)])]
+        };
+        assert_eq!(verifier.calls(), want);
+        assert_eq!(f.store, before);
+        assert_eq!(get_head(&f.store), Ok(head));
+    }
+    assert!(f.store.payload_timeliness_vote(f.b).is_none());
+    assert!(f.store.payload_data_availability_vote(f.b).is_none());
+
+    // The checks still apply. 10 is in the PTC of the head, and not in the PTC of `b`.
+    for is_from_block in [false, true] {
+        let verifier = accept();
+        let m = message(10, f.b, 9, true, true);
+        assert_eq!(
+            on_payload_attestation_message(&mut f.store, &verifier, &m, is_from_block),
+            invalid(PayloadAttestationError::NotInPtc {
+                validator: 10,
+                slot: 9
+            })
+        );
+        assert!(verifier.calls().is_empty());
+        assert_eq!(f.store, before);
+    }
+    // A refused signature fails, and no verdict is not a proof.
+    assert_eq!(
+        on_payload_attestation_message(&mut f.store, &refuse(), &m, false),
+        invalid(PayloadAttestationError::InvalidSignature)
+    );
+    assert_eq!(
+        on_payload_attestation_message(&mut f.store, &no_verdict(), &m, false),
+        Err(Error::NoSignatureVerdict(BackendError("timeout".into())))
+    );
+    assert_eq!(f.store, before);
+    assert_eq!(get_head(&f.store), Ok(head));
+}
+
+#[test]
+fn a_message_for_a_forgotten_block_fails_as_unknown() {
+    let mut f = pruned();
+    // The prune ran in epoch 1. The store keeps `b` through the end of epoch 3, and the first
+    // tick of epoch 4 forgets it.
+    tick(&mut f.store, 31);
+    assert!(f.store.block_or_dropped(f.b).is_some());
+    tick(&mut f.store, 32);
+    assert!(f.store.block_or_dropped(f.b).is_none());
+    let head = get_head(&f.store).unwrap();
+    let before = f.store.clone();
+    for is_from_block in [false, true] {
+        let verifier = accept();
+        let m = message(49, f.b, 9, true, true);
+        assert_eq!(
+            on_payload_attestation_message(&mut f.store, &verifier, &m, is_from_block),
+            invalid(PayloadAttestationError::UnknownBeaconBlock(f.b))
+        );
+        assert!(verifier.calls().is_empty());
+        assert_eq!(f.store, before);
+        assert_eq!(get_head(&f.store), Ok(head));
     }
 }

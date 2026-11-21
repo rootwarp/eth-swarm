@@ -14,11 +14,11 @@
 //!
 //! The crate does no I/O and links no BLS library. The state transition of a block comes
 //! from the caller through a [`StateProvider`], and the BLS verdicts of an attestation, an
-//! envelope or a payload attestation message through a [`SignatureVerifier`]. Data availability and the answer of the execution
-//! engine for an envelope come through a [`DataAvailabilityCheck`] and an [`ExecutionEngine`].
-//! [`on_execution_payload_envelope`] fills `store.payloads`. The test seam
-//! `testing::mark_payload_verified` (tests only) also does, without the checks of the
-//! handler.
+//! envelope or a payload attestation message through a [`SignatureVerifier`]. Data
+//! availability and the answer of the execution engine for an envelope come through a
+//! [`DataAvailabilityCheck`] and an [`ExecutionEngine`]. [`on_execution_payload_envelope`]
+//! fills `store.payloads`. The test seam `testing::mark_payload_verified` (tests only) also
+//! does, without the checks of the handler.
 //!
 //! The spec's store keeps every block. Here [`on_tick`] still drops the blocks that do not
 //! descend from the finalized checkpoint block once finality moves, from the kept set that
