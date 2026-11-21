@@ -93,6 +93,16 @@ check pass "one SHA, a descendant of the fix" "libp2p revs OK" "$root" "$remote"
 root=$(fixture at-fix "$fix")
 check pass "one SHA, the fix commit itself" "libp2p revs OK" "$root" "$remote" "$fixenv"
 
+# Several required fixes (the script's FIXES holds more than one): the pin must contain every one.
+root=$(fixture all-fixes "$later")
+check pass "one SHA containing every required fix" "libp2p revs OK" "$root" "$remote" "LIBP2P_FIX_COMMIT=$fix $later"
+root=$(fixture second-fix-missing "$fix")
+check fail "SHA with the first required fix but not the second" "does not contain $later" "$root" "$remote" \
+  "LIBP2P_FIX_COMMIT=$fix $later"
+root=$(fixture first-fix-missing "$later")
+check fail "SHA with the second required fix but not the first" "does not contain $side" "$root" "$remote" \
+  "LIBP2P_FIX_COMMIT=$side $fix"
+
 # Ancestry.
 root=$(fixture before "$base")
 check fail "SHA before the fix" "does not contain" "$root" "$remote" "$fixenv"

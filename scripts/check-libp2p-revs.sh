@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fail unless every libp2p* crate comes from one full commit SHA of libp2p/rust-libp2p, and that
-# commit contains the gossipsub StrictNoSign `key` rejection (rust-libp2p PR 6621, merged as FIX).
+# commit contains every gossipsub fix in FIXES: the StrictNoSign `key` rejection (rust-libp2p PR
+# 6621) and the PRUNE backoff fix for topics not in the mesh (PR 6707, RUSTSEC-2026-0534).
 # Keep in sync with the root Cargo.toml [patch.crates-io] and the deny.toml [sources] comment.
 #
 # Checks, against <root>/Cargo.lock and every Cargo.toml under <root> (Cargo.lock and deny.toml are
@@ -13,21 +14,25 @@
 #   - <root>/deny.toml, if present, has no libp2p* crate in [bans] skip or skip-tree, in any entry
 #     form ("name", "name@version", { crate = ... }, { name = ..., version = ... }); an entry of
 #     another form fails too;
-#   - FIX is an ancestor of (or equal to) that SHA, and that SHA is an ancestor of (or equal to)
-#     upstream master. The commit graph of the SHA and master is fetched (commits only,
-#     --filter=tree:0) from LIBP2P_REMOTE; a failed fetch fails the check.
+#   - every commit in FIXES is an ancestor of (or equal to) that SHA, and that SHA is an ancestor
+#     of (or equal to) upstream master. The commit graph of the SHA and master is fetched (commits
+#     only, --filter=tree:0) from LIBP2P_REMOTE; a failed fetch fails the check.
 #
 # Usage: scripts/check-libp2p-revs.sh [ROOT]   (default: this repo)
 # Env (tests only): LIBP2P_REMOTE (default https://github.com/libp2p/rust-libp2p),
-#   LIBP2P_FIX_COMMIT (default FIX below), LIBP2P_SKIP_ANCESTRY=1 (skip the ancestry step).
+#   LIBP2P_FIX_COMMIT (one SHA or a space-separated list, replacing FIXES below),
+#   LIBP2P_SKIP_ANCESTRY=1 (skip the ancestry step).
 # Exit: 0 OK, 1 a pin violation, 2 the check could not run (no python3 >= 3.11, or the ancestry
 # fetch failed). Works on bash 3.2.
 set -euo pipefail
-FIX=ba75f82a872075b7f628570cbb8fe6555f6e54b8   # "fix(gossipsub): reject `key` field in anonymous validation mode"
+# The pin must contain each of these, so a later bump cannot move back past either fix:
+#   ba75f82  "fix(gossipsub): reject `key` field in anonymous validation mode" (PR 6621)
+#   6c5a10b  "fix(gossipsub): ignore PRUNEs for unknown topics" (PR 6707, RUSTSEC-2026-0534)
+FIXES="ba75f82a872075b7f628570cbb8fe6555f6e54b8 6c5a10b4102a7a04f56d6cf65ea58eeff929cefa"
 URL=https://github.com/libp2p/rust-libp2p
 
 root=${1:-$(cd "$(dirname "$0")/.." && pwd)}
-fix=${LIBP2P_FIX_COMMIT:-$FIX}
+fixes=${LIBP2P_FIX_COMMIT:-$FIXES}
 remote=${LIBP2P_REMOTE:-$URL}
 lock="$root/Cargo.lock"
 [[ -f $lock ]] || { echo "ERROR: $lock missing: Cargo.lock must be committed"; exit 1; }
@@ -149,10 +154,10 @@ done < <(find "$root" \( -name target -o -name .git \) -prune -o -name Cargo.tom
 
 ((fail == 0)) || exit 1
 
-# FIX must be in the history of the pinned commit, and the pinned commit in upstream master's: GitHub
-# serves a fork's commit by SHA through the parent repo's URL, so fetching it proves nothing.
+# Every fix must be in the history of the pinned commit, and the pinned commit in upstream master's:
+# GitHub serves a fork's commit by SHA through the parent repo's URL, so fetching it proves nothing.
 if [[ ${LIBP2P_SKIP_ANCESTRY:-} == 1 ]]; then
-  echo "WARNING: ancestry check SKIPPED (LIBP2P_SKIP_ANCESTRY=1): $fix not verified in $sha"
+  echo "WARNING: ancestry check SKIPPED (LIBP2P_SKIP_ANCESTRY=1): $fixes not verified in $sha"
 else
   git_dir=$(mktemp -d)
   # Best effort: a temp dir that cannot be removed is reported, and the exit status stays the verdict.
@@ -168,14 +173,16 @@ else
   if ! git -C "$git_dir" fetch -q --no-tags --filter=tree:0 origin "$sha" \
     "+refs/heads/master:refs/remotes/origin/master" 2>"$git_dir/fetch.err"; then
     sed 's/^/  /' "$git_dir/fetch.err"
-    echo "ERROR: cannot fetch $sha and master from $remote, so the pin cannot be checked for $fix"
+    echo "ERROR: cannot fetch $sha and master from $remote, so the pin cannot be checked for $fixes"
     exit 2
   fi
-  if ! GIT_NO_LAZY_FETCH=1 git -C "$git_dir" cat-file -e "$fix^{commit}" 2>/dev/null \
-    || ! GIT_NO_LAZY_FETCH=1 git -C "$git_dir" merge-base --is-ancestor "$fix" "$sha"; then
-    echo "ERROR: rust-libp2p $sha does not contain $fix (gossipsub StrictNoSign key rejection)"
-    exit 1
-  fi
+  for fix in $fixes; do
+    if ! GIT_NO_LAZY_FETCH=1 git -C "$git_dir" cat-file -e "$fix^{commit}" 2>/dev/null \
+      || ! GIT_NO_LAZY_FETCH=1 git -C "$git_dir" merge-base --is-ancestor "$fix" "$sha"; then
+      echo "ERROR: rust-libp2p $sha does not contain $fix (a required gossipsub fix, see FIXES)"
+      exit 1
+    fi
+  done
   if ! GIT_NO_LAZY_FETCH=1 git -C "$git_dir" merge-base --is-ancestor "$sha" refs/remotes/origin/master; then
     echo "ERROR: rust-libp2p $sha is not on rust-libp2p master (a fork or unmerged commit served by SHA)"
     exit 1
