@@ -536,6 +536,27 @@ fn a_head_state_with_no_ptc_of_the_slot_must_ignore() {
 }
 
 #[test]
+fn a_head_state_two_epochs_before_the_slot_must_ignore() {
+    let mut chain = chain();
+    on_tick(&mut chain.store, time_at(17)).unwrap();
+    let p = chain.store.block(chain.p).unwrap().clone();
+    let block = block_on(&p, 17, 3);
+    on_block(&mut chain.store, &Provider, &block).unwrap();
+    let root = block.message.tree_hash_root();
+    let m = message(12, root, 17);
+    // The head state of the view is the post-state of `p`, of epoch 0, for example a head that
+    // is behind during a sync. Slot 17 is in epoch 2, after the PTC window of that state.
+    let behind = with_head(&chain, chain.head_state());
+    assert_eq!(
+        validate_at(&Seen::default(), &behind, &m, time_at(17)),
+        Verdict::Ignore(IgnoreReason::NoPtc { slot: 17 })
+    );
+    // With the post-state of the block of slot 17 as the head state, the same message passes.
+    let current = with_head(&chain, chain.store.block_state(root).unwrap());
+    pending(validate_at(&Seen::default(), &current, &m, time_at(17)));
+}
+
+#[test]
 fn seen_takes_the_key_only_after_a_valid_signature() {
     let chain = chain();
     let m = message(12, chain.p, 1);
