@@ -44,6 +44,11 @@ impl<V: Clone> Refused<V> {
             .map(|entry| &entry.value)
     }
 
+    /// `true` if block `root` is refused, for one signature or for each.
+    pub(crate) fn contains(&self, root: &Root) -> bool {
+        self.entries.contains_key(root)
+    }
+
     /// Keeps `value` as the refusal of block `root`: for each signature if `signature` is
     /// `None`, else for that signature only. Returns `value`. A refusal for each signature
     /// stays as it is. A root refused again keeps its place in the order.

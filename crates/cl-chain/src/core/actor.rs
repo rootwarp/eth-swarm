@@ -1,6 +1,7 @@
 //! The chain core: the single writer of the chain state.
 //!
-//! [`ChainCore`] holds the head and the pre-states ([`Snapshots`]). [`ChainCore::spawn`] moves
+//! [`ChainCore`] holds the head, the pre-states ([`Snapshots`]) and the states of its walks
+//! over empty slots ([`Advanced`]). [`ChainCore::spawn`] moves
 //! it onto one dedicated OS thread, the only mutator of that state. The thread serves the
 //! queues of [`queue`] until each sender is gone, and then returns the core. Each queue is
 //! bounded: an item for a full queue is refused at once ([`SubmitError::Full`]), and the caller
@@ -23,18 +24,28 @@
 //! - the core refused the block before and kept the refusal: the same answer again;
 //! - the parent has no pre-state: IGNORE;
 //! - the block slot is more than [`PRE_STATE_EPOCHS`] epochs of slots after the slot of the
-//!   parent pre-state: IGNORE, kept. The wall-clock bound does not stop a block at the slot of
-//!   the wall clock on an old pre-state (the anchor stays for good), and the walk from that
-//!   pre-state costs one `process_slot` for each slot;
-//! - `proposer_index` is past the registry of the parent pre-state: INVALID, kept;
-//! - the proposer signature ([`check_proposer_signature`]), with the key of the parent
+//!   parent pre-state: the core first walks the empty slots between them on a copy, to the slot
+//!   before the block ([`advance`](super::advance)). The wall-clock bound does not stop a block
+//!   at the slot of the wall clock on an old pre-state (the anchor stays for good), so the walk
+//!   has its own bounds: a start more than
+//!   [`MAX_ADVANCE_EPOCHS`](super::advance::MAX_ADVANCE_EPOCHS) epochs of slots before the
+//!   block, the deadline, a caller that stopped waiting, no deposit verdict, or an error in
+//!   the walk is IGNORE. The checks below and the import then run on the advanced state in
+//!   place of the parent pre-state;
+//! - `proposer_index` is past the registry of the pre-state: INVALID, kept;
+//! - the caller of the import dropped the receiver of the answer: IGNORE. The core checks this
+//!   here, again at the end of the VerifyBls call of the proposer set, and at the end of
+//!   [`import_block`]. A drop before a check stops the import at that check: no later VerifyBls
+//!   call, no commit, and no kept refusal, also of an INVALID verdict;
+//! - the proposer signature ([`check_proposer_signature`]), with the key and the domain of the
 //!   pre-state: INVALID on an INVALID verdict (kept for that signature only), IGNORE on no
 //!   verdict.
 //!
-//! Then it runs [`import_block`] on the pre-state of the parent. The core sends the signature
-//! sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the caller, with the
-//! deadline of the import: the proposer set in a first VerifyBls call, the block sets in a
-//! second one during the transition. Each VerifyBls call of one import gets the same deadline,
+//! Then it runs [`import_block`] on the pre-state: the pre-state of the parent, or the advanced
+//! state. The core sends the signature sets to cl-verify through a [`BlsVerifier`], on the
+//! Tokio runtime of the caller, with the deadline of the import: the proposer set in a first
+//! VerifyBls call, the block sets in a second one during the transition. The deposit sets of
+//! a walk go in calls before them. Each VerifyBls call of one import gets the same deadline,
 //! and no verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state
 //! root equal to `block.state_root` and a gate that permits the payload: it makes the parent
 //! pre-state the most recently used, keeps the post-state as a pre-state, and the block
@@ -54,20 +65,23 @@
 //! the block and on the pre-state of its parent. A refusal for the proposer signature holds
 //! only for that signature, as the block root does not commit to it. The core does not keep no
 //! verdict (the block can come again and get a verdict in time), a parent without a pre-state
-//! (it can come), a refused payload, or the wall-clock bound: the same block is in that bound
-//! once its slot comes, and that check costs no slot loop and no VerifyBls call.
+//! (it can come), a refused payload, the wall-clock bound (the same block is in that bound
+//! once its slot comes, and that check costs no slot loop and no VerifyBls call), a caller
+//! that stopped waiting, or a refusal of the walk: a later walk can start from a nearer state,
+//! or have more time.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
 
+use super::advance::{advance, Advanced, MAX_ADVANCED_STATES};
 use super::seen::Refused;
 use super::snapshot::{max_pre_states, Snapshots, PRE_STATE_EPOCHS};
 use crate::import::block::{
-    check_proposer_signature, import_block, NotImported, PayloadImportGate,
+    check_proposer_signature, import_block, process_empty_slots, NotImported, PayloadImportGate,
 };
 use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{Root, Slot};
+use consensus_types::primitives::{Epoch, Root, Slot};
 use ethswarm_proto::verify::BlsSet;
 use network_config::ChainConfig;
 use state_transition::{state_root, Preset, StfError};
@@ -158,6 +172,28 @@ pub enum AnchorError {
 /// The answer channel of an item.
 type Reply = oneshot::Sender<Served>;
 
+/// A hook that the core thread runs in a walk over empty slots, with the slot of the walk state
+/// ([`ChainCore::with_walk_hook`]).
+#[cfg(feature = "test-hooks")]
+type WalkHook = Box<dyn Fn(Slot) + Send + Sync>;
+
+/// The test hooks of a [`ChainCore`]: none in a build without the `test-hooks` feature.
+#[derive(Default)]
+struct Hooks {
+    #[cfg(feature = "test-hooks")]
+    walk: Option<WalkHook>,
+}
+
+impl Hooks {
+    /// Runs the walk hook, if one is set.
+    fn walk(&self, _slot: Slot) {
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = &self.walk {
+            hook(_slot);
+        }
+    }
+}
+
 /// A block to import, and where its answer goes.
 struct ImportItem<E: Preset> {
     block: Box<SignedBeaconBlock<E>>,
@@ -202,7 +238,8 @@ pub fn queue<E: Preset>(capacity: usize) -> (CoreSender<E>, CoreQueue<E>) {
 impl<E: Preset> CoreSender<E> {
     /// Queues `block` for import. The answer comes on the receiver; a receiver that closes
     /// without one means the core stopped (IGNORE). The core checks the slot of the block
-    /// against the wall clock before the slot loop (see the module docs).
+    /// against the wall clock before the slot loop (see the module docs). If the caller drops
+    /// the receiver, the core stops the import at its next check of the caller (IGNORE).
     pub fn import(
         &self,
         block: SignedBeaconBlock<E>,
@@ -264,6 +301,8 @@ pub struct ChainCore<E: Preset> {
     /// `genesis_time` of the anchor state, Unix seconds: the start of slot 0.
     genesis_time: u64,
     snapshots: Snapshots<BeaconState<E>>,
+    /// The states of the walks over empty slots (see [`advance`](super::advance)).
+    advanced: Advanced<BeaconState<E>>,
     /// The root of each block the core committed, and of the anchor (see the module docs).
     committed: HashSet<Root>,
     /// The kept refusals, by block root (see the module docs).
@@ -274,6 +313,7 @@ pub struct ChainCore<E: Preset> {
     gate: Option<Box<dyn PayloadImportGate>>,
     clock: UnixClock,
     turns: u64,
+    hooks: Hooks,
 }
 
 impl<E: Preset> ChainCore<E> {
@@ -310,6 +350,7 @@ impl<E: Preset> ChainCore<E> {
             config,
             genesis_time: state.genesis_time,
             snapshots: Snapshots::new(head.block_root, state, max_pre_states::<E>()),
+            advanced: Advanced::new(MAX_ADVANCED_STATES),
             committed: HashSet::from([head.block_root]),
             refused: Refused::new(MAX_REFUSED_ROOTS),
             head,
@@ -317,6 +358,7 @@ impl<E: Preset> ChainCore<E> {
             gate: None,
             clock: Arc::new(system_clock),
             turns: 0,
+            hooks: Hooks::default(),
         })
     }
 
@@ -343,6 +385,18 @@ impl<E: Preset> ChainCore<E> {
         self
     }
 
+    /// The same core with `hook` as its walk hook, in place of an earlier one. A test seam: in
+    /// a walk over empty slots (see [`advance`](super::advance)), the core thread runs `hook`
+    /// with the slot of the walk state before each check of the deadline and of the caller,
+    /// and once after the walk. So it runs before the walk, at each epoch boundary after the
+    /// walk keeps its state, and before the check of the proposer.
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_walk_hook(mut self, hook: impl Fn(Slot) + Send + Sync + 'static) -> Self {
+        self.hooks.walk = Some(Box::new(hook));
+        self
+    }
+
     /// The last block the core committed, or the anchor.
     pub fn head(&self) -> Head {
         self.head
@@ -356,6 +410,18 @@ impl<E: Preset> ChainCore<E> {
     /// The number of pre-states the core holds, the anchor included.
     pub fn pre_states(&self) -> usize {
         self.snapshots.len()
+    }
+
+    /// `true` if the core keeps a refusal of block `block_root`, for one signature or for each
+    /// (see [Seen roots](#seen-roots)).
+    pub fn is_refused(&self, block_root: &Root) -> bool {
+        self.refused.contains(block_root)
+    }
+
+    /// The post-state of block `parent_root` advanced to the last slot of epoch `epoch - 1`, if
+    /// the core keeps it (see [`advance`](super::advance)).
+    pub fn advanced_state(&self, parent_root: &Root, epoch: Epoch) -> Option<&BeaconState<E>> {
+        self.advanced.peek(parent_root, epoch)
     }
 
     /// Moves the core onto a new OS thread that serves `queue` (see the module docs). Each
@@ -383,7 +449,10 @@ impl<E: Preset> ChainCore<E> {
             self.turns += 1;
             let turn = self.turns;
             let (outcome, reply) = match item {
-                Item::Import(item) => (self.import(&item.block, verifier, runtime), item.reply),
+                Item::Import(item) => (
+                    self.import(&item.block, &item.reply, verifier, runtime),
+                    item.reply,
+                ),
                 Item::Envelope(reply) => (Outcome::Ignored("no envelope import yet".into()), reply),
                 Item::Gossip(reply) => (Outcome::Ignored("no gossip commit yet".into()), reply),
             };
@@ -393,10 +462,12 @@ impl<E: Preset> ChainCore<E> {
         self
     }
 
-    /// Imports `block` and commits it only if it imports (see the module docs).
+    /// Imports `block` and commits it only if it imports (see the module docs). `reply` is the
+    /// answer channel of the import: once it is closed, the import stops at the next check.
     fn import<V: BlsVerifier + 'static>(
         &mut self,
         block: &SignedBeaconBlock<E>,
+        reply: &Reply,
         verifier: &Arc<V>,
         runtime: &Handle,
     ) -> Outcome {
@@ -423,31 +494,66 @@ impl<E: Preset> ChainCore<E> {
         let parent = block.message.parent_root;
         // A peek: the parent becomes the most recently used only if its child commits, so a
         // failed import does not change the order of use.
-        let Some(pre) = self.snapshots.peek(&parent) else {
+        let Some(parent_state) = self.snapshots.peek(&parent) else {
             return Outcome::Ignored(format!("no pre-state for the parent {parent}"));
         };
+        let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
+        let slot = block.message.slot;
         let window = PRE_STATE_EPOCHS * E::slots_per_epoch();
-        if block.message.slot.saturating_sub(pre.slot) > window {
-            let why = format!(
-                "block slot {} is more than {window} slots after the parent state slot {}",
-                block.message.slot, pre.slot
-            );
-            return self.refused.refuse(block_root, None, Outcome::Ignored(why));
-        }
+        let advanced;
+        let pre = if slot.saturating_sub(parent_state.slot) <= window {
+            parent_state
+        } else {
+            let hooks = &self.hooks;
+            // On the clock of the runtime, as the deadline.
+            let stop = |at: Slot| {
+                hooks.walk(at);
+                let _context = runtime.enter();
+                if Instant::now() >= deadline {
+                    Some("no time left")
+                } else if reply.is_closed() {
+                    Some(CALLER_GONE)
+                } else {
+                    None
+                }
+            };
+            let config = &self.config;
+            let walk = |state: &mut BeaconState<E>, to: Slot| {
+                process_empty_slots(state, to, parent_state, config, &verdict)
+            };
+            let walked = advance(&mut self.advanced, parent, parent_state, slot, &stop, &walk);
+            advanced = match walked {
+                Ok(state) => state,
+                // No proof about the block, so the refusal is not kept.
+                Err(why) => return Outcome::Ignored(why),
+            };
+            self.hooks.walk(advanced.slot);
+            &advanced
+        };
         // The slot loop can add a validator, but not an active one: its activation waits for
         // the finality of a later epoch than the one that added it, and the loop has no new
-        // attestations to finalize that epoch. So an index past the registry of the parent is
-        // never the proposer, and `process_block_header` refuses it after the slot loop.
+        // attestations to finalize that epoch. So an index past the registry of the pre-state
+        // is never the proposer, and `process_block_header` refuses it after the slot loop.
         // Refused here, it costs no slot loop.
         let proposer = block.message.proposer_index;
         if !usize::try_from(proposer).is_ok_and(|index| index < pre.validators.len()) {
             let invalid = Outcome::Invalid(StfError::UnknownValidator(proposer));
             return self.refused.refuse(block_root, None, invalid);
         }
-        let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
+        // A caller that stopped waiting gets no answer: no VerifyBls call and no commit for it.
+        // This is no proof about the block, so the refusal is not kept.
+        if reply.is_closed() {
+            return Outcome::Ignored(CALLER_GONE.into());
+        }
         // The gossip order: the signature of the proposer before the slot loop, so that a
         // block that its proposer did not sign costs one VerifyBls call and no slot loop.
-        match check_proposer_signature(pre, block, &verdict) {
+        let checked = check_proposer_signature(pre, block, &verdict);
+        // The caller can stop waiting during that VerifyBls call. Then the core keeps no
+        // refusal, also of an INVALID verdict, and sends no more sets.
+        if reply.is_closed() {
+            return Outcome::Ignored(CALLER_GONE.into());
+        }
+        match checked {
             Ok(()) => {}
             Err(NotImported::Invalid(e)) => {
                 let signature = Some(block.signature);
@@ -457,7 +563,13 @@ impl<E: Preset> ChainCore<E> {
             }
             Err(NotImported::Ignored(why)) => return Outcome::Ignored(why),
         }
-        match import_block(pre, block, &self.config, &verdict, gate) {
+        let imported = import_block(pre, block, &self.config, &verdict, gate);
+        // The same for the VerifyBls call of the block sets, before any change of the core: no
+        // commit and no kept refusal.
+        if reply.is_closed() {
+            return Outcome::Ignored(CALLER_GONE.into());
+        }
+        match imported {
             Ok(imported) => {
                 self.head = Head {
                     block_root: imported.block_root,
@@ -541,3 +653,6 @@ fn verify<V: BlsVerifier + 'static>(
 
 /// The no-verdict reason of a VerifyBls call without a verdict before its deadline.
 const NO_VERDICT_IN_TIME: &str = "no verdict by the deadline";
+
+/// The IGNORE reason of an import whose caller dropped the receiver of the answer.
+const CALLER_GONE: &str = "the caller stopped waiting for the answer";
