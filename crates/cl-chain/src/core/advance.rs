@@ -109,8 +109,8 @@ impl<S> Advanced<S> {
 /// Advances `pre`, the pre-state of block `parent`, toward a block at `slot` (see the module
 /// docs), and returns the state at `slot - 1`. The caller calls it only for a block more than
 /// [`PRE_STATE_EPOCHS`] epochs of slots after `pre`. `walk` runs `process_slots` on a state to
-/// a slot. `out_of_time` is `true` once the deadline of the import passed. `Err` (why, for the
-/// log) is IGNORE.
+/// a slot. `out_of_time` gets the slot of the walk state, and is `true` once the deadline of
+/// the import passed. `Err` (why, for the log) is IGNORE.
 ///
 /// [`PRE_STATE_EPOCHS`]: super::snapshot::PRE_STATE_EPOCHS
 pub(crate) fn advance<E: Preset>(
@@ -118,7 +118,7 @@ pub(crate) fn advance<E: Preset>(
     parent: Root,
     pre: &BeaconState<E>,
     slot: Slot,
-    out_of_time: &dyn Fn() -> bool,
+    out_of_time: &dyn Fn(Slot) -> bool,
     walk: &Walk<'_, E>,
 ) -> Result<BeaconState<E>, String> {
     let epoch_slots = E::slots_per_epoch();
@@ -136,7 +136,7 @@ pub(crate) fn advance<E: Preset>(
     let target = slot.saturating_sub(1);
     let mut state = start.clone();
     while state.slot < target {
-        if out_of_time() {
+        if out_of_time(state.slot) {
             return Err(format!(
                 "no time left to advance the state of the parent {parent} from slot {}",
                 state.slot

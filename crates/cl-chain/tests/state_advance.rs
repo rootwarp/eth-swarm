@@ -10,6 +10,10 @@
 //! the slot of the block and of its bid, and the proposer of that slot, and it removes the
 //! attestations and the payload attestations. A local transition gives the state root of the
 //! moved block. The fake cl-verify gives each verdict, so no signature is checked.
+//!
+//! In some tests, the caller of an import stops waiting for the answer. A hook drops the
+//! receiver of the answer at a known point of the import. The test then waits for the writer
+//! thread to stop, and reads the core.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[allow(dead_code)]
@@ -17,14 +21,17 @@ mod support;
 
 use cl_chain::core::advance::Advanced;
 use cl_chain::core::snapshot::PRE_STATE_EPOCHS;
-use cl_chain::core::{ChainCore, Head, Outcome, MAX_ADVANCED_STATES, MAX_ADVANCE_EPOCHS};
+use cl_chain::core::{
+    queue, ChainCore, Head, Outcome, Served, MAX_ADVANCED_STATES, MAX_ADVANCE_EPOCHS,
+};
 use cl_chain::import::block::PermitAll;
-use cl_chain::verify::client::UnixClock;
+use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::common::PendingDeposit;
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{BLSPubkey, Bytes32, Epoch, Root};
 use consensus_types::{EthSpec, Minimal};
 use crypto_bls::{eth_aggregate_pubkeys, PublicKey};
+use ethswarm_proto::verify::BlsSet;
 use network_config::ChainConfig;
 use state_transition::caches::proposer::get_beacon_proposer_index;
 use state_transition::per_slot::process_slots;
@@ -32,13 +39,17 @@ use state_transition::{
     state_root, state_transition, AggregationError, BackendError, BlsContext, PubkeyAggregator,
     SignatureBackend, SignatureSet, StfError,
 };
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{
     assert_unchanged, clock_at, export_block, fixture, import_one, proposer_set, slot_start,
-    Answer, Fixture, VERIFY_TIMEOUT,
+    Answer, FakeVerify, Fixture, QUEUE, VERIFY_TIMEOUT,
 };
 use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
 use testkit::anchor::load_anchor;
+use tokio::runtime::Handle;
+use tokio::sync::oneshot;
+use tokio::time::Instant;
 use tree_hash::TreeHash;
 
 /// The block type of the fixture.
@@ -562,5 +573,297 @@ async fn a_missing_deposit_verdict_in_the_walk_is_ignored_and_keeps_the_state_be
     assert!(
         core.advanced_state(&f.anchor.block_root, 2).is_none(),
         "the walk must not keep a state past the boundary of the deposit"
+    );
+}
+
+/// The receiver of the answer to one import. A hook drops it: then the caller of the import
+/// does not wait for the answer.
+#[derive(Clone, Default)]
+struct Waiting(Arc<Mutex<Option<oneshot::Receiver<Served>>>>);
+
+impl Waiting {
+    /// Drops the receiver, if it is still there.
+    fn stop(&self) {
+        drop(self.0.lock().unwrap().take());
+    }
+}
+
+/// A fake cl-verify that gives the answers of `inner`. After each call, the caller of the
+/// import stops waiting.
+struct StopsWaiting {
+    inner: Arc<FakeVerify>,
+    waiting: Waiting,
+}
+
+impl BlsVerifier for StopsWaiting {
+    async fn verify_sets(&self, sets: Vec<BlsSet>, deadline: Instant) -> BlsOutcome {
+        let outcome = self.inner.verify_sets(sets, deadline).await;
+        self.waiting.stop();
+        outcome
+    }
+}
+
+/// What a watched import did.
+struct Watched {
+    /// The answer of the core, or `None` if a hook dropped the receiver.
+    outcome: Option<Outcome>,
+    /// The core after its writer thread stops.
+    core: ChainCore<Minimal>,
+    /// The slot of each call of the walk hook, in order.
+    slots: Vec<u64>,
+}
+
+/// Imports `block` on `core`, and sends its sets to `verifier`. `waiting` holds the receiver
+/// of the answer. The walk hook of the core records the slot of each call. At slot `drop_at`,
+/// the hook drops the receiver. The test does not wait for the answer. It waits for the writer
+/// thread to stop, and then reads the answer, if the receiver is still there.
+async fn import_watched<V: BlsVerifier + 'static>(
+    core: ChainCore<Minimal>,
+    block: Block,
+    verifier: Arc<V>,
+    waiting: &Waiting,
+    drop_at: Option<u64>,
+) -> Watched {
+    let slots: Arc<Mutex<Vec<u64>>> = Arc::default();
+    let hook = {
+        let (slots, waiting) = (Arc::clone(&slots), waiting.clone());
+        move |slot| {
+            slots.lock().unwrap().push(slot);
+            if drop_at == Some(slot) {
+                waiting.stop();
+            }
+        }
+    };
+    let (sender, queue) = queue::<Minimal>(QUEUE);
+    // The item and its receiver are in place before the writer thread starts.
+    let answer = sender
+        .import(block)
+        .expect("the import queue must have room");
+    *waiting.0.lock().unwrap() = Some(answer);
+    drop(sender);
+    let writer = core
+        .with_walk_hook(hook)
+        .spawn(queue, verifier, Handle::current())
+        .unwrap();
+    // The writer thread can wait for a VerifyBls call on this runtime. The join must not block
+    // the runtime.
+    let core = tokio::task::spawn_blocking(move || writer.join())
+        .await
+        .unwrap()
+        .expect("the writer thread must not panic");
+    let outcome = (waiting.0.lock().unwrap().take())
+        .map(|mut answer| answer.try_recv().expect("the core must answer").outcome);
+    let slots = slots.lock().unwrap().clone();
+    Watched {
+        outcome,
+        core,
+        slots,
+    }
+}
+
+#[tokio::test]
+async fn an_import_whose_caller_stops_waiting_before_the_walk_is_ignored_and_not_kept() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let slot = window() + 4;
+    let (block, _) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+    let block_root = block.message.tree_hash_root();
+    let core = f.core.with_clock(wall.at(slot));
+    let verify = FakeVerify::new(Answer::Valid);
+    // The hook drops the receiver before the walk, at the slot of the anchor.
+    let watched = import_watched(
+        core,
+        block.clone(),
+        Arc::clone(&verify),
+        &Waiting::default(),
+        Some(f.anchor.slot),
+    )
+    .await;
+    assert_eq!(watched.outcome, None, "the hook must drop the receiver");
+    let core = watched.core;
+    assert_unchanged(&core, f.anchor, block_root);
+    assert!(
+        !core.is_refused(&block_root),
+        "the core must not keep the refusal of a stopped import"
+    );
+    assert!(
+        verify.calls().is_empty(),
+        "the import must not reach cl-verify"
+    );
+    assert!(
+        core.advanced_state(&f.anchor.block_root, 1).is_none(),
+        "the walk must stop before process_slots"
+    );
+    assert_eq!(
+        watched.slots,
+        vec![f.anchor.slot],
+        "the walk must stop at its first check"
+    );
+
+    let (outcome, _, _) = import_one(core, block.clone(), Answer::Valid).await;
+    assert_eq!(
+        outcome,
+        committed(&block),
+        "the block must be able to come again"
+    );
+}
+
+#[tokio::test]
+async fn an_import_whose_caller_stops_waiting_at_an_epoch_boundary_keeps_the_states_before_it() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let anchor = anchor_state(&f);
+    // The walk goes from slot 0 to slot 19. It keeps the states at slots 7 and 15.
+    let slot = window() + 4;
+    let first_end = epoch_slots() - 1;
+    let second_end = 2 * epoch_slots() - 1;
+    let (block, _) = moved(&f.block, &anchor, slot, &f.config);
+    let block_root = block.message.tree_hash_root();
+    let core = f.core.with_clock(wall.at(slot));
+    let verify = FakeVerify::new(Answer::Valid);
+    // The hook drops the receiver after the walk keeps the state at slot 7.
+    let watched = import_watched(
+        core,
+        block.clone(),
+        Arc::clone(&verify),
+        &Waiting::default(),
+        Some(first_end),
+    )
+    .await;
+    assert_eq!(watched.outcome, None, "the hook must drop the receiver");
+    let core = watched.core;
+    assert_unchanged(&core, f.anchor, block_root);
+    assert!(
+        !core.is_refused(&block_root),
+        "the core must not keep the refusal of a stopped import"
+    );
+    assert!(
+        verify.calls().is_empty(),
+        "the proposer set must not go to cl-verify"
+    );
+    assert_eq!(
+        watched.slots,
+        vec![0, first_end],
+        "the walk must stop at the first epoch boundary"
+    );
+    let mut kept = core
+        .advanced_state(&f.anchor.block_root, 1)
+        .expect("the walk must keep the state at slot 7")
+        .clone();
+    assert_eq!(kept.slot, first_end);
+    let mut expected = advanced(&anchor, first_end, &f.config);
+    assert_eq!(
+        state_root(&mut kept).unwrap(),
+        state_root(&mut expected).unwrap(),
+        "the kept state must be the anchor state after process_slots"
+    );
+    assert!(
+        core.advanced_state(&f.anchor.block_root, 2).is_none(),
+        "the walk must not keep a state after the stop"
+    );
+
+    let verify = FakeVerify::new(Answer::Valid);
+    let watched = import_watched(
+        core,
+        block.clone(),
+        Arc::clone(&verify),
+        &Waiting::default(),
+        None,
+    )
+    .await;
+    assert_eq!(watched.outcome, Some(committed(&block)));
+    assert_eq!(
+        watched.slots,
+        vec![first_end, second_end, slot - 1],
+        "the walk must start from the kept state at slot 7"
+    );
+    assert_eq!(verify.calls().len(), 2);
+    assert_eq!(watched.core.head(), head_of(&block));
+}
+
+#[tokio::test]
+async fn an_import_whose_caller_stops_waiting_after_the_walk_sends_no_proposer_set() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let slot = window() + 4;
+    let (block, _) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+    let block_root = block.message.tree_hash_root();
+    let core = f.core.with_clock(wall.at(slot));
+    let verify = FakeVerify::new(Answer::Valid);
+    // The hook drops the receiver after the walk, at slot 19.
+    let watched = import_watched(
+        core,
+        block.clone(),
+        Arc::clone(&verify),
+        &Waiting::default(),
+        Some(slot - 1),
+    )
+    .await;
+    assert_eq!(watched.outcome, None, "the hook must drop the receiver");
+    let core = watched.core;
+    assert_unchanged(&core, f.anchor, block_root);
+    assert!(
+        !core.is_refused(&block_root),
+        "the core must not keep the refusal of a stopped import"
+    );
+    assert!(
+        verify.calls().is_empty(),
+        "the proposer set must not go to cl-verify"
+    );
+    assert_eq!(
+        watched.slots,
+        vec![0, epoch_slots() - 1, 2 * epoch_slots() - 1, slot - 1]
+    );
+    assert!(
+        core.advanced_state(&f.anchor.block_root, 2).is_some(),
+        "the walk must keep the states that it reached"
+    );
+
+    let (outcome, _, _) = import_one(core, block.clone(), Answer::Valid).await;
+    assert_eq!(
+        outcome,
+        committed(&block),
+        "the block must be able to come again"
+    );
+}
+
+#[tokio::test]
+async fn an_import_whose_caller_stops_waiting_during_the_proposer_check_does_not_commit() {
+    let f = fixture();
+    let wall = Wall::of(&f);
+    let slot = window() + 4;
+    let (block, before) = moved(&f.block, &anchor_state(&f), slot, &f.config);
+    let block_root = block.message.tree_hash_root();
+    let expected = proposer_set(&before, &block);
+    let core = f.core.with_clock(wall.at(slot));
+    let verify = FakeVerify::new(Answer::Valid);
+    let waiting = Waiting::default();
+    // The fake cl-verify gives VALID to the proposer set, and then drops the receiver.
+    let stops = Arc::new(StopsWaiting {
+        inner: Arc::clone(&verify),
+        waiting: waiting.clone(),
+    });
+    let watched = import_watched(core, block.clone(), stops, &waiting, None).await;
+    assert_eq!(
+        watched.outcome, None,
+        "the fake cl-verify must drop the receiver"
+    );
+    let core = watched.core;
+    assert_unchanged(&core, f.anchor, block_root);
+    assert!(
+        !core.is_refused(&block_root),
+        "the core must not keep the refusal of a stopped import"
+    );
+    assert_eq!(
+        verify.calls(),
+        vec![vec![expected]],
+        "only the proposer set must go to cl-verify, and the block sets must not"
+    );
+
+    let (outcome, _, _) = import_one(core, block.clone(), Answer::Valid).await;
+    assert_eq!(
+        outcome,
+        committed(&block),
+        "the block must be able to come again"
     );
 }

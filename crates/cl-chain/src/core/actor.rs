@@ -166,6 +166,28 @@ pub enum AnchorError {
 /// The answer channel of an item.
 type Reply = oneshot::Sender<Served>;
 
+/// A hook that the core thread runs in a walk over empty slots, with the slot of the walk state
+/// ([`ChainCore::with_walk_hook`]).
+#[cfg(feature = "test-hooks")]
+type WalkHook = Box<dyn Fn(Slot) + Send + Sync>;
+
+/// The test hooks of a [`ChainCore`]: none in a build without the `test-hooks` feature.
+#[derive(Default)]
+struct Hooks {
+    #[cfg(feature = "test-hooks")]
+    walk: Option<WalkHook>,
+}
+
+impl Hooks {
+    /// Runs the walk hook, if one is set.
+    fn walk(&self, _slot: Slot) {
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = &self.walk {
+            hook(_slot);
+        }
+    }
+}
+
 /// A block to import, and where its answer goes.
 struct ImportItem<E: Preset> {
     block: Box<SignedBeaconBlock<E>>,
@@ -284,6 +306,7 @@ pub struct ChainCore<E: Preset> {
     gate: Option<Box<dyn PayloadImportGate>>,
     clock: UnixClock,
     turns: u64,
+    hooks: Hooks,
 }
 
 impl<E: Preset> ChainCore<E> {
@@ -328,6 +351,7 @@ impl<E: Preset> ChainCore<E> {
             gate: None,
             clock: Arc::new(system_clock),
             turns: 0,
+            hooks: Hooks::default(),
         })
     }
 
@@ -351,6 +375,18 @@ impl<E: Preset> ChainCore<E> {
     #[must_use]
     pub fn with_clock(mut self, clock: UnixClock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// The same core with `hook` as its walk hook, in place of an earlier one. A test seam: in
+    /// a walk over empty slots (see [`advance`](super::advance)), the core thread runs `hook`
+    /// with the slot of the walk state before each check of the deadline, and once after the
+    /// walk. So it runs before the walk, at each epoch boundary after the walk keeps its state,
+    /// and before the check of the proposer.
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_walk_hook(mut self, hook: impl Fn(Slot) + Send + Sync + 'static) -> Self {
+        self.hooks.walk = Some(Box::new(hook));
         self
     }
 
@@ -456,8 +492,10 @@ impl<E: Preset> ChainCore<E> {
         let pre = if slot.saturating_sub(parent_state.slot) <= window {
             parent_state
         } else {
+            let hooks = &self.hooks;
             // On the clock of the runtime, as the deadline.
-            let out_of_time = || {
+            let out_of_time = |at: Slot| {
+                hooks.walk(at);
                 let _context = runtime.enter();
                 Instant::now() >= deadline
             };
@@ -478,6 +516,7 @@ impl<E: Preset> ChainCore<E> {
                 // No proof about the block, so the refusal is not kept.
                 Err(why) => return Outcome::Ignored(why),
             };
+            self.hooks.walk(advanced.slot);
             &advanced
         };
         // The slot loop can add a validator, but not an active one: its activation waits for
