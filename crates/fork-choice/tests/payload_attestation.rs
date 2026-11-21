@@ -10,7 +10,9 @@ use consensus_types::gloas::{
     BeaconBlock, BeaconState, PayloadAttestationData, PayloadAttestationMessage, SignedBeaconBlock,
 };
 use consensus_types::primitives::{BLSSignature, Root, Slot, ValidatorIndex};
-use consensus_types::signing::{compute_signing_root, SignatureSet, SignerRef, DOMAIN_PTC_ATTESTER};
+use consensus_types::signing::{
+    compute_signing_root, SignatureSet, SignerRef, DOMAIN_PTC_ATTESTER,
+};
 use consensus_types::Minimal;
 use fork_choice::testing::mark_payload_verified;
 use fork_choice::{

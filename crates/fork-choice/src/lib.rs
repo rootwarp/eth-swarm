@@ -9,14 +9,16 @@
 //!   tiebreaker.
 //! - [`envelope`]: [`on_execution_payload_envelope`] and
 //!   [`verify_execution_payload_envelope`].
+//! - [`payload_attestation`]: [`on_payload_attestation_message`], which also gives `on_block`
+//!   the votes of the payload attestations of a block.
 //!
 //! The crate does no I/O and links no BLS library. The state transition of a block comes
-//! from the caller through a [`StateProvider`], and the BLS verdicts of an attestation or an
-//! envelope through a [`SignatureVerifier`]. Data availability and the answer of the execution
+//! from the caller through a [`StateProvider`], and the BLS verdicts of an attestation, an
+//! envelope or a payload attestation message through a [`SignatureVerifier`]. Data availability and the answer of the execution
 //! engine for an envelope come through a [`DataAvailabilityCheck`] and an [`ExecutionEngine`].
 //! [`on_execution_payload_envelope`] fills `store.payloads`. The test seam
 //! `testing::mark_payload_verified` (tests only) also does, without the checks of the
-//! handler. `on_payload_attestation_message` from the wire is not here yet.
+//! handler.
 //!
 //! The spec's store keeps every block. Here [`on_tick`] still drops the blocks that do not
 //! descend from the finalized checkpoint block once finality moves, from the kept set that
@@ -37,6 +39,7 @@
 pub mod attestations;
 pub mod envelope;
 pub mod handlers;
+pub mod payload_attestation;
 pub mod store;
 pub mod weights;
 
@@ -47,6 +50,7 @@ pub use envelope::{
     NewPayloadRequestRef, PayloadImport,
 };
 pub use handlers::{on_block, on_tick, store_target_checkpoint_state, StateProvider};
+pub use payload_attestation::on_payload_attestation_message;
 pub use store::{
     compute_slots_since_epoch_start, get_ancestor, get_checkpoint_block, get_current_slot,
     get_current_store_epoch, get_forkchoice_store, get_parent_payload_status,
@@ -149,14 +153,6 @@ pub enum Error {
         /// The checkpoint root.
         root: Root,
     },
-    /// `on_payload_attestation_message` asserts that the attester is in the PTC.
-    #[error("validator {validator} is not in the PTC of slot {slot}")]
-    NotInPtc {
-        /// The attester.
-        validator: ValidatorIndex,
-        /// `data.slot`.
-        slot: Slot,
-    },
     /// A time before genesis: the `Uint64` subtraction of `compute_slot_at_time_ms` fails.
     #[error("time {time_ms} ms is before the genesis time {genesis_time_ms} ms")]
     BeforeGenesis {
@@ -191,9 +187,50 @@ pub enum Error {
     /// proof that the envelope is invalid.
     #[error("the execution engine refused the payload of block {0}")]
     PayloadRefused(Root),
-    /// The signature verifier gave no verdict on an envelope: never a proof.
+    /// `on_payload_attestation_message` failed a spec `assert` on the message, from the wire
+    /// or from a block.
+    #[error("invalid payload attestation message: {0}")]
+    InvalidPayloadAttestation(PayloadAttestationError),
+    /// The signature verifier gave no verdict on an envelope or a payload attestation message:
+    /// never a proof.
     #[error("no signature verdict: {0}")]
     NoSignatureVerdict(BackendError),
+}
+
+/// The spec `assert` that a payload attestation message failed, in the order of
+/// `on_payload_attestation_message` (G L1139-1187).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PayloadAttestationError {
+    /// The attested block must be in `store.block_states`. The message can pass later, when
+    /// the block arrives.
+    #[error("attested block {0} is not in the store")]
+    UnknownBeaconBlock(Root),
+    /// The validator must be in the PTC of `data.slot` on the post-state of the attested block.
+    #[error("validator {validator} is not in the PTC of slot {slot}")]
+    NotInPtc {
+        /// `ptc_message.validator_index`.
+        validator: ValidatorIndex,
+        /// `data.slot`.
+        slot: Slot,
+    },
+    /// A message from the wire must be of the current slot.
+    #[error("payload attestation slot {slot} is not the current slot {current}")]
+    NotCurrentSlot {
+        /// `data.slot`.
+        slot: Slot,
+        /// `get_current_slot(store)`.
+        current: Slot,
+    },
+    /// `is_valid_indexed_payload_attestation` is false for a message from the wire: the
+    /// verifier rejected the signature.
+    #[error("the payload attestation signature is not valid")]
+    InvalidSignature,
+}
+
+impl From<PayloadAttestationError> for Error {
+    fn from(e: PayloadAttestationError) -> Self {
+        Self::InvalidPayloadAttestation(e)
+    }
 }
 
 /// The spec `assert` that an execution payload envelope failed, in the order of

@@ -5,6 +5,7 @@
 //! `store`" (P0 L97-99). `on_block` computes every value that can fail before it changes the
 //! store.
 
+use crate::payload_attestation::ptc_votes;
 use crate::store::{
     compute_slot_at_time_ms, compute_slots_since_epoch_start, compute_start_slot_at_epoch,
     compute_time_at_slot_ms, get_ancestor, get_checkpoint_block, get_current_slot,
@@ -14,10 +15,8 @@ use crate::store::{
 };
 use crate::weights::get_head;
 use crate::{Error, ATTESTATION_DUE_BPS_GLOAS, PAYLOAD_ATTESTATION_DUE_BPS};
-use consensus_types::gloas::{BeaconState, Checkpoint, PayloadAttestation, SignedBeaconBlock};
+use consensus_types::gloas::{BeaconState, Checkpoint, SignedBeaconBlock};
 use consensus_types::primitives::{Root, Slot};
-use state_transition::caches::get_ptc;
-use state_transition::per_block::payload_attestation::get_indexed_payload_attestation;
 use state_transition::per_epoch::justification::process_justification_and_finalization;
 use state_transition::{Preset, StfError};
 use tree_hash::TreeHash;
@@ -258,79 +257,6 @@ fn block_timeliness<E: Preset>(store: &Store<E>, slot: Slot) -> [bool; 2] {
     [ATTESTATION_DUE_BPS_GLOAS, PAYLOAD_ATTESTATION_DUE_BPS].map(|bps| {
         is_current_slot && time_into_slot_ms < get_slot_component_duration_ms(store, bps)
     })
-}
-
-/// One PTC vote of a payload attestation in a block.
-struct PtcVote {
-    root: Root,
-    position: usize,
-    payload_present: bool,
-    blob_data_available: bool,
-}
-
-impl PtcVote {
-    fn apply<E: Preset>(&self, store: &mut Store<E>) {
-        let set = |votes: Option<&mut Vec<Option<bool>>>, value| {
-            if let Some(vote) = votes.and_then(|v| v.get_mut(self.position)) {
-                *vote = Some(value);
-            }
-        };
-        set(
-            store.payload_timeliness_vote.get_mut(&self.root),
-            self.payload_present,
-        );
-        set(
-            store.payload_data_availability_vote.get_mut(&self.root),
-            self.blob_data_available,
-        );
-    }
-}
-
-/// The votes of `notify_ptc_messages` (G L268-288): each attester of each payload
-/// attestation through `on_payload_attestation_message(..., is_from_block=True)` (G
-/// L1139-1187), which checks no signature. `state` is the post-state of the block. The
-/// votes are in spec order, so a later vote of a position replaces an earlier one.
-fn ptc_votes<E: Preset>(
-    store: &Store<E>,
-    state: &BeaconState<E>,
-    payload_attestations: &[PayloadAttestation<E>],
-) -> Result<Vec<PtcVote>, Error> {
-    let mut votes = Vec::new();
-    if state.slot == 0 {
-        return Ok(votes);
-    }
-    for payload_attestation in payload_attestations {
-        let indexed =
-            get_indexed_payload_attestation(state, payload_attestation).map_err(Error::Stf)?;
-        let data = &indexed.data;
-        let attested_state = store.get_block_state(data.beacon_block_root)?;
-        // A vote changes only the votes of the block of its own slot.
-        if data.slot != attested_state.slot {
-            continue;
-        }
-        let ptc = get_ptc(attested_state, data.slot).map_err(Error::Stf)?;
-        for validator_index in indexed.attesting_indices.iter() {
-            let positions: Vec<usize> = ptc
-                .iter()
-                .enumerate()
-                .filter(|(_, member)| *member == validator_index)
-                .map(|(position, _)| position)
-                .collect();
-            if positions.is_empty() {
-                return Err(Error::NotInPtc {
-                    validator: *validator_index,
-                    slot: data.slot,
-                });
-            }
-            votes.extend(positions.into_iter().map(|position| PtcVote {
-                root: data.beacon_block_root,
-                position,
-                payload_present: data.payload_present,
-                blob_data_available: data.blob_data_available,
-            }));
-        }
-    }
-    Ok(votes)
 }
 
 /// `store_target_checkpoint_state` (P0 L860-866): the state of `target.root` advanced to the
