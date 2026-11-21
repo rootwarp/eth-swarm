@@ -9,6 +9,10 @@
 //! The store has two blocks of slot 1 on the anchor: `p`, the first and thus the head (it gets
 //! the proposer boost), and `q` of [`OTHER_PROPOSER`].
 //!
+//! The provider does not move the PTC window. In a state of epoch 1, the PTC of slot 9 is the
+//! entry that a state of epoch 0 has for slot 1, so [`HEAD_PTC`] is also the PTC of slot 9 in
+//! the later states.
+//!
 //! This crate links no BLS library. A test gives the BLS verdict of a pending set itself.
 
 use consensus_types::gloas::{
@@ -20,7 +24,11 @@ use consensus_types::signing::{
     compute_signing_root, SignatureSet, SignerRef, DOMAIN_PTC_ATTESTER,
 };
 use consensus_types::Minimal;
-use fork_choice::{get_forkchoice_store, get_head, on_block, on_tick, StateProvider, Store};
+use fork_choice::{
+    get_forkchoice_store, get_head, on_block, on_payload_attestation_message, on_tick,
+    store_target_checkpoint_state, Error, PayloadAttestationError, SignatureVerifier,
+    StateProvider, Store,
+};
 use gossip_validation::{
     is_current_slot, validate_payload_attestation_message_gossip, IgnoreReason, RejectReason, Seen,
     SeenKey, StoreView, Verdict, MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS,
@@ -92,6 +100,39 @@ impl StateProvider<E> for Provider {
     }
 }
 
+/// [`Provider`], and the post-state justifies and finalizes the checkpoint.
+struct Finalizing(Checkpoint);
+
+impl StateProvider<E> for Finalizing {
+    fn state_transition(
+        &self,
+        state: &mut BeaconState<E>,
+        block: &SignedBeaconBlock<E>,
+    ) -> Result<(), StfError> {
+        Provider.state_transition(state, block)?;
+        state.current_justified_checkpoint = self.0.clone();
+        state.finalized_checkpoint = self.0.clone();
+        Ok(())
+    }
+
+    fn process_slots(&self, state: &mut BeaconState<E>, slot: Slot) -> Result<(), StfError> {
+        Provider.process_slots(state, slot)
+    }
+}
+
+/// The verifier of fork choice: each signature is valid.
+struct ValidSignatures;
+
+impl SignatureVerifier<E> for ValidSignatures {
+    fn verify_signature_sets(
+        &self,
+        _: &BeaconState<E>,
+        _: &[SignatureSet],
+    ) -> Result<bool, BackendError> {
+        Ok(true)
+    }
+}
+
 /// The store, and the roots of `p` (the head) and `q`.
 struct Chain {
     store: Store<E>,
@@ -116,15 +157,33 @@ fn block_on(anchor: &BeaconBlock<E>, slot: Slot, proposer: u64) -> SignedBeaconB
     block
 }
 
-fn chain() -> Chain {
-    let mut state = genesis_state::<E>(&[32_000_000_000; 64]);
+/// The anchor state with the PTC [`HEAD_PTC`] for slot 1 and `validators` validators, and its
+/// block.
+fn anchor(validators: usize) -> (BeaconState<E>, BeaconBlock<E>) {
+    let mut state = genesis_state::<E>(&vec![32_000_000_000; validators]);
     state.genesis_time = GENESIS_TIME;
     set_ptc(&mut state, HEAD_PTC);
     let mut anchor = signed_block::<E>(0, 0).message;
     anchor.state_root = state_root(&mut state).unwrap();
+    (state, anchor)
+}
+
+/// A store at the anchor of [`anchor`], at the start of slot 1.
+fn store_at_anchor(validators: usize) -> (Store<E>, BeaconBlock<E>) {
+    let (state, anchor) = anchor(validators);
     let slot_duration = NonZeroU64::new(SLOT_MS).unwrap();
     let mut store = get_forkchoice_store(state, anchor.clone(), slot_duration).unwrap();
     on_tick(&mut store, time_at(1)).unwrap();
+    (store, anchor)
+}
+
+fn chain() -> Chain {
+    chain_with(64)
+}
+
+/// The [`Chain`] with `validators` validators.
+fn chain_with(validators: usize) -> Chain {
+    let (mut store, anchor) = store_at_anchor(validators);
     let p = block_on(&anchor, 1, 1);
     let q = block_on(&anchor, 1, OTHER_PROPOSER);
     for block in [&p, &q] {
@@ -495,4 +554,128 @@ fn seen_takes_the_key_only_after_a_valid_signature() {
     });
     assert_eq!(seen.resolve(second, Ok(true)), want);
     assert_eq!(validate(&seen, &chain, &m), want);
+}
+
+#[test]
+fn a_validator_index_past_a_head_registry_that_is_shorter_than_the_block_registry_must_reject() {
+    let chain = chain();
+    // The head state has 48 validators, and the post-state of the attested block has 64.
+    let (mut short, _) = anchor(48);
+    short.slot = 1;
+    assert_eq!(short.validators.len(), 48);
+    let block_state = chain.store.block_state(chain.p).unwrap();
+    assert_eq!(block_state.validators.len(), 64);
+    let view = Head {
+        store: &chain.store,
+        head: Some(&short),
+    };
+    let m = message(50, chain.p, 1);
+    assert_eq!(
+        validate_at(&Seen::default(), &view, &m, time_at(1)),
+        Verdict::Reject(RejectReason::UnknownValidator(50))
+    );
+    // An index of the head registry and of its PTC passes.
+    pending(validate_at(
+        &Seen::default(),
+        &view,
+        &message(12, chain.p, 1),
+        time_at(1),
+    ));
+}
+
+/// A store in which the finality prune at slot 9 dropped the block `b`.
+struct Pruned {
+    store: Store<E>,
+    b: Root,
+}
+
+/// The anchor at slot 0, `a` and `x` at slot 1 on it, `b` at slot 9 on `x`, and `c` at slot 9
+/// on `a`. The post-state of `c` justifies and finalizes epoch 1 (first slot 8) with `a`. The
+/// blocks of slot 9 come after the attestation deadline, so neither gets the proposer boost,
+/// and the next tick in slot 9 prunes: it drops the anchor, `x` and `b`.
+///
+/// The prune in epoch 1 keeps the dropped blocks and their post-states through the end of
+/// epoch 3 (slot 31). The head is `c`. The PTC of slot 9 is [`HEAD_PTC`] in the post-states of
+/// `b` and `c`.
+fn pruned() -> Pruned {
+    let (mut store, anchor) = store_at_anchor(64);
+    let a = block_on(&anchor, 1, 1);
+    let x = block_on(&anchor, 1, 3);
+    for block in [&a, &x] {
+        on_block(&mut store, &Provider, block).unwrap();
+    }
+    let late = time_at(9) + SLOT_MS / 2;
+    on_tick(&mut store, late).unwrap();
+    let b = block_on(&x.message, 9, 4);
+    on_block(&mut store, &Provider, &b).unwrap();
+    let checkpoint = Checkpoint {
+        epoch: 1,
+        root: a.message.tree_hash_root(),
+    };
+    let c = block_on(&a.message, 9, 5);
+    on_block(&mut store, &Finalizing(checkpoint.clone()), &c).unwrap();
+    assert_eq!(store.finalized_checkpoint(), &checkpoint);
+    // On the spec path, `on_attestation` stores the state of the justified checkpoint.
+    store_target_checkpoint_state(&mut store, &Provider, &checkpoint).unwrap();
+    on_tick(&mut store, late).unwrap();
+    let b = b.message.tree_hash_root();
+    assert!(store.block(b).is_none());
+    assert!(store.block_or_dropped(b).is_some());
+    assert_eq!(get_head(&store).unwrap().root, c.message.tree_hash_root());
+    for state in [
+        StoreView::head_state(&store).unwrap(),
+        store.block_state_or_dropped(b).unwrap(),
+    ] {
+        assert_eq!(get_ptc(state, 9).unwrap().to_vec(), HEAD_PTC.to_vec());
+    }
+    Pruned { store, b }
+}
+
+#[test]
+fn gossip_and_fork_choice_agree_on_a_retained_and_then_a_forgotten_dropped_block() {
+    let Pruned { mut store, b } = pruned();
+    let m = message(12, b, 9);
+    let head = get_head(&store).unwrap();
+
+    // While the store retains `b`, gossip checks the message on the head state and accepts it.
+    let mut seen = Seen::default();
+    let (sets, key) = pending(validate_at(&seen, &store, &m, time_at(9)));
+    let head_state = StoreView::head_state(&store).unwrap();
+    let domain = get_domain(head_state, DOMAIN_PTC_ATTESTER, Some(1));
+    let want = SignatureSet::single(
+        SignerRef::Validator(12),
+        compute_signing_root(&m.data, domain),
+        SIG,
+    );
+    assert_eq!(sets, vec![want]);
+    assert_eq!(seen.resolve(key, Ok(true)), Verdict::Accept);
+    assert!(seen.has_payload_attestation(9, 12));
+    // Fork choice takes the message, but the store has no votes of `b`, so nothing changes.
+    let before = store.clone();
+    assert_eq!(
+        on_payload_attestation_message(&mut store, &ValidSignatures, &m, false),
+        Ok(())
+    );
+    assert_eq!(store, before);
+    assert_eq!(get_head(&store), Ok(head));
+    assert!(store.payload_timeliness_vote(b).is_none());
+
+    // The prune ran in epoch 1, so the first tick of epoch 4 forgets `b`. Then gossip ignores
+    // the message as a message for an unknown block, and fork choice refuses it.
+    on_tick(&mut store, time_at(32)).unwrap();
+    assert!(store.block_or_dropped(b).is_none());
+    assert_eq!(
+        validate_at(&Seen::default(), &store, &m, time_at(9)),
+        Verdict::Ignore(IgnoreReason::UnknownBlock(b))
+    );
+    let before = store.clone();
+    let head = get_head(&store).unwrap();
+    assert_eq!(
+        on_payload_attestation_message(&mut store, &ValidSignatures, &m, false),
+        Err(Error::InvalidPayloadAttestation(
+            PayloadAttestationError::UnknownBeaconBlock(b)
+        ))
+    );
+    assert_eq!(store, before);
+    assert_eq!(get_head(&store), Ok(head));
 }
