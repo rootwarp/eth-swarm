@@ -37,6 +37,7 @@ use cl_chain::core::{
     queue, ChainCore, Head, Outcome, Served, MAX_ADVANCED_STATES, MAX_ADVANCE_BUDGET_PROPOSERS,
     MAX_ADVANCE_EPOCHS, MAX_ADVANCE_EPOCHS_PER_PROPOSER_PER_SLOT, MAX_ADVANCE_EPOCHS_PER_SLOT,
 };
+use cl_chain::engine::fcu::PayloadStatus;
 use cl_chain::import::block::PermitAll;
 use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::common::{PendingDeposit, Validator};
@@ -371,6 +372,7 @@ fn head_of(block: &Block) -> Head {
         block_root: block.message.tree_hash_root(),
         slot: block.message.slot,
         state_root: block.message.state_root,
+        payload_status: PayloadStatus::Empty,
     }
 }
 

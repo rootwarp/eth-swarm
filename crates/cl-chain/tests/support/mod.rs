@@ -6,6 +6,7 @@
 //! A fake cl-verify behind `BlsVerifier` gives the VerifyBls verdicts.
 
 use cl_chain::core::{queue, ChainCore, Head, Outcome};
+use cl_chain::engine::fcu::PayloadStatus;
 use cl_chain::import::block::PermitAll;
 use cl_chain::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{
@@ -168,10 +169,12 @@ pub fn anchored() -> Fixture {
         .write(dir.path())
         .unwrap();
     let loaded = load_anchor::<Minimal>(dir.path()).expect("the anchor must load");
+    // No payload is verified yet: the head is the EMPTY node of the anchor.
     let anchor = Head {
         block_root: loaded.block_root(),
         slot: loaded.slot(),
         state_root: loaded.state_root(),
+        payload_status: PayloadStatus::Empty,
     };
     let (state, block) = loaded.into_parts();
     let core = ChainCore::from_anchor(state, block, pinned.config.clone())

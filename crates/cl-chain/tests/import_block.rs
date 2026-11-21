@@ -23,6 +23,7 @@ mod verify {
 mod support;
 
 use cl_chain::core::{queue, ChainCore, Head, Outcome, SubmitError, MAX_REFUSED_ROOTS};
+use cl_chain::engine::fcu::PayloadStatus;
 use cl_chain::import::block::{PayloadImportGate, PermitAll};
 use cl_chain::verify::client::{BlsClient, BlsOutcome, BlsVerifier, DEFAULT_MAX_OUTSTANDING};
 use consensus_types::gloas::SignedBeaconBlock;
@@ -91,7 +92,8 @@ async fn valid_block_commits() {
         Head {
             block_root,
             slot: 1,
-            state_root
+            state_root,
+            payload_status: PayloadStatus::Empty,
         }
     );
     assert_eq!(core.pre_states(), 2, "the anchor and the new post-state");

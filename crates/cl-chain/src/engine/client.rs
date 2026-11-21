@@ -26,7 +26,7 @@
 //! - **Metrics.** `chain_fcu_sent_total` (calls sent), `chain_fcu_coalesced_total`, and
 //!   `chain_fcu_errors_total{kind}` ([`FcuErrorKind`]).
 
-use super::fcu::ForkchoiceArgs;
+use super::fcu::{ForkchoiceArgs, ForkchoiceSink};
 use super::verdict::{self, ElVerdict, Reason};
 use consensus_types::gloas::{ExecutionPayload, ExecutionPayloadBid, ExecutionPayloadEnvelope};
 use consensus_types::EthSpec;
@@ -371,6 +371,12 @@ impl FcuSender {
     #[must_use]
     pub fn outcomes(&self) -> watch::Receiver<Option<FcuOutcome>> {
         self.outcomes.clone()
+    }
+}
+
+impl ForkchoiceSink for FcuSender {
+    fn send(&self, args: ForkchoiceArgs) {
+        Self::send(self, args);
     }
 }
 

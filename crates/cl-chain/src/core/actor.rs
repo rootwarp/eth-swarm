@@ -159,6 +159,7 @@ use super::envelope::EnvelopeHooks;
 use super::seen::Refused;
 use super::snapshot::{max_pre_states, Snapshots, PRE_STATE_EPOCHS};
 use crate::engine::client::{NewPayload, CALL_TIMEOUT};
+use crate::engine::fcu::{ForkchoiceArgs, ForkchoiceSink, PayloadStatus, CUSTODY_COLUMN_BYTES};
 use crate::engine::verdict::{ElVerdict, ExecutionStatus, ExecutionStatuses};
 use crate::import::block::{
     check_proposer_signature, check_proposer_signature_in, import_block, process_empty_slots,
@@ -169,7 +170,10 @@ use consensus_types::gloas::{BeaconState, SignedBeaconBlock, SignedExecutionPayl
 use consensus_types::primitives::{BLSPubkey, Epoch, Root, Slot, ValidatorIndex};
 use consensus_types::signing::DOMAIN_BEACON_PROPOSER;
 use ethswarm_proto::verify::BlsSet;
-use fork_choice::{verify_execution_payload_envelope, DataAvailability, DataAvailabilityCheck};
+use fork_choice::{
+    get_forkchoice_store, verify_execution_payload_envelope, DataAvailability,
+    DataAvailabilityCheck, Store,
+};
 use network_config::ChainConfig;
 use state_transition::accessors::get_domain;
 use state_transition::{state_root, Preset, StfError};
@@ -213,6 +217,8 @@ pub struct Head {
     pub slot: Slot,
     /// `block.state_root`, equal to the root of the post-state the core holds.
     pub state_root: Root,
+    /// The payload status of the head node.
+    pub payload_status: PayloadStatus,
 }
 
 /// What the core did with an item.
@@ -271,6 +277,9 @@ pub enum AnchorError {
     /// The network config lacks `CAPELLA_FORK_VERSION`.
     #[error("network config: {0}")]
     Config(String),
+    /// `get_forkchoice_store` refused the anchor.
+    #[error("fork choice store: {0}")]
+    Store(fork_choice::Error),
 }
 
 /// The answer channel of an item.
@@ -431,6 +440,14 @@ pub struct ChainCore<E: Preset> {
     /// The blocks whose payload is verified, among those with a pre-state.
     payload_verified: HashSet<Root>,
     head: Head,
+    /// The fork choice store.
+    store: Store<E>,
+    /// `None` until [`Self::with_forkchoice_sink`]: no forkchoiceUpdated without it.
+    sink: Option<Box<dyn ForkchoiceSink>>,
+    /// The custody columns of each forkchoiceUpdated.
+    custody: [u8; CUSTODY_COLUMN_BYTES],
+    /// The arguments of the last forkchoiceUpdated the core sent.
+    sent: Option<ForkchoiceArgs>,
     verify_timeout: Duration,
     engine_timeout: Duration,
     /// `None` until [`Self::with_payload_gate`]: no block commits without a gate.
@@ -459,9 +476,9 @@ impl<E: Preset> ChainCore<E> {
         config
             .capella_fork_version()
             .map_err(|e| AnchorError::Config(e.to_string()))?;
-        if config.slot_duration_ms() == 0 {
+        let Some(slot_ms) = NonZeroU64::new(config.slot_duration_ms()) else {
             return Err(AnchorError::Config("SLOT_DURATION_MS is 0".into()));
-        }
+        };
         let computed = state_root(&mut state).map_err(AnchorError::State)?;
         if computed != block.message.state_root {
             return Err(AnchorError::State(StfError::StateRootMismatch {
@@ -469,10 +486,13 @@ impl<E: Preset> ChainCore<E> {
                 computed,
             }));
         }
+        let store = get_forkchoice_store(state.clone(), block.message.clone(), slot_ms)
+            .map_err(AnchorError::Store)?;
         let head = Head {
             block_root: block.message.tree_hash_root(),
             slot: block.message.slot,
             state_root: computed,
+            payload_status: PayloadStatus::Empty,
         };
         Ok(Self {
             config,
@@ -485,6 +505,10 @@ impl<E: Preset> ChainCore<E> {
             statuses: ExecutionStatuses::new(),
             payload_verified: HashSet::new(),
             head,
+            store,
+            sink: None,
+            custody: [0; CUSTODY_COLUMN_BYTES],
+            sent: None,
             verify_timeout: DEFAULT_VERIFY_TIMEOUT,
             engine_timeout: DEFAULT_ENGINE_TIMEOUT,
             gate: None,
@@ -544,6 +568,28 @@ impl<E: Preset> ChainCore<E> {
         self
     }
 
+    /// The same core with `edit` applied to its fork choice store. A test seam: it stands for
+    /// the handlers of the store (see `fork_choice::testing`).
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_fork_choice(mut self, edit: impl FnOnce(&mut Store<E>)) -> Self {
+        edit(&mut self.store);
+        self
+    }
+
+    /// The same core that sends each forkchoiceUpdated to `sink`, with `custody_columns` (the
+    /// SSZ `CustodyColumnBits`).
+    #[must_use]
+    pub fn with_forkchoice_sink(
+        mut self,
+        sink: impl ForkchoiceSink + 'static,
+        custody_columns: [u8; CUSTODY_COLUMN_BYTES],
+    ) -> Self {
+        self.sink = Some(Box::new(sink));
+        self.custody = custody_columns;
+        self
+    }
+
     /// The same core with `clock` (Unix milliseconds) as its wall clock, in place of the system
     /// clock.
     #[must_use]
@@ -583,6 +629,16 @@ impl<E: Preset> ChainCore<E> {
     /// The last block the core committed, or the anchor.
     pub fn head(&self) -> Head {
         self.head
+    }
+
+    /// The fork choice store.
+    pub fn fork_choice(&self) -> &Store<E> {
+        &self.store
+    }
+
+    /// The arguments of the last forkchoiceUpdated the core sent.
+    pub fn forkchoice_sent(&self) -> Option<ForkchoiceArgs> {
+        self.sent
     }
 
     /// The post-state of block `block_root`, if the core holds it as a pre-state.
@@ -874,6 +930,7 @@ impl<E: Preset> ChainCore<E> {
                     block_root: imported.block_root,
                     slot: block.message.slot,
                     state_root: imported.state_root,
+                    payload_status: PayloadStatus::Empty,
                 };
                 self.snapshots.promote(&parent);
                 self.snapshots.insert(imported.block_root, imported.post);
