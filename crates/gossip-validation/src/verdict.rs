@@ -2,7 +2,7 @@
 //! pending its signature check.
 
 use crate::seen::SeenKey;
-use consensus_types::primitives::{BuilderIndex, Hash32, Root, Slot};
+use consensus_types::primitives::{BuilderIndex, Epoch, Hash32, Root, Slot, ValidatorIndex};
 use consensus_types::signing::SignatureSet;
 
 /// The verdict of a gossip message.
@@ -50,6 +50,35 @@ pub enum IgnoreReason {
     UnknownBuilder(BuilderIndex),
     /// The signature verifier gave no verdict.
     NoSignatureVerdict,
+    /// A valid payload attestation message of this slot from this validator is already seen.
+    PayloadAttestationAlreadySeen {
+        /// `data.slot`.
+        slot: Slot,
+        /// `validator_index`.
+        validator_index: ValidatorIndex,
+    },
+    /// The slot of the message is not the current slot, with `MAXIMUM_GOSSIP_CLOCK_DISPARITY`
+    /// on both ends.
+    NotCurrentSlot {
+        /// `data.slot`.
+        slot: Slot,
+    },
+    /// The block of the message is not of the slot of the message.
+    BlockSlotMismatch {
+        /// `block.slot`.
+        block: Slot,
+        /// `data.slot`.
+        message: Slot,
+    },
+    /// The store gives no post-state of its head: a fault of the store, not a proof against
+    /// the message.
+    NoHeadState,
+    /// The head state has no PTC of the slot of the message (`get_ptc` fails, for example for
+    /// a slot more than one epoch after the head state): not a proof against the message.
+    NoPtc {
+        /// `data.slot`.
+        slot: Slot,
+    },
 }
 
 /// A kind of execution request that `verify_execution_requests_limits` bounds.
@@ -68,7 +97,7 @@ pub enum RequestKind {
 /// Why a message is REJECT: a proven spec violation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectReason {
-    /// The block of the envelope is seen but did not pass validation.
+    /// The block of the message is seen but did not pass validation.
     BlockNotValid(Root),
     /// The slot of the payload is not the slot of the block.
     SlotMismatch {
@@ -116,4 +145,20 @@ pub enum RejectReason {
     },
     /// A signature of the message is not valid.
     InvalidSignature,
+    /// The slot of the message is before the Gloas fork.
+    BeforeGloasFork {
+        /// `data.slot`.
+        slot: Slot,
+        /// `GLOAS_FORK_EPOCH`.
+        fork_epoch: Epoch,
+    },
+    /// The validator index is past the registry of the head state.
+    UnknownValidator(ValidatorIndex),
+    /// The validator is not in the PTC of the slot of the message on the head state.
+    NotInPtc {
+        /// `validator_index`.
+        validator_index: ValidatorIndex,
+        /// `data.slot`.
+        slot: Slot,
+    },
 }

@@ -6,11 +6,12 @@
 //! verifier gave no verdict on, leaves it unchanged, and a later valid copy can still pass.
 //!
 //! The spec does not prune `Seen`, and neither does this type. It grows by one entry for each
-//! accepted envelope, which a block of the chain limits. The change that connects it to gossip
-//! must bound it, for example by the finalized slot.
+//! accepted envelope, which a block of the chain limits, and by one entry for each accepted
+//! payload attestation message, at most `PTC_SIZE` for each slot. The change that connects it
+//! to gossip must bound it, for example by the finalized slot.
 
 use crate::verdict::{IgnoreReason, RejectReason, Verdict};
-use consensus_types::primitives::{BuilderIndex, Hash32, Root};
+use consensus_types::primitives::{BuilderIndex, Hash32, Root, Slot, ValidatorIndex};
 use state_transition::BackendError;
 use std::collections::{HashMap, HashSet};
 
@@ -21,6 +22,8 @@ pub struct Seen {
     execution_payload_envelopes: HashSet<(Root, BuilderIndex)>,
     /// `seen.execution_payloads`, with only what its readers need of each payload.
     execution_payloads: HashMap<Hash32, SeenPayload>,
+    /// `seen.payload_attestation_validators`.
+    payload_attestation_validators: HashSet<(Slot, ValidatorIndex)>,
 }
 
 /// What `seen.execution_payloads[block_hash]` keeps of a payload. The spec keeps the whole
@@ -45,6 +48,11 @@ enum Key {
         block_hash: Hash32,
         payload: SeenPayload,
     },
+    /// The key of a payload attestation message.
+    PayloadAttestation {
+        slot: Slot,
+        validator_index: ValidatorIndex,
+    },
 }
 
 impl SeenKey {
@@ -63,6 +71,14 @@ impl SeenKey {
             payload: SeenPayload { gas_limit },
         })
     }
+
+    /// The key of a payload attestation message of `slot` from `validator_index`.
+    pub(crate) fn payload_attestation(slot: Slot, validator_index: ValidatorIndex) -> Self {
+        Self(Key::PayloadAttestation {
+            slot,
+            validator_index,
+        })
+    }
 }
 
 impl Seen {
@@ -79,6 +95,12 @@ impl Seen {
     /// `seen.execution_payloads[block_hash]`.
     pub fn execution_payload(&self, block_hash: Hash32) -> Option<&SeenPayload> {
         self.execution_payloads.get(&block_hash)
+    }
+
+    /// `(slot, validator_index) in seen.payload_attestation_validators`.
+    pub fn has_payload_attestation(&self, slot: Slot, validator_index: ValidatorIndex) -> bool {
+        self.payload_attestation_validators
+            .contains(&(slot, validator_index))
     }
 
     /// The end of a [`Verdict::Pending`]: `signatures` is the BLS verdict of its sets, as
@@ -102,7 +124,8 @@ impl Seen {
     }
 
     /// Adds the key of a fully valid message ("Mark this envelope as seen and store its
-    /// payload", L881-883). Only [`Seen::resolve`] calls it, after a valid signature.
+    /// payload", L881-883; "Mark this payload_attestation as seen", L952-953). Only
+    /// [`Seen::resolve`] calls it, after a valid signature.
     fn commit(&mut self, SeenKey(key): SeenKey) -> Verdict {
         match key {
             Key::ExecutionPayloadEnvelope {
@@ -121,6 +144,21 @@ impl Seen {
                     });
                 }
                 self.execution_payloads.insert(block_hash, payload);
+                Verdict::Accept
+            }
+            Key::PayloadAttestation {
+                slot,
+                validator_index,
+            } => {
+                if !self
+                    .payload_attestation_validators
+                    .insert((slot, validator_index))
+                {
+                    return Verdict::Ignore(IgnoreReason::PayloadAttestationAlreadySeen {
+                        slot,
+                        validator_index,
+                    });
+                }
                 Verdict::Accept
             }
         }

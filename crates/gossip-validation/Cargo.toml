@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Gloas gossip validation as pure functions of a Seen set and the fork-choice store: the execution_payload topic. No I/O and no BLS: a signature leaves as a signature set."
+description = "Gloas gossip validation as pure functions of a Seen set and the fork-choice store: the execution_payload and payload_attestation_message topics. No I/O and no BLS: a signature leaves as a signature set."
 
 [dependencies]
 consensus-types = { path = "../consensus-types" }

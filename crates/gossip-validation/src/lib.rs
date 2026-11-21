@@ -3,6 +3,8 @@
 //!
 //! - [`execution_payload`]: the `execution_payload` topic,
 //!   [`validate_execution_payload_envelope_gossip`] (L811-885).
+//! - [`payload_attestation`]: the `payload_attestation_message` topic,
+//!   [`validate_payload_attestation_message_gossip`] (L891-954).
 //! - [`seen`]: the spec's `Seen` (L188-219), for the topics of this crate.
 //! - [`verdict`]: the [`Verdict`] of a message, and why it is IGNORE or REJECT.
 //!
@@ -18,12 +20,16 @@
 //! No gossip dispatch calls this crate yet.
 
 pub mod execution_payload;
+pub mod payload_attestation;
 pub mod seen;
 pub mod verdict;
 
 pub use execution_payload::{
     validate_execution_payload_envelope_gossip, verify_execution_requests_limits,
     verify_withdrawals_limit, RequestCounts,
+};
+pub use payload_attestation::{
+    is_current_slot, validate_payload_attestation_message_gossip, MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS,
 };
 pub use seen::{Seen, SeenKey, SeenPayload};
 pub use verdict::{IgnoreReason, RejectReason, RequestKind, Verdict};
@@ -32,6 +38,7 @@ use consensus_types::gloas::{BeaconBlock, BeaconState, Checkpoint};
 use consensus_types::primitives::Root;
 use fork_choice::Store;
 use state_transition::Preset;
+use std::num::NonZeroU64;
 
 /// What the gossip checks read of the fork-choice store.
 ///
@@ -48,6 +55,9 @@ use state_transition::Preset;
 /// validated, not ignored as unknown. [`Store::block`] and [`Store::block_state`] have only
 /// the blocks that the store keeps. After the window the store forgets a dropped block, and
 /// an envelope for it is ignored.
+///
+/// The head state of the view of the fork-choice [`Store`] runs `get_head` on each call, as the
+/// spec does for each payload attestation message.
 pub trait StoreView<E: Preset> {
     /// `store.blocks[root]`.
     fn block(&self, root: Root) -> Option<&BeaconBlock<E>>;
@@ -57,6 +67,16 @@ pub trait StoreView<E: Preset> {
 
     /// `store.finalized_checkpoint`.
     fn finalized_checkpoint(&self) -> &Checkpoint;
+
+    /// `store.genesis_time_ms`.
+    fn genesis_time_ms(&self) -> u64;
+
+    /// The config value `SLOT_DURATION_MS` of `compute_time_at_slot_ms`.
+    fn slot_duration_ms(&self) -> NonZeroU64;
+
+    /// `store.block_states[get_head(store).root]`, or `None` if the store cannot give it: a
+    /// fault of the store.
+    fn head_state(&self) -> Option<&BeaconState<E>>;
 }
 
 impl<E: Preset> StoreView<E> for Store<E> {
@@ -70,5 +90,19 @@ impl<E: Preset> StoreView<E> for Store<E> {
 
     fn finalized_checkpoint(&self) -> &Checkpoint {
         Store::finalized_checkpoint(self)
+    }
+
+    fn genesis_time_ms(&self) -> u64 {
+        Store::genesis_time_ms(self)
+    }
+
+    fn slot_duration_ms(&self) -> NonZeroU64 {
+        Store::slot_duration_ms(self)
+    }
+
+    fn head_state(&self) -> Option<&BeaconState<E>> {
+        // The head is a block of the store, so `Store::block_state` has its post-state.
+        let head = fork_choice::get_head(self).ok()?;
+        Store::block_state(self, head.root)
     }
 }
