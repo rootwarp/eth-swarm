@@ -29,9 +29,13 @@
 //!   at the slot of the wall clock on an old pre-state (the anchor stays for good), so the walk
 //!   has its own bounds: a start more than
 //!   [`MAX_ADVANCE_EPOCHS`](super::advance::MAX_ADVANCE_EPOCHS) epochs of slots before the
-//!   block, the deadline, no deposit verdict, or an error in the walk is IGNORE. The checks
-//!   below and the import then run on the advanced state in place of the parent pre-state;
+//!   block, the deadline, a caller that stopped waiting, no deposit verdict, or an error in
+//!   the walk is IGNORE. The checks below and the import then run on the advanced state in
+//!   place of the parent pre-state;
 //! - `proposer_index` is past the registry of the pre-state: INVALID, kept;
+//! - the caller of the import dropped the receiver of the answer: IGNORE. The core checks this
+//!   here and again before [`import_block`]. A drop before a check stops the import at that
+//!   check: no later VerifyBls call and no commit;
 //! - the proposer signature ([`check_proposer_signature`]), with the key and the domain of the
 //!   pre-state: INVALID on an INVALID verdict (kept for that signature only), IGNORE on no
 //!   verdict.
@@ -61,8 +65,9 @@
 //! only for that signature, as the block root does not commit to it. The core does not keep no
 //! verdict (the block can come again and get a verdict in time), a parent without a pre-state
 //! (it can come), a refused payload, the wall-clock bound (the same block is in that bound
-//! once its slot comes, and that check costs no slot loop and no VerifyBls call), or a refusal
-//! of the walk: a later walk can start from a nearer state, or have more time.
+//! once its slot comes, and that check costs no slot loop and no VerifyBls call), a caller
+//! that stopped waiting, or a refusal of the walk: a later walk can start from a nearer state,
+//! or have more time.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
@@ -232,7 +237,8 @@ pub fn queue<E: Preset>(capacity: usize) -> (CoreSender<E>, CoreQueue<E>) {
 impl<E: Preset> CoreSender<E> {
     /// Queues `block` for import. The answer comes on the receiver; a receiver that closes
     /// without one means the core stopped (IGNORE). The core checks the slot of the block
-    /// against the wall clock before the slot loop (see the module docs).
+    /// against the wall clock before the slot loop (see the module docs). If the caller drops
+    /// the receiver, the core stops the import at its next check of the caller (IGNORE).
     pub fn import(
         &self,
         block: SignedBeaconBlock<E>,
@@ -380,9 +386,9 @@ impl<E: Preset> ChainCore<E> {
 
     /// The same core with `hook` as its walk hook, in place of an earlier one. A test seam: in
     /// a walk over empty slots (see [`advance`](super::advance)), the core thread runs `hook`
-    /// with the slot of the walk state before each check of the deadline, and once after the
-    /// walk. So it runs before the walk, at each epoch boundary after the walk keeps its state,
-    /// and before the check of the proposer.
+    /// with the slot of the walk state before each check of the deadline and of the caller,
+    /// and once after the walk. So it runs before the walk, at each epoch boundary after the
+    /// walk keeps its state, and before the check of the proposer.
     #[cfg(feature = "test-hooks")]
     #[must_use]
     pub fn with_walk_hook(mut self, hook: impl Fn(Slot) + Send + Sync + 'static) -> Self {
@@ -442,7 +448,10 @@ impl<E: Preset> ChainCore<E> {
             self.turns += 1;
             let turn = self.turns;
             let (outcome, reply) = match item {
-                Item::Import(item) => (self.import(&item.block, verifier, runtime), item.reply),
+                Item::Import(item) => (
+                    self.import(&item.block, &item.reply, verifier, runtime),
+                    item.reply,
+                ),
                 Item::Envelope(reply) => (Outcome::Ignored("no envelope import yet".into()), reply),
                 Item::Gossip(reply) => (Outcome::Ignored("no gossip commit yet".into()), reply),
             };
@@ -452,10 +461,12 @@ impl<E: Preset> ChainCore<E> {
         self
     }
 
-    /// Imports `block` and commits it only if it imports (see the module docs).
+    /// Imports `block` and commits it only if it imports (see the module docs). `reply` is the
+    /// answer channel of the import: once it is closed, the import stops at the next check.
     fn import<V: BlsVerifier + 'static>(
         &mut self,
         block: &SignedBeaconBlock<E>,
+        reply: &Reply,
         verifier: &Arc<V>,
         runtime: &Handle,
     ) -> Outcome {
@@ -494,23 +505,22 @@ impl<E: Preset> ChainCore<E> {
         } else {
             let hooks = &self.hooks;
             // On the clock of the runtime, as the deadline.
-            let out_of_time = |at: Slot| {
+            let stop = |at: Slot| {
                 hooks.walk(at);
                 let _context = runtime.enter();
-                Instant::now() >= deadline
+                if Instant::now() >= deadline {
+                    Some("no time left")
+                } else if reply.is_closed() {
+                    Some(CALLER_GONE)
+                } else {
+                    None
+                }
             };
             let config = &self.config;
             let walk = |state: &mut BeaconState<E>, to: Slot| {
                 process_empty_slots(state, to, parent_state, config, &verdict)
             };
-            let walked = advance(
-                &mut self.advanced,
-                parent,
-                parent_state,
-                slot,
-                &out_of_time,
-                &walk,
-            );
+            let walked = advance(&mut self.advanced, parent, parent_state, slot, &stop, &walk);
             advanced = match walked {
                 Ok(state) => state,
                 // No proof about the block, so the refusal is not kept.
@@ -529,6 +539,11 @@ impl<E: Preset> ChainCore<E> {
             let invalid = Outcome::Invalid(StfError::UnknownValidator(proposer));
             return self.refused.refuse(block_root, None, invalid);
         }
+        // A caller that stopped waiting gets no answer: no VerifyBls call and no commit for it.
+        // This is no proof about the block, so the refusal is not kept.
+        if reply.is_closed() {
+            return Outcome::Ignored(CALLER_GONE.into());
+        }
         // The gossip order: the signature of the proposer before the slot loop, so that a
         // block that its proposer did not sign costs one VerifyBls call and no slot loop.
         match check_proposer_signature(pre, block, &verdict) {
@@ -540,6 +555,10 @@ impl<E: Preset> ChainCore<E> {
                     .refuse(block_root, signature, Outcome::Invalid(e));
             }
             Err(NotImported::Ignored(why)) => return Outcome::Ignored(why),
+        }
+        // The caller can stop waiting during that VerifyBls call.
+        if reply.is_closed() {
+            return Outcome::Ignored(CALLER_GONE.into());
         }
         match import_block(pre, block, &self.config, &verdict, gate) {
             Ok(imported) => {
@@ -625,3 +644,6 @@ fn verify<V: BlsVerifier + 'static>(
 
 /// The no-verdict reason of a VerifyBls call without a verdict before its deadline.
 const NO_VERDICT_IN_TIME: &str = "no verdict by the deadline";
+
+/// The IGNORE reason of an import whose caller dropped the receiver of the answer.
+const CALLER_GONE: &str = "the caller stopped waiting for the answer";

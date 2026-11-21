@@ -15,12 +15,14 @@
 //! - a start more than [`MAX_ADVANCE_EPOCHS`] epochs of slots before the block is IGNORE at
 //!   once, with no `process_slots`;
 //! - before the walk, and before each epoch boundary, the walk checks the deadline of the
-//!   import. The deposit verdicts of an epoch boundary go to cl-verify with that deadline.
+//!   import, and that the caller of the import still waits for the answer. The deposit
+//!   verdicts of an epoch boundary go to cl-verify with that deadline.
 //!
 //! At the last slot of each epoch that it reaches, the walk keeps a copy of its state in
 //! [`Advanced`], by the root of the parent and the epoch after that slot. A walk that stops
-//! (the deadline, no deposit verdict, an error) keeps the states it reached. A later walk from
-//! the same parent starts from the latest of them, so it does not walk those slots again.
+//! (the deadline, a caller that stopped waiting, no deposit verdict, an error) keeps the states
+//! it reached. A later walk from the same parent starts from the latest of them, so it does not
+//! walk those slots again.
 //!
 //! No refusal of the walk is a proof about the block: each is IGNORE, and the core does not
 //! keep it. The block can import later from a nearer state, or with more time.
@@ -109,8 +111,9 @@ impl<S> Advanced<S> {
 /// Advances `pre`, the pre-state of block `parent`, toward a block at `slot` (see the module
 /// docs), and returns the state at `slot - 1`. The caller calls it only for a block more than
 /// [`PRE_STATE_EPOCHS`] epochs of slots after `pre`. `walk` runs `process_slots` on a state to
-/// a slot. `out_of_time` gets the slot of the walk state, and is `true` once the deadline of
-/// the import passed. `Err` (why, for the log) is IGNORE.
+/// a slot. `stop` gets the slot of the walk state, and gives why the walk must stop there (the
+/// deadline of the import passed, or its caller stopped waiting), else `None`. `Err` (why, for
+/// the log) is IGNORE.
 ///
 /// [`PRE_STATE_EPOCHS`]: super::snapshot::PRE_STATE_EPOCHS
 pub(crate) fn advance<E: Preset>(
@@ -118,7 +121,7 @@ pub(crate) fn advance<E: Preset>(
     parent: Root,
     pre: &BeaconState<E>,
     slot: Slot,
-    out_of_time: &dyn Fn(Slot) -> bool,
+    stop: &dyn Fn(Slot) -> Option<&'static str>,
     walk: &Walk<'_, E>,
 ) -> Result<BeaconState<E>, String> {
     let epoch_slots = E::slots_per_epoch();
@@ -136,9 +139,9 @@ pub(crate) fn advance<E: Preset>(
     let target = slot.saturating_sub(1);
     let mut state = start.clone();
     while state.slot < target {
-        if out_of_time(state.slot) {
+        if let Some(why) = stop(state.slot) {
             return Err(format!(
-                "no time left to advance the state of the parent {parent} from slot {}",
+                "{why}: the walk of the state of the parent {parent} stops at slot {}",
                 state.slot
             ));
         }
