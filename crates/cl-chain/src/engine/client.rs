@@ -67,8 +67,8 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(8);
 /// ([`NEW_PAYLOAD_V5_TIMEOUT`]), and no longer, so a stalled cl-engine holds the chain core's
 /// writer no longer than the EL may take
 /// ([`DEFAULT_ENGINE_TIMEOUT`](crate::core::DEFAULT_ENGINE_TIMEOUT)). It is under cl-engine's
-/// 10 s request deadline, so a newPayload answer that cl-engine gives later is lost to the
-/// caller: the call has no verdict. [`FcuSender`] connects within it too, but waits
+/// 10 s newPayload request deadline, so a newPayload answer that cl-engine gives later is lost to
+/// the caller: the call has no verdict. [`FcuSender`] connects within it too, but waits
 /// [`FCU_CALL_TIMEOUT`] for a forkchoiceUpdated answer.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(6);
 
@@ -82,13 +82,15 @@ pub const FORKCHOICE_UPDATED_TIMEOUT: Duration = Duration::from_secs(8);
 /// send, before the call counts as lost in transport. It is longer than cl-engine's wait for the
 /// EL ([`FORKCHOICE_UPDATED_TIMEOUT`]), so cl-engine answers first: the EL's status, an
 /// `INVALID` included, or its own `TIMEOUT`. Only a call still running at 10 s, held in
-/// cl-engine's queue or by a cl-engine stuck past the EL wait, is lost here. cl-engine's
-/// request deadline is 10 s as well, and can end such a call at the same moment: either way the
-/// call is lost, so retried with the latest arguments, and the EL may still have applied it.
+/// cl-engine's queue or by a cl-engine stuck past the EL wait, is lost here: retried with the
+/// latest arguments, and the EL may still have applied it. cl-engine's request deadline for
+/// forkchoiceUpdated is longer (its `FORKCHOICE_UPDATED_REQUEST_TIMEOUT`, 12 s; the other
+/// methods keep 10 s), so it never ends such a call at the same moment as this wait.
 pub const FCU_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 // cl-engine's wait for the EL on forkchoiceUpdated ends before the sender's: its answer, the
-// EL's status or its TIMEOUT, comes first.
+// EL's status or its TIMEOUT, comes first. cl-engine is not a dependency of this crate, so
+// tests/fcu_order.rs pins this copy to cl-engine's and the sender's wait under its deadline.
 const _: () = assert!(FORKCHOICE_UPDATED_TIMEOUT.as_millis() < FCU_CALL_TIMEOUT.as_millis());
 
 /// The `seq` of cl-chain's engine.v1 calls: one counter per process, shared by every caller,

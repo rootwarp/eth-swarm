@@ -514,7 +514,11 @@ fn the_waits_on_a_forkchoice_call_end_in_order() {
         "cl-chain's copy of cl-engine's wait for the EL"
     );
     // The request deadline cl-engine gives forkchoiceUpdated by default.
-    let request_deadline = cl_engine::server::Limits::default().request_timeout;
+    let request_deadline = cl_engine::server::Limits::default().forkchoice_updated_timeout;
+    assert_eq!(
+        request_deadline,
+        cl_engine::server::FORKCHOICE_UPDATED_REQUEST_TIMEOUT
+    );
     assert!(
         FORKCHOICE_UPDATED_TIMEOUT < FCU_CALL_TIMEOUT,
         "the EL wait ({FORKCHOICE_UPDATED_TIMEOUT:?}) must end before the sender's \

@@ -724,3 +724,29 @@ async fn forkchoice_updated_runs_past_the_shared_request_deadline() {
         ["engine_forkchoiceUpdatedV4", "engine_newPayloadV5"]
     );
 }
+
+/// forkchoiceUpdated's own request deadline still ends a call: an EL answer later than it is cut
+/// off (`CANCELLED`) at that deadline, not at the shared one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forkchoice_updated_ends_at_its_own_request_deadline() {
+    let own = Duration::from_millis(800);
+    let limits = Limits {
+        request_timeout: Duration::from_millis(300),
+        forkchoice_updated_timeout: own,
+        ..Limits::default()
+    };
+    let running = start(acl(me(), &[FORKCHOICE]), limits).await;
+    running
+        .mock
+        .set_method_delay("engine_forkchoiceUpdatedV4", LATE_EL_ANSWER);
+    let mut client = EngineServiceClient::new(channel(&running.path).await);
+    let started = std::time::Instant::now();
+    let cut = client
+        .forkchoice_updated(forkchoice_updated(1))
+        .await
+        .expect_err("forkchoiceUpdated ran past its own request deadline");
+    let elapsed = started.elapsed();
+    assert_eq!(cut.code(), Code::Cancelled, "{cut:?}");
+    assert!(elapsed >= own && elapsed < LATE_EL_ANSWER, "{elapsed:?}");
+    assert_eq!(sent(&running.mock), ["engine_forkchoiceUpdatedV4"]);
+}
