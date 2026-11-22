@@ -32,8 +32,8 @@ use consensus_types::gloas::{BeaconState, Checkpoint};
 use consensus_types::primitives::{Bytes32, Hash32};
 use consensus_types::{EthSpec, Minimal};
 use el::{
-    advanced, block_item, commit_all, empty_child, envelope, full_child, hash, invalid_on,
-    payload_block, ready, root, sealed, step, Block, El, Item,
+    advanced, block_item, commit_all, empty_child, envelope, full_child, full_child_at, hash,
+    invalid_on, payload_block, ready, root, sealed, step, Block, El, Item,
 };
 use ethswarm_proto::engine as pb;
 use fork_choice::testing::{
@@ -1160,6 +1160,74 @@ async fn an_fcu_invalid_block_hash_is_a_protocol_fault_that_halts_and_records_no
     assert_eq!(t.el.forkchoice_updates().len(), updates);
 }
 
+/// The EL took the payloads of `p` and `c` optimistically, and `e` builds on the FULL payload of
+/// `c`. The answer to the forkchoiceUpdated of the FULL head `p` comes late: fork choice
+/// finalizes `e` first (a test seam stands for a finalizing chain), so the finalized execution
+/// hash is the payload of `c`, and at the start of the next turn the core prunes it and its
+/// parent, the payload of `p`, from the table. Then it takes the answer: INVALID for the payload
+/// of `p`, with its execution parent as `latestValidHash`. Finality has passed that payload, so
+/// this is an EL contradiction: the core halts the sender and records nothing for the gone
+/// payload, and the head, the store and the forkchoiceUpdated calls stay as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_fcu_invalid_for_a_payload_finality_pruned_halts_and_records_nothing() {
+    let t = later(Reply::Syncing, |_| Reply::Syncing).await;
+    let (p, p_post) = &t.p;
+    let (c, c_post) = &t.c;
+    let fcu = t.sink.fcu.as_ref().unwrap();
+    let answer = fcu
+        .take_outcome()
+        .expect("the answer to the forkchoiceUpdated of p");
+    assert_eq!(answer.args.head_block_hash, hash(0x31));
+    let core = commit_all(t.core, &[c], &t.verify).await;
+    t.el.answer(hash(0x32), Reply::Syncing);
+    let (outcome, core) = step(core, envelope(&t.config, c, c_post), &t.verify).await;
+    assert_eq!(
+        outcome,
+        Outcome::PayloadVerified {
+            block_root: root(c)
+        }
+    );
+    let (e, _) = full_child_at(&t.config, c, c_post, c.message.slot + 1, 0x36);
+    let core = commit_all(core, &[&e], &t.verify).await;
+    let finalized = Checkpoint {
+        epoch: 1,
+        root: root(&e),
+    };
+    let core = core.with_fork_choice(|store| set_finalized_checkpoint(store, finalized));
+    assert_eq!(
+        bid(&e).parent_block_hash,
+        hash(0x32),
+        "the finalized execution hash"
+    );
+    assert_eq!(
+        [0x31, 0x32].map(|n| core.execution_statuses().status(&hash(n))),
+        [Some(ExecutionStatus::Optimistic); 2]
+    );
+    el_sees(&t.el, t.sink.sent().last().unwrap()).await;
+    let updates = t.el.forkchoice_updates().len();
+    let before = seen(&core, &t.sink);
+
+    t.sink
+        .script(invalid_answer(answer, p_post.latest_block_hash));
+    let (outcome, core) = step(core, Item::Gossip, &t.verify).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    let statuses = core.execution_statuses();
+    assert_eq!(
+        [0x31, 0x32].map(|n| statuses.status(&hash(n))),
+        [None, None],
+        "finality pruned both payloads, and the answer records nothing"
+    );
+    assert!(
+        statuses.el_contradiction(),
+        "an INVALID for a payload below the finalized execution hash contradicts finality"
+    );
+    assert!(t.sink.halted(), "the contradiction halts the sender");
+    assert_eq!(seen(&core, &t.sink), before, "the head and the store stay");
+    assert!(is_payload_verified(core.fork_choice(), root(p)));
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(t.el.forkchoice_updates().len(), updates);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The justified checkpoint on an invalid payload, and a later INVALID that changes nothing.
 
@@ -1495,6 +1563,144 @@ async fn a_tick_that_moves_justified_and_finalized_past_a_removed_payload_halts_
     assert_eq!(verified(&core), [true, false, false, false]);
     assert_eq!(t.sink.sent(), sent, "no forkchoiceUpdated");
     assert_eq!(core.forkchoice_sent(), forkchoice_sent);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(t.el.forkchoice_updates().len(), updates);
+}
+
+/// The `later` core on a test clock in the last slot of epoch 1, where the EL took the payload of
+/// `p` optimistically, with `c` on that FULL payload and `d` on the EMPTY node of `c` committed:
+/// the anchor is the justified and the finalized block, and the head is the EMPTY node of `d`.
+/// Test seams then apply `edit` to the store and pull the unrealized justified checkpoint up to
+/// `d` and the unrealized finalized checkpoint up to `c` (a justifying and finalizing chain), and
+/// the clock reaches the first slot of epoch 2: the next import ticks the store there. Returns
+/// the core, `d`, and `other`, a sibling of `p` with another payload, whose parent (the anchor)
+/// the prune of that tick drops, so `on_block` refuses it.
+async fn before_a_tick_to_d(
+    edit: impl FnOnce(&mut fork_choice::Store<Minimal>),
+) -> (Later, Block, Block) {
+    let epoch = Minimal::slots_per_epoch();
+    let end_of_epoch_1 = |core: ChainCore<Minimal>| {
+        let at = slot_time(&core, 2 * epoch - 1);
+        core.with_clock(clock_at(at))
+    };
+    let mut t = later_with(Reply::Syncing, |_| Reply::Syncing, end_of_epoch_1).await;
+    let (p, _) = &t.p;
+    let (c, c_post) = &t.c;
+    let (d, _) = empty_child(&t.config, c, c_post, epoch + 1, 0x34);
+    let core = commit_all(t.core, &[c, &d], &t.verify).await;
+    assert_eq!(core.head(), head_of(&d, PayloadStatus::Empty));
+    let other = other_payload(&core, p, &t.config);
+    let (justified, finalized) = justified_on_d_finalized_on_c(c, &d);
+    let start_of_epoch_2 = clock_at(slot_time(&core, 2 * epoch));
+    t.core = core
+        .with_fork_choice(|store| {
+            edit(store);
+            set_unrealized_justified_checkpoint(store, justified);
+            set_unrealized_finalized_checkpoint(store, finalized);
+        })
+        .with_clock(start_of_epoch_2);
+    (t, d, other)
+}
+
+/// [`before_a_tick_to_d`] with the store as the commits left it. The import of `other` ticks the
+/// store: `on_tick` makes `d` the justified and `c` the finalized block, with no EL contradiction
+/// (both build on the payload of `p`, which the store has), and its prune drops the anchor. Then
+/// `on_block` refuses `other`: the import is IGNORE and commits nothing. The core still follows
+/// the tick, as after a commit: it prunes the table at the new finalized execution hash (the
+/// payload of `p`), the head is the EMPTY node of `d`, and one forkchoiceUpdated carries the new
+/// safe and finalized hashes to the EL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tick_before_a_refused_block_moves_the_head_and_the_forkchoice_update() {
+    let (t, d, other) = before_a_tick_to_d(|_| {}).await;
+    let (justified, finalized) = justified_on_d_finalized_on_c(&t.c.0, &d);
+    let sent = t.sink.sent();
+    let last = *sent.last().unwrap();
+    assert_eq!(
+        hashes(&last),
+        [hash(0x31), Hash32::ZERO, Hash32::ZERO],
+        "the EMPTY node of d builds on the payload of p, and the anchor is safe and finalized"
+    );
+    assert_eq!(t.core.forkchoice_sent(), Some(last));
+
+    let (outcome, core) = step(t.core, block_item(&other), &t.verify).await;
+    let store = core.fork_choice();
+    assert_eq!(
+        (store.justified_checkpoint(), store.finalized_checkpoint()),
+        (&justified, &finalized),
+        "on_tick of the import makes d the justified and c the finalized block"
+    );
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    assert!(!core.execution_statuses().el_contradiction());
+    assert!(!t.sink.halted());
+    assert!(
+        !core.is_committed(&root(&other)),
+        "the import commits nothing"
+    );
+    assert!(
+        store.block(root(&other)).is_none(),
+        "on_block refuses the block"
+    );
+    assert_eq!(core.head(), head_of(&d, PayloadStatus::Empty));
+    let want = args(hash(0x31), hash(0x31), hash(0x31));
+    assert_eq!(
+        t.sink.sent(),
+        [sent, vec![want]].concat(),
+        "one forkchoiceUpdated with the new safe and finalized hashes"
+    );
+    assert_eq!(core.forkchoice_sent(), Some(want));
+    assert_eq!(
+        core.execution_statuses().status(&hash(0x31)),
+        None,
+        "the table is pruned at the new finalized execution hash"
+    );
+    el_sees(&t.el, &want).await;
+}
+
+/// [`before_a_tick_to_d`] where the payload of `p` left the store first (`invalidate_payloads`
+/// through a test seam, with no refresh after it): `c` and `d` build on it. The same tick then
+/// makes `d` the justified block, which builds on a payload that left the store: an EL
+/// contradiction, and `on_block` does not run. The core halts the sender, commits nothing and
+/// does not refresh from the tick: the head stays, no forkchoiceUpdated is sent, and the table is
+/// not pruned at the new finalized execution hash in that turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tick_that_latches_before_a_refused_block_does_not_refresh() {
+    let (t, d, other) = before_a_tick_to_d(|store| {
+        assert!(invalidate_payloads(store, |payload| *payload == hash(0x31)));
+    })
+    .await;
+    let (justified, finalized) = justified_on_d_finalized_on_c(&t.c.0, &d);
+    let head = t.core.head();
+    let sent = t.sink.sent();
+    let forkchoice_sent = t.core.forkchoice_sent();
+    el_sees(&t.el, sent.last().unwrap()).await;
+    let updates = t.el.forkchoice_updates().len();
+
+    let (outcome, core) = step(t.core, block_item(&other), &t.verify).await;
+    let store = core.fork_choice();
+    assert_eq!(
+        (store.justified_checkpoint(), store.finalized_checkpoint()),
+        (&justified, &finalized),
+        "on_tick of the import makes d the justified and c the finalized block"
+    );
+    assert!(
+        core.execution_statuses().el_contradiction(),
+        "d builds on a payload that left the store"
+    );
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    assert!(t.sink.halted(), "the core halts the sender");
+    assert!(
+        !core.is_committed(&root(&other)),
+        "the import commits nothing"
+    );
+    assert!(store.block(root(&other)).is_none(), "on_block does not run");
+    assert_eq!(core.head(), head, "the head stays");
+    assert_eq!(t.sink.sent(), sent, "no forkchoiceUpdated");
+    assert_eq!(core.forkchoice_sent(), forkchoice_sent);
+    assert_eq!(
+        core.execution_statuses().status(&hash(0x31)),
+        Some(ExecutionStatus::Optimistic),
+        "no refresh: the table is not pruned at the new finalized execution hash"
+    );
     tokio::time::sleep(QUIET).await;
     assert_eq!(t.el.forkchoice_updates().len(), updates);
 }

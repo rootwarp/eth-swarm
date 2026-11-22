@@ -384,6 +384,32 @@ pub fn empty_child(
     slot: u64,
     n: u8,
 ) -> (Block, State) {
+    // The payload that `parent` builds on, not its own.
+    child_at(config, parent, pre, slot, n, pre.latest_block_hash)
+}
+
+/// [`empty_child`] on the FULL node of `parent`: the bid builds on the payload of `parent`, which
+/// must be verified for the block to import.
+pub fn full_child_at(
+    config: &ChainConfig,
+    parent: &Block,
+    pre: &State,
+    slot: u64,
+    n: u8,
+) -> (Block, State) {
+    let parent_hash = pre.latest_execution_payload_bid.block_hash;
+    child_at(config, parent, pre, slot, n, parent_hash)
+}
+
+/// The block of [`empty_child`] with `parent_hash` as the bid's `parent_block_hash`.
+fn child_at(
+    config: &ChainConfig,
+    parent: &Block,
+    pre: &State,
+    slot: u64,
+    n: u8,
+    parent_hash: Hash32,
+) -> (Block, State) {
     let parent_root = root(parent);
     let at = advanced(pre, slot, config);
     let mut block = export_block(2);
@@ -400,8 +426,7 @@ pub fn empty_child(
     let bid = &mut block.message.body.signed_execution_payload_bid.message;
     bid.slot = slot;
     bid.parent_block_root = parent_root;
-    // The payload that `parent` builds on, not its own.
-    bid.parent_block_hash = pre.latest_block_hash;
+    bid.parent_block_hash = parent_hash;
     bid.block_hash = hash(n);
     bid.prev_randao = get_randao_mix(&at, Minimal::epoch_at_slot(slot));
     bid.execution_requests_root = requests_root;
