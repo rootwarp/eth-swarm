@@ -110,7 +110,8 @@
 //! checkpoint that `get_head` reads (`store_target_checkpoint_state`, with the real
 //! `process_slots`).
 //!
-//! After a commit or an envelope import, the head is `get_head` of the store. A new finalized
+//! After a commit, an envelope import, or a refusal of the store after the tick of an import (the
+//! tick can move the checkpoints or the head), the head is `get_head` of the store. A new finalized
 //! checkpoint prunes the EL's verdicts at the bid `parent_block_hash` of the finalized block, the
 //! `finalizedBlockHash` of a forkchoiceUpdated ([`ExecutionStatuses::prune_finalized`]; nothing
 //! if the store has no such block). With a sink ([`ChainCore::with_forkchoice_sink`]) the core
@@ -138,7 +139,9 @@
 //! the sink ([`ForkchoiceSink::halt`]): queued arguments and the retries of a lost call never
 //! reach the EL, and a later answer is not read. An INVALID for the finalized payload, or with a
 //! `latestValidHash` strictly below it or zero, is such a contradiction; a `latestValidHash`
-//! equal to it is not ([`ExecutionStatuses`]). So is INVALID_BLOCK_HASH as the answer to a
+//! equal to it is not ([`ExecutionStatuses`]). So is a late one that answers a forkchoiceUpdated
+//! whose head a prune at finality already dropped, at or below the finalized payload
+//! ([`ExecutionStatuses::record_head`]). So is INVALID_BLOCK_HASH as the answer to a
 //! forkchoiceUpdated, a newPayload status: a protocol fault, which records nothing. So is a
 //! verdict that makes `Invalid` a payload that the justified block builds on, down to the
 //! finalized block (`is_justified_on_invalid_payload`): `get_head` starts at the justified
@@ -997,6 +1000,9 @@ impl<E: Preset> ChainCore<E> {
             Ok(imported) => {
                 // Fork choice first: a block that the store refuses commits nothing.
                 if let Err(why) = self.store_block(block, &imported.post, &verdict) {
+                    // Its tick can have moved the store: the head and the forkchoiceUpdated
+                    // follow it. Nothing after a latch (`refresh`).
+                    self.refresh();
                     return Outcome::Ignored(why);
                 }
                 self.snapshots.promote(&parent);
@@ -1123,10 +1129,10 @@ impl<E: Preset> ChainCore<E> {
         Ok(())
     }
 
-    /// After a commit, an envelope import or a payload that left the store: the prune at
-    /// finality, the head and the forkchoiceUpdated (see [Fork choice](#fork-choice)). Nothing
-    /// while the EL contradiction is set, and no new head and no forkchoiceUpdated while
-    /// `get_head` fails.
+    /// After a commit, an envelope import, a payload that left the store or an import that the
+    /// store refused after its tick: the prune at finality, the head and the forkchoiceUpdated
+    /// (see [Fork choice](#fork-choice)). Nothing while the EL contradiction is set, and no new
+    /// head and no forkchoiceUpdated while `get_head` fails.
     fn refresh(&mut self) {
         if self.statuses.el_contradiction() {
             return;

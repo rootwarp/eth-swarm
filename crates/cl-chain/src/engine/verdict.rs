@@ -200,6 +200,12 @@ pub enum ExecutionStatus {
 /// an `INVALID` payload back.
 pub const MAX_INVALID_PAYLOADS: usize = 4096;
 
+/// Most hashes of payloads at or below finality that [`ExecutionStatuses`] keeps after
+/// [`ExecutionStatuses::prune_finalized`] dropped or reached them: 128 epochs at one per slot.
+/// Past it, the oldest goes first, and a late forkchoiceUpdated `INVALID` for it is dropped like
+/// one for a hash the table never had ([`ExecutionStatuses::record_head`]).
+pub const MAX_FINALIZED_PAYLOADS: usize = 4096;
+
 /// One payload's status, as the table holds it.
 #[derive(Clone, Copy, Debug)]
 enum State {
@@ -282,7 +288,9 @@ enum Walk {
 ///   `finalizedBlockHash`) and its ancestors valid. A `latestValidHash` equal to that payload is
 ///   the ordinary boundary above. An `INVALID` for that payload is an EL contradiction, and so is
 ///   a walk that reaches it before the boundary: a `latestValidHash` strictly below it, or the
-///   zero hash. The zero hash finalizes no payload.
+///   zero hash. The zero hash finalizes no payload. An `INVALID` that answers a forkchoiceUpdated
+///   for a payload that a prune at finality dropped, at or below the finalized payload, is one
+///   too ([`ExecutionStatuses::record_head`]).
 /// - `NotVerified` records nothing: a payload without a status stays without one, and an
 ///   earlier status stays as it is.
 ///
@@ -304,6 +312,10 @@ pub struct ExecutionStatuses {
     evicted: HashMap<Hash32, Entry>,
     /// The payload of the last [`ExecutionStatuses::prune_finalized`], `None` for the zero hash.
     finalized: Option<Hash32>,
+    /// The payloads at or below finality (see [`MAX_FINALIZED_PAYLOADS`]), and the same hashes
+    /// oldest first, which go first past the bound.
+    finality: HashSet<Hash32>,
+    finality_order: VecDeque<Hash32>,
     /// See [`ExecutionStatuses::el_contradiction`].
     contradiction: bool,
     /// A payload became `Invalid` since the last [`ExecutionStatuses::take_invalidated`].
@@ -375,7 +387,9 @@ impl ExecutionStatuses {
 
     /// [`Self::record`] for `verdict`, the answer to a forkchoiceUpdated with the head `head`,
     /// with the parent hash the table has for it. A head without one records nothing, but an
-    /// `INVALID` with a `latestValidHash` for the finalized payload is an EL contradiction.
+    /// `INVALID` with a `latestValidHash` for a payload at or below finality is an EL
+    /// contradiction: the finalized payload, or one that a prune dropped or reached before the
+    /// answer came (see [`Self::prune_finalized`]).
     /// [`Reason::InvalidBlockHash`] is a newPayload status that a forkchoiceUpdated must not
     /// answer: a protocol fault, so an EL contradiction, and it records nothing for `head`.
     pub fn record_head(&mut self, head: Hash32, verdict: &ElVerdict) -> Option<ExecutionStatus> {
@@ -390,7 +404,7 @@ impl ExecutionStatuses {
             latest_valid_hash: Some(_),
         } = verdict
         {
-            self.contradiction |= self.finalized == Some(head);
+            self.contradiction |= self.finalized == Some(head) || self.finality.contains(&head);
         }
         None
     }
@@ -428,7 +442,8 @@ impl ExecutionStatuses {
     /// finalized. That payload is an ancestor of `finalized` too, and `children` keeps its
     /// children after its entry is gone, so it anchors the forks off it: none of them leaks
     /// past a later finality. `finalized` stays the finalized payload of the contradiction
-    /// check (see the type docs), also if it is not recorded.
+    /// check (see the type docs), also if it is not recorded. It, the ancestors it drops and the
+    /// parent hash the walk ends at stay known as at or below finality ([`Self::record_head`]).
     pub fn prune_finalized(&mut self, finalized: &Hash32) -> usize {
         self.finalized = (*finalized != Hash32::ZERO).then_some(*finalized);
         let mut seen = HashSet::new();
@@ -440,6 +455,11 @@ impl ExecutionStatuses {
             }
             doomed.push(at);
             at = parent;
+        }
+        // The oldest first: where the walk ended, then each payload it passed, to `finalized`.
+        self.remember_finality(at);
+        for &hash in doomed.iter().rev() {
+            self.remember_finality(hash);
         }
         if doomed.is_empty() {
             // Nothing tells which children of `finalized` it is not an ancestor of.
@@ -692,6 +712,20 @@ impl ExecutionStatuses {
             };
             if let Some(entry) = self.blocks.remove(&hash) {
                 self.evicted.insert(hash, entry);
+            }
+        }
+    }
+
+    /// Keeps `hash` as a payload at or below finality, the oldest going first past
+    /// [`MAX_FINALIZED_PAYLOADS`]. The zero hash is no payload.
+    fn remember_finality(&mut self, hash: Hash32) {
+        if hash == Hash32::ZERO || !self.finality.insert(hash) {
+            return;
+        }
+        self.finality_order.push_back(hash);
+        if self.finality_order.len() > MAX_FINALIZED_PAYLOADS {
+            if let Some(oldest) = self.finality_order.pop_front() {
+                self.finality.remove(&oldest);
             }
         }
     }

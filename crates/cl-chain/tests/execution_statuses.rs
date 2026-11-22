@@ -9,7 +9,8 @@
 //! `hash(n)`, and `chain` records each `(n, parent, verdict)` in order.
 
 use cl_chain::engine::verdict::{
-    self, ElVerdict, ExecutionStatus, ExecutionStatuses, Reason, MAX_INVALID_PAYLOADS,
+    self, ElVerdict, ExecutionStatus, ExecutionStatuses, Reason, MAX_FINALIZED_PAYLOADS,
+    MAX_INVALID_PAYLOADS,
 };
 use consensus_types::primitives::Hash32;
 use engine_api::{FixedData, PayloadStatusV1, ValidationStatus};
@@ -696,6 +697,29 @@ fn an_fcu_invalid_for_a_pruned_ancestor_of_the_finalized_payload_is_an_el_contra
             [None, None, Some(Optimistic)]
         );
     }
+}
+
+/// The table keeps at most `MAX_FINALIZED_PAYLOADS` payloads at or below finality, the oldest
+/// going first. A chain of that many on the payload `wide(0)`, finalized at its top: the walk
+/// ends at `wide(0)`, one past the bound, so an INVALID for it is dropped like one for a hash the
+/// table never had. One for the next payload, `wide(1)`, is still an EL contradiction.
+#[test]
+fn the_payloads_at_or_below_finality_that_the_table_keeps_are_bounded() {
+    let mut statuses = ExecutionStatuses::new();
+    let top = u32::try_from(MAX_FINALIZED_PAYLOADS).unwrap();
+    for i in 1..=top {
+        statuses.record(wide(i), wide(i - 1), &VALID);
+    }
+    assert_eq!(statuses.prune_finalized(&wide(top)), MAX_FINALIZED_PAYLOADS);
+    assert!(statuses.is_empty());
+    let verdict = invalid(Some(wide(0)));
+    assert_eq!(statuses.record_head(wide(0), &verdict), None);
+    assert!(
+        !statuses.el_contradiction(),
+        "the oldest went past the bound"
+    );
+    assert_eq!(statuses.record_head(wide(1), &verdict), None);
+    assert!(statuses.el_contradiction());
 }
 
 /// INVALID with a `null` `latestValidHash` is the Engine API's answer to a payload that does not
