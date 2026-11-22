@@ -12,9 +12,12 @@ mod el;
 #[allow(dead_code)]
 mod support;
 
-use cl_chain::core::{ChainCore, Head, Outcome};
-use cl_chain::engine::client::{EngineSeq, NewPayloadClient, NewPayloadMetrics};
-use cl_chain::engine::verdict::ExecutionStatus;
+use cl_chain::core::{queue, ChainCore, Head, Outcome};
+use cl_chain::engine::client::{
+    EngineSeq, NewPayload, NewPayloadClient, NewPayloadFuture, NewPayloadMetrics,
+};
+use cl_chain::engine::verdict::{ElVerdict, ExecutionStatus};
+use consensus_types::gloas::{ExecutionPayloadBid, ExecutionPayloadEnvelope};
 use consensus_types::primitives::Root;
 use consensus_types::Minimal;
 use el::{
@@ -26,8 +29,11 @@ use fork_choice::DataAvailability;
 use network_config::ChainConfig;
 use std::sync::Arc;
 use std::time::Duration;
-use support::{envelope_of, fixture, Answer, FakeVerify, Fixture};
+use support::{envelope_of, fixture, Answer, FakeVerify, Fixture, QUEUE};
 use testkit::mock_el::Reply;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 /// What a test can read of the core state, for the roots of `roots`.
 #[derive(Debug, PartialEq)]
@@ -380,6 +386,168 @@ async fn no_answer_in_time_is_ignored_and_records_nothing() {
     }
     assert!(el.new_payloads().contains(&hash(0x62)));
     assert_eq!(late.new_payloads(), vec![hash(0x63)]);
+}
+
+/// The engine wait of a core that keeps the default, as a number: 6 s, the Engine API's wait
+/// for `engine_newPayloadV5`.
+const DEFAULT_WAIT: Duration = Duration::from_secs(6);
+
+/// The most wall-clock time the core has for an answer that is due on the frozen clock: the
+/// clock cannot move then, so no Tokio timer bounds the wait.
+const WALL_LIMIT: Duration = Duration::from_secs(10);
+
+/// How a slow newPayload call goes, on the Tokio clock, from its start.
+#[derive(Clone, Copy, Debug)]
+enum Slow {
+    /// It never answers.
+    Stall,
+    /// VALID after this wait.
+    ValidAfter(Duration),
+    /// A connection that takes `connect`, then VALID `answer` after it.
+    ConnectThenValid { connect: Duration, answer: Duration },
+}
+
+/// A newPayload call that is slow as `slow` says, and sends the time it started on `started`.
+struct SlowEngine {
+    slow: Slow,
+    started: mpsc::UnboundedSender<Instant>,
+}
+
+impl NewPayload<Minimal> for SlowEngine {
+    fn new_payload<'a>(
+        &'a self,
+        _: &'a ExecutionPayloadEnvelope<Minimal>,
+        _: &'a ExecutionPayloadBid<Minimal>,
+    ) -> NewPayloadFuture<'a> {
+        Box::pin(async move {
+            let _ = self.started.send(Instant::now());
+            match self.slow {
+                Slow::Stall => std::future::pending().await,
+                Slow::ValidAfter(wait) => tokio::time::sleep(wait).await,
+                Slow::ConnectThenValid { connect, answer } => {
+                    tokio::time::sleep(connect).await;
+                    tokio::time::sleep(answer).await;
+                }
+            }
+            ElVerdict::Valid
+        })
+    }
+}
+
+/// Holds the paused clock still until dropped: Tokio does not auto-advance paused time while a
+/// blocking task runs (`tokio::time::pause`, "Preventing auto-advance"), so only
+/// `tokio::time::advance` moves it.
+struct Frozen {
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+fn freeze() -> Frozen {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        // Returns once the sender is dropped.
+        let _ = released.recv();
+    });
+    Frozen { _release: release }
+}
+
+/// The output of `fut`, or `None` if it has none within `limit` of wall-clock time.
+async fn within_wall<T>(fut: impl std::future::Future<Output = T>, limit: Duration) -> Option<T> {
+    let (done, over) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
+        let _ = done.send(());
+    });
+    tokio::select! {
+        biased;
+        out = fut => Some(out),
+        _ = over => None,
+    }
+}
+
+/// A core that keeps the default engine wait, and a newPayload call that never answers,
+/// answers VALID 1 ms after that wait, or takes 5 s to connect and 5 s more to answer VALID
+/// (each wait under 6 s, both over it). On the frozen paused clock, the envelope has no answer
+/// 1 ms before 6 s, and at 6 s it is IGNORE and records nothing. The writer is free then: the
+/// item queued behind the envelope is served at 6 s too. A writer that waits longer (12 s) has
+/// no answer at 6 s and fails this test.
+#[tokio::test(start_paused = true)]
+async fn a_slow_new_payload_frees_the_writer_at_the_default_engine_wait() {
+    let f = fixture();
+    let (p, post) = payload_block(&f, 0x66, 1);
+    let Fixture { core, config, .. } = f;
+    let verify = FakeVerify::new(Answer::Valid);
+    // No `with_engine_timeout`: the core keeps its default wait.
+    let core = core.with_data_availability(Data(DataAvailability::Available));
+    let mut core = commit_all(core, &[&p], &verify).await;
+    let roots = [root(&p)];
+    let before = observe(&core, &roots);
+    let ms = Duration::from_millis;
+    let slow = [
+        Slow::Stall,
+        Slow::ValidAfter(DEFAULT_WAIT + ms(1)),
+        Slow::ConnectThenValid {
+            connect: ms(5000),
+            answer: ms(5000),
+        },
+    ];
+    for slow in slow {
+        let (started_tx, mut started) = mpsc::unbounded_channel();
+        let engine = SlowEngine {
+            slow,
+            started: started_tx,
+        };
+        let frozen = freeze();
+        let (sender, queue) = queue::<Minimal>(QUEUE);
+        let mut reply = sender.envelope(envelope_of(&p, &post, &config)).unwrap();
+        let mut next = sender.gossip().unwrap();
+        let writer = core
+            .with_engine(engine)
+            .spawn(queue, Arc::clone(&verify), Handle::current())
+            .unwrap();
+        let Some(Some(start)) = within_wall(started.recv(), WALL_LIMIT).await else {
+            panic!(
+                "{slow:?}: the envelope must reach the newPayload call: {:?}",
+                reply.try_recv()
+            );
+        };
+
+        tokio::time::advance(DEFAULT_WAIT - ms(1)).await;
+        assert!(
+            within_wall(&mut reply, ms(50)).await.is_none(),
+            "{slow:?}: an answer before the engine wait is over"
+        );
+        tokio::time::advance(ms(1)).await;
+        let served = within_wall(&mut reply, WALL_LIMIT)
+            .await
+            .unwrap_or_else(|| panic!("{slow:?}: no answer at 6 s: the writer waits longer"))
+            .expect("the core answers");
+        assert!(
+            matches!(served.outcome, Outcome::Ignored(_)),
+            "{slow:?}: {:?}",
+            served.outcome
+        );
+        assert_eq!(start.elapsed(), DEFAULT_WAIT, "{slow:?}");
+        let then = within_wall(&mut next, WALL_LIMIT)
+            .await
+            .unwrap_or_else(|| panic!("{slow:?}: the writer does not serve the next item"))
+            .expect("the core answers");
+        assert_eq!(then.turn, served.turn + 1, "{slow:?}");
+        assert_eq!(
+            start.elapsed(),
+            DEFAULT_WAIT,
+            "{slow:?}: the next item is served at the same time"
+        );
+
+        drop(sender);
+        core = tokio::task::spawn_blocking(move || writer.join().unwrap())
+            .await
+            .unwrap();
+        drop(frozen);
+        let statuses = core.execution_statuses();
+        assert_eq!(statuses.status(&hash(0x66)), None, "{slow:?}");
+        assert!(!statuses.el_contradiction(), "{slow:?}");
+        assert_eq!(observe(&core, &roots), before, "{slow:?}");
+    }
 }
 
 /// The checks before cl-verify and the EL: a core with no data availability check, data that
