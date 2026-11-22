@@ -142,8 +142,11 @@
 //! forkchoiceUpdated, a newPayload status: a protocol fault, which records nothing. So is a
 //! verdict that makes `Invalid` a payload that the justified block builds on, down to the
 //! finalized block (`is_justified_on_invalid_payload`): `get_head` starts at the justified
-//! block. The core sets the contradiction before such a payload leaves the store. An `Invalid`
-//! payload of the justified block itself is not one: the head can move to its EMPTY node.
+//! block. The core sets the contradiction before such a payload leaves the store. So is an
+//! `on_tick` or `on_block` of an import that moves the justified checkpoint onto a block that
+//! builds on such a payload, also one that left the store already: that import commits nothing,
+//! and after such an `on_tick`, `on_block` does not run. An `Invalid` payload of the justified
+//! block itself is not one: the head can move to its EMPTY node.
 //!
 //! # Seen roots
 //!
@@ -990,8 +993,8 @@ impl<E: Preset> ChainCore<E> {
         match imported {
             Ok(imported) => {
                 // Fork choice first: a block that the store refuses commits nothing.
-                if let Err(e) = self.store_block(block, &imported.post, &verdict) {
-                    return Outcome::Ignored(format!("fork choice: {e}"));
+                if let Err(why) = self.store_block(block, &imported.post, &verdict) {
+                    return Outcome::Ignored(why);
                 }
                 self.snapshots.promote(&parent);
                 self.snapshots.insert(imported.block_root, imported.post);
@@ -1083,24 +1086,32 @@ impl<E: Preset> ChainCore<E> {
     }
 
     /// Fork choice of `block`, which passed each check of the core, with its post-state `post`:
-    /// `on_tick` with the wall clock, then `on_block` (see [Fork choice](#fork-choice)).
+    /// `on_tick` with the wall clock, then `on_block` (see [Fork choice](#fork-choice)). `Err`
+    /// is why the import is IGNORE: a refusal of the store, or the EL contradiction if either
+    /// moved the justified checkpoint onto an invalid payload ([`check_justified`]).
     fn store_block(
         &mut self,
         block: &SignedBeaconBlock<E>,
         post: &BeaconState<E>,
         verdict: &dyn Fn(Vec<BlsSet>) -> BlsOutcome,
-    ) -> Result<(), fork_choice::Error> {
+    ) -> Result<(), String> {
         let provider = Provider {
             post,
             config: &self.config,
             verdict,
         };
+        let refused = |e: fork_choice::Error| format!("fork choice: {e}");
         // The time of the store never goes back.
         let now = u64::try_from((self.clock)()).unwrap_or(u64::MAX);
         let now = now.max(self.store.time_ms());
-        on_tick(&mut self.store, now)?;
+        let justified = self.store.justified_checkpoint().clone();
+        on_tick(&mut self.store, now).map_err(refused)?;
+        let sink = self.sink.as_deref();
+        check_justified(&self.store, &mut self.statuses, sink, &justified)?;
         keep_justified_state(&mut self.store, &provider);
-        on_block(&mut self.store, &provider, block)?;
+        let justified = self.store.justified_checkpoint().clone();
+        on_block(&mut self.store, &provider, block).map_err(refused)?;
+        check_justified(&self.store, &mut self.statuses, sink, &justified)?;
         keep_justified_state(&mut self.store, &provider);
         Ok(())
     }
@@ -1189,16 +1200,13 @@ impl<E: Preset> ChainCore<E> {
     /// contradiction too: the store and the head stay as they were (see
     /// [Fork choice](#fork-choice)).
     fn reconcile(&mut self) -> bool {
-        if !self.statuses.el_contradiction() && self.statuses.take_invalidated() {
+        if !self.statuses.el_contradiction()
+            && self.statuses.take_invalidated()
+            && !latch_justified(&self.store, &mut self.statuses)
+        {
             let statuses = &self.statuses;
             let invalid = |hash: &Hash32| statuses.status(hash) == Some(ExecutionStatus::Invalid);
-            if is_justified_on_invalid_payload(&self.store, invalid) {
-                tracing::error!(
-                    justified = %self.store.justified_checkpoint().root,
-                    "the justified checkpoint builds on a payload the EL found INVALID: halting"
-                );
-                self.statuses.set_contradiction();
-            } else if invalidate_payloads(&mut self.store, invalid) {
+            if invalidate_payloads(&mut self.store, invalid) {
                 self.refresh();
             }
         }
@@ -1278,6 +1286,41 @@ fn keep_justified_state<E: Preset>(store: &mut Store<E>, provider: &Provider<'_,
     if let Err(e) = store_target_checkpoint_state(store, provider, &justified) {
         tracing::warn!(error = %e, "no state of the justified checkpoint");
     }
+}
+
+/// Sets the EL contradiction if the justified block of `store` builds on a payload that left
+/// `store.payloads` or that `statuses` has `Invalid` (`is_justified_on_invalid_payload`), and
+/// returns whether it did (see [Fork choice](#fork-choice)).
+fn latch_justified<E: Preset>(store: &Store<E>, statuses: &mut ExecutionStatuses) -> bool {
+    let invalid = |hash: &Hash32| statuses.status(hash) == Some(ExecutionStatus::Invalid);
+    if !is_justified_on_invalid_payload(store, invalid) {
+        return false;
+    }
+    tracing::error!(
+        justified = %store.justified_checkpoint().root,
+        "the justified checkpoint builds on a payload the EL found INVALID: halting"
+    );
+    statuses.set_contradiction();
+    true
+}
+
+/// After `on_tick` or `on_block` of an import: if the justified checkpoint of `store` moved
+/// from `before` and [`latch_justified`] sets the EL contradiction, `sink` halts and the import
+/// is IGNORE. A justified checkpoint that did not move was checked when it moved or when a
+/// payload became `Invalid` (`reconcile`).
+fn check_justified<E: Preset>(
+    store: &Store<E>,
+    statuses: &mut ExecutionStatuses,
+    sink: Option<&dyn ForkchoiceSink>,
+    before: &Checkpoint,
+) -> Result<(), String> {
+    if store.justified_checkpoint() == before || !latch_justified(store, statuses) {
+        return Ok(());
+    }
+    if let Some(sink) = sink {
+        sink.halt();
+    }
+    Err(EL_CONTRADICTION.into())
 }
 
 /// The post-state of block `root` as a pre-state: the one of the LRU, else the one of the fork
