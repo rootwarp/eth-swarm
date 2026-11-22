@@ -1,12 +1,14 @@
 //! [`FcuSender`] against a mock `ethswarm.engine.v1` server on a Unix socket: latest wins after
 //! a stall, `seq` keeps increasing across a reconnect, the request carries the custody bits and
 //! no payload attributes, a halted sender sends nothing more, the caller takes each answer once,
-//! and a later answer does not replace an unread INVALID. Also the `[chain.engine]` config of its
-//! socket. These run on real time, except the test of a slow EL answer: it runs on paused time,
-//! held still ([`freeze`]), so only `tokio::time::advance` moves the clock.
+//! and a later answer does not replace an unread INVALID. Also the order of the waits on one call
+//! and the `[chain.engine]` config of its socket. These run on real time, except the test of a
+//! slow EL answer: it runs on paused time, held still ([`freeze`]), so only
+//! `tokio::time::advance` moves the clock.
 
 use cl_chain::engine::client::{
-    EngineSeq, FcuErrorKind, FcuMetrics, FcuSender, BACKOFF_MAX, BACKOFF_MIN,
+    EngineSeq, FcuErrorKind, FcuMetrics, FcuSender, BACKOFF_MAX, BACKOFF_MIN, FCU_CALL_TIMEOUT,
+    FORKCHOICE_UPDATED_TIMEOUT,
 };
 use cl_chain::engine::fcu::{custody_column_bits, ForkchoiceArgs, ForkchoiceSink};
 use cl_chain::probe::service::CHAIN_METHODS;
@@ -496,6 +498,37 @@ async fn a_slow_invalid_within_the_el_wait_is_kept() {
     assert_eq!(lost(), 0);
     drop(frozen);
     server.stop().await;
+}
+
+/// One forkchoiceUpdated call has three waits, and they end in this order. cl-engine's wait for
+/// the EL ends first (cl-chain's copy of it is cl-engine's own), so cl-engine answers, with the
+/// EL's status or its `TIMEOUT`, while the sender still waits. The sender's wait ends next, so a
+/// call held in cl-engine's queue, or by a stuck cl-engine, is given up by the sender (and sent
+/// again with the latest arguments) before cl-engine's request deadline for forkchoiceUpdated
+/// ends it: the two never end the call at the same moment.
+#[test]
+fn the_waits_on_a_forkchoice_call_end_in_order() {
+    assert_eq!(
+        FORKCHOICE_UPDATED_TIMEOUT,
+        cl_engine::client::FORKCHOICE_UPDATED_TIMEOUT,
+        "cl-chain's copy of cl-engine's wait for the EL"
+    );
+    // The request deadline cl-engine gives forkchoiceUpdated by default.
+    let request_deadline = cl_engine::server::Limits::default().forkchoice_updated_timeout;
+    assert_eq!(
+        request_deadline,
+        cl_engine::server::FORKCHOICE_UPDATED_REQUEST_TIMEOUT
+    );
+    assert!(
+        FORKCHOICE_UPDATED_TIMEOUT < FCU_CALL_TIMEOUT,
+        "the EL wait ({FORKCHOICE_UPDATED_TIMEOUT:?}) must end before the sender's \
+         ({FCU_CALL_TIMEOUT:?})"
+    );
+    assert!(
+        FCU_CALL_TIMEOUT < request_deadline,
+        "the sender's wait ({FCU_CALL_TIMEOUT:?}) must end before cl-engine's forkchoiceUpdated \
+         request deadline ({request_deadline:?})"
+    );
 }
 
 /// The request is the arguments as they are: three 32-byte hashes, the 16 custody bytes (never

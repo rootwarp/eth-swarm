@@ -91,15 +91,17 @@ bound by `ipc::uds::bind`. It is a trust boundary:
   unknown or unlisted method is `PERMISSION_DENIED` before the body is decoded.
 - `Limits`: a request message over 32 MiB + 64 KiB is refused from its gRPC length prefix
   (`OUT_OF_RANGE`) before a buffer is allocated; responses are capped at 48 MiB + 64 KiB. Each
-  request has a 10 s deadline (body read included), a connection silent for 30 s is closed,
-  one whose first request has not arrived 10 s after the accept is closed however steadily it
-  sends, at most 4 connections and 16 in-flight requests per connection.
+  request has a 10 s deadline (body read included), except forkchoiceUpdated, whose own is 12 s
+  (`FORKCHOICE_UPDATED_REQUEST_TIMEOUT`): above cl-chain's 10 s wait for its answer, so the two
+  never end a call at the same moment. A connection silent for 30 s is closed, one whose first
+  request has not arrived 10 s after the accept is closed however steadily it sends, at most 4
+  connections and 16 in-flight requests per connection.
 - Requests the EL could not take as specified are refused (`INVALID_ARGUMENT`) before the
   queue, and their `seq` is released: a `payload_id` that is not 8 bytes, a versioned hash that
   is not 32 bytes, more than 128 of them, an `indices_bitarray` that is not 16 bytes for
   getBlobsV4 (or set at all for V2/V3), a `custody_columns` that is not 16 bytes or empty for
   forkchoiceUpdatedV4 (or set at all for V3).
-- A caller's `timeout_ms` may raise the spec wait (up to the 10 s request deadline), never
+- A caller's `timeout_ms` may raise the spec wait (up to the method's request deadline), never
   shorten it (`common.md`: the CL MUST wait the method's timeout). An EL error, timeout, a
   `forkchoiceUpdated` result without `payloadStatus`, or a `latestValidHash`/`payloadId` that is
   not `null` or exactly 32/8 bytes is an `EngineError`, never `VALID`.
@@ -107,7 +109,8 @@ bound by `ipc::uds::bind`. It is a trust boundary:
 
 `tests/server.rs` serves the mock EL over a socket: a wrong-UID peer, unknown and near-miss
 methods, an oversize frame, an oversize length prefix alone, a body that never finishes,
-stalled and trickling writers, malformed getBlobs/getPayload requests and the connection cap.
+stalled and trickling writers, malformed getBlobs/getPayload requests, the connection cap, and
+forkchoiceUpdated's own request deadline next to the shared one.
 
 Tests use the hyper mock in `tests/common`, bound to `127.0.0.1:0`. Nothing is dialed that the
 test did not start.

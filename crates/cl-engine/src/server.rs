@@ -9,14 +9,15 @@
 //! - The method ACL ([`ipc::acl::AclLayer`]) runs ahead of the service: exact paths, deny by
 //!   default, before the request body is decoded. Each handler checks the UID again.
 //! - A gRPC message longer than [`Limits::max_request_bytes`] is refused from its length prefix,
-//!   before the buffer is allocated. Each request (body read included) has a deadline, a
-//!   connection that sends nothing for [`Limits::idle_timeout`] is closed, one whose first
-//!   request has not arrived [`Limits::first_request_timeout`] after the accept is closed
-//!   however steadily it sends, and connections and in-flight requests per connection are
-//!   capped.
+//!   before the buffer is allocated. Each request (body read included) has its method's
+//!   deadline ([`Limits::request_timeout`], and a longer one of its own for forkchoiceUpdated,
+//!   [`Limits::forkchoice_updated_timeout`]), a connection that sends nothing for
+//!   [`Limits::idle_timeout`] is closed, one whose first request has not arrived
+//!   [`Limits::first_request_timeout`] after the accept is closed however steadily it sends, and
+//!   connections and in-flight requests per connection are capped.
 //! - Requests the EL could not take as specified are refused before the queue (and their `seq`
 //!   released): lengths of `DATA` fields, at most 128 versioned hashes per getBlobs, and a
-//!   caller's `timeout_ms` only ever raises the spec wait (up to the request deadline).
+//!   caller's `timeout_ms` only ever raises the spec wait (up to the method's request deadline).
 //! - Errors and logs carry codes, UIDs and fixed text: never the secret or a payload.
 //!
 //! The socket itself comes from [`ipc::uds::bind`] (owned directory, stale socket removed only
@@ -59,6 +60,9 @@ pub struct EngineServer {
     queue: Queue,
     /// Ceiling of a caller's raised wait: the gRPC request deadline ([`Limits::request_timeout`]).
     max_wait: Duration,
+    /// [`EngineServer::max_wait`] for forkchoiceUpdated: its own request deadline
+    /// ([`Limits::forkchoice_updated_timeout`]).
+    forkchoice_max_wait: Duration,
 }
 
 impl EngineServer {
@@ -72,6 +76,7 @@ impl EngineServer {
             acl,
             queue,
             max_wait: Limits::default().request_timeout,
+            forkchoice_max_wait: Limits::default().forkchoice_updated_timeout,
         }
     }
 
@@ -81,10 +86,12 @@ impl EngineServer {
         &self.queue
     }
 
-    /// Every `ethswarm.engine.v1` service, with the message size caps of `limits`.
+    /// Every `ethswarm.engine.v1` service, with the message size caps of `limits`, and its
+    /// request deadlines as the ceilings of a caller's raised wait.
     #[must_use]
     pub fn routes(mut self, limits: &Limits) -> tonic::service::Routes {
         self.max_wait = limits.request_timeout;
+        self.forkchoice_max_wait = limits.forkchoice_updated_timeout;
         tonic::service::Routes::new(
             EngineServiceServer::new(self)
                 .max_decoding_message_size(limits.max_request_bytes)
@@ -174,7 +181,11 @@ impl EngineService for EngineServer {
             Ok(prepared) => prepared,
             Err(status) => return Err(self.refuse(req.seq, status).await),
         };
-        let timeout = timeout_of(req.timeout_ms, spec_timeout(method), self.max_wait);
+        let timeout = timeout_of(
+            req.timeout_ms,
+            spec_timeout(method),
+            self.forkchoice_max_wait,
+        );
         match self.queue.call(req.seq, method, params, timeout).await {
             Ok(result) => {
                 // `payloadId` is `DATA|null`, 8 bytes (paris.md): anything else is malformed.
@@ -320,6 +331,17 @@ impl EngineService for EngineServer {
     }
 }
 
+/// The path of `ForkchoiceUpdated`, the one method with a request deadline of its own
+/// ([`Limits::forkchoice_updated_timeout`]).
+const FORKCHOICE_UPDATED_PATH: &str = "/ethswarm.engine.v1.EngineService/ForkchoiceUpdated";
+
+/// forkchoiceUpdated's request deadline by default ([`Limits::forkchoice_updated_timeout`]):
+/// 12 s. The EL is given 8 s ([`FORKCHOICE_UPDATED_TIMEOUT`]) and cl-chain waits 10 s for the
+/// answer (its `FCU_CALL_TIMEOUT`), so cl-engine answers a call it sends at once within the
+/// caller's wait. A call held longer (first in the queue, or by a stuck server) is given up by
+/// the caller at 10 s and only ended here after that: never by both at the same moment.
+pub const FORKCHOICE_UPDATED_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// Caps on the engine socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -331,19 +353,36 @@ pub struct Limits {
     pub max_connections: usize,
     /// Requests in flight on one connection (HTTP/2 streams).
     pub max_requests_per_connection: u32,
-    /// One request, from its headers through reading its body to the response. A queued engine
-    /// call can take up to twice its own timeout (queue wait, then the EL's response; see
+    /// One request, from its headers through reading its body to the response, of every method
+    /// but forkchoiceUpdated ([`Limits::forkchoice_updated_timeout`]). A queued engine call can
+    /// take up to twice its own timeout (queue wait, then the EL's response; see
     /// [`crate::queue`]), so a request cut off here may still reach the EL: the caller must treat
     /// it as possibly applied.
     pub request_timeout: Duration,
+    /// [`Limits::request_timeout`] for forkchoiceUpdated alone, longer than the caller's own wait
+    /// for the answer ([`FORKCHOICE_UPDATED_REQUEST_TIMEOUT`]). The other methods keep the shared
+    /// deadline, so a request of theirs is not held longer.
+    pub forkchoice_updated_timeout: Duration,
     /// A connection that sends nothing for this long is closed.
     pub idle_timeout: Duration,
     /// A connection whose first request (the HTTP/2 preface through the end of a request's
     /// header block) has not arrived this long after the accept is closed, however steadily
     /// it sends bytes. Not from any spec: it bounds how long a peer can hold a slot without
-    /// asking for anything; once a request has arrived, [`Limits::request_timeout`] and
+    /// asking for anything; once a request has arrived, its method's request deadline and
     /// [`Limits::idle_timeout`] apply.
     pub first_request_timeout: Duration,
+}
+
+impl Limits {
+    /// The request deadline of the method at `path`: [`Limits::forkchoice_updated_timeout`] for
+    /// forkchoiceUpdated, [`Limits::request_timeout`] for every other path.
+    fn request_deadline(&self, path: &str) -> Duration {
+        if path == FORKCHOICE_UPDATED_PATH {
+            self.forkchoice_updated_timeout
+        } else {
+            self.request_timeout
+        }
+    }
 }
 
 impl Default for Limits {
@@ -353,8 +392,9 @@ impl Default for Limits {
             max_response_bytes: 48 * 1024 * 1024 + 64 * 1024,
             max_connections: 4,
             max_requests_per_connection: 16,
-            // Above the 8 s newPayload / forkchoiceUpdated wait.
+            // Above the longest spec wait of the other methods (newPayloadV4, 8 s).
             request_timeout: Duration::from_secs(10),
+            forkchoice_updated_timeout: FORKCHOICE_UPDATED_REQUEST_TIMEOUT,
             idle_timeout: Duration::from_secs(30),
             first_request_timeout: Duration::from_secs(10),
         }
@@ -371,16 +411,71 @@ pub async fn serve(
     let (tx, rx) = mpsc::channel(1);
     let accept = tokio::spawn(accept(listener, Arc::clone(&server.callers), limits, tx));
     let acl = Arc::clone(&server.acl);
+    // No `Server::timeout`: it is one deadline for every method. `DeadlineLayer` gives each
+    // method its own.
     let result = tonic::transport::Server::builder()
-        .timeout(limits.request_timeout)
         .max_concurrent_streams(limits.max_requests_per_connection)
         .concurrency_limit_per_connection(limits.max_requests_per_connection as usize)
+        .layer(DeadlineLayer(limits))
         .layer(AclLayer::new(acl))
         .add_routes(server.routes(&limits))
         .serve_with_incoming_shutdown(ReceiverStream::new(rx), shutdown)
         .await;
     accept.abort();
     result
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Ends each request at its method's deadline ([`Limits::request_deadline`]), from its headers
+/// through reading its body to the response, with the answer tonic's own server timeout gives:
+/// the error [`tonic::TimeoutExpired`], which tonic sends as `CANCELLED`. A `grpc-timeout` the
+/// caller sends still applies too (tonic's, outside this layer).
+#[derive(Clone, Copy, Debug)]
+struct DeadlineLayer(Limits);
+
+impl<S> tower::Layer<S> for DeadlineLayer {
+    type Service = Deadline<S>;
+
+    fn layer(&self, inner: S) -> Deadline<S> {
+        Deadline {
+            inner,
+            limits: self.0,
+        }
+    }
+}
+
+/// The service [`DeadlineLayer`] wraps around `S`.
+#[derive(Clone, Debug)]
+struct Deadline<S> {
+    inner: S,
+    limits: Limits,
+}
+
+impl<S, B, R> tower::Service<http::Request<B>> for Deadline<S>
+where
+    S: tower::Service<http::Request<B>, Response = http::Response<R>>,
+    S::Future: Send + 'static,
+    S::Error: Into<BoxError>,
+{
+    type Response = http::Response<R>;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, BoxError>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        let deadline = Instant::now() + self.limits.request_deadline(request.uri().path());
+        let call = self.inner.call(request);
+        Box::pin(async move {
+            match tokio::time::timeout_at(deadline, call).await {
+                Ok(answer) => answer.map_err(Into::into),
+                Err(_) => Err(tonic::TimeoutExpired(()).into()),
+            }
+        })
+    }
 }
 
 /// Accepts connections; only a peer whose `SO_PEERCRED` UID is a caller, while a connection
