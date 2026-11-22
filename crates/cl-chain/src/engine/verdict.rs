@@ -290,7 +290,8 @@ enum Walk {
 ///   a walk that reaches it before the boundary: a `latestValidHash` strictly below it, or the
 ///   zero hash. The zero hash finalizes no payload. An `INVALID` that answers a forkchoiceUpdated
 ///   for a payload that a prune at finality dropped, at or below the finalized payload, is one
-///   too ([`ExecutionStatuses::record_head`]).
+///   too, also if that payload was recorded again, and records nothing
+///   ([`ExecutionStatuses::record_head`]).
 /// - `NotVerified` records nothing: a payload without a status stays without one, and an
 ///   earlier status stays as it is.
 ///
@@ -386,10 +387,11 @@ impl ExecutionStatuses {
     }
 
     /// [`Self::record`] for `verdict`, the answer to a forkchoiceUpdated with the head `head`,
-    /// with the parent hash the table has for it. A head without one records nothing, but an
-    /// `INVALID` with a `latestValidHash` for a payload at or below finality is an EL
-    /// contradiction: the finalized payload, or one that a prune dropped or reached before the
-    /// answer came (see [`Self::prune_finalized`]).
+    /// with the parent hash the table has for it. A head without one records nothing. An
+    /// `INVALID` with a `latestValidHash` for a payload at or below finality records nothing
+    /// either and is an EL contradiction, also if the table has that payload again: the
+    /// finalized payload, or one that a prune dropped or reached before the answer came (see
+    /// [`Self::prune_finalized`]).
     /// [`Reason::InvalidBlockHash`] is a newPayload status that a forkchoiceUpdated must not
     /// answer: a protocol fault, so an EL contradiction, and it records nothing for `head`.
     pub fn record_head(&mut self, head: Hash32, verdict: &ElVerdict) -> Option<ExecutionStatus> {
@@ -397,16 +399,19 @@ impl ExecutionStatuses {
             self.contradiction = true;
             return self.status(&head);
         }
-        if let Some((_, parent)) = self.get(&head) {
-            return self.record(head, parent, verdict);
-        }
-        if let ElVerdict::Invalid {
-            latest_valid_hash: Some(_),
-        } = verdict
+        // Finality before the table: a payload at or below it can be recorded again.
+        if matches!(
+            verdict,
+            ElVerdict::Invalid {
+                latest_valid_hash: Some(_)
+            }
+        ) && (self.finalized == Some(head) || self.finality.contains(&head))
         {
-            self.contradiction |= self.finalized == Some(head) || self.finality.contains(&head);
+            self.contradiction = true;
+            return self.status(&head);
         }
-        None
+        self.get(&head)
+            .and_then(|(_, parent)| self.record(head, parent, verdict))
     }
 
     /// The status of the payload `block_hash`, `None` if it has none.
