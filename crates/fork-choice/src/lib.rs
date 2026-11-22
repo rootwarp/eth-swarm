@@ -52,7 +52,10 @@ pub use envelope::{
     verify_execution_payload_envelope, DataAvailability, DataAvailabilityCheck, ExecutionEngine,
     NewPayloadRequestRef, PayloadImport,
 };
-pub use handlers::{on_block, on_tick, store_target_checkpoint_state, StateProvider};
+pub use handlers::{
+    on_block, on_tick, on_tick_unpruned, prune_after_tick, store_target_checkpoint_state,
+    StateProvider,
+};
 pub use payload_attestation::on_payload_attestation_message;
 pub use store::{
     compute_slots_since_epoch_start, get_ancestor, get_checkpoint_block, get_current_slot,

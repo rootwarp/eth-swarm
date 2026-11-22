@@ -145,7 +145,10 @@
 //! block. The core sets the contradiction before such a payload leaves the store. So is an
 //! `on_tick` or `on_block` of an import that moves the justified checkpoint onto a block that
 //! builds on such a payload, also one that left the store already: that import commits nothing,
-//! and after such an `on_tick`, `on_block` does not run. An `Invalid` payload of the justified
+//! and after such an `on_tick`, `on_block` does not run. Such a walk goes down to the finalized
+//! block before that step, as the step can move the finalized checkpoint too, and after
+//! `on_tick` it runs before the prune of the tick (`on_tick_unpruned`, then `prune_after_tick`),
+//! which can drop a block below the new finalized block. An `Invalid` payload of the justified
 //! block itself is not one: the head can move to its EMPTY node.
 //!
 //! # Seen roots
@@ -234,8 +237,8 @@ use ethswarm_proto::verify::BlsSet;
 use fork_choice::{
     get_current_slot, get_forkchoice_store, get_head, invalidate_payloads,
     is_justified_on_invalid_payload, is_payload_verified, on_block, on_execution_payload_envelope,
-    on_tick, store_target_checkpoint_state, DataAvailabilityCheck, EnvelopeError, StateProvider,
-    Store,
+    on_tick_unpruned, prune_after_tick, store_target_checkpoint_state, DataAvailabilityCheck,
+    EnvelopeError, StateProvider, Store,
 };
 use network_config::ChainConfig;
 use state_transition::accessors::get_domain;
@@ -1105,13 +1108,17 @@ impl<E: Preset> ChainCore<E> {
         let now = u64::try_from((self.clock)()).unwrap_or(u64::MAX);
         let now = now.max(self.store.time_ms());
         let justified = self.store.justified_checkpoint().clone();
-        on_tick(&mut self.store, now).map_err(refused)?;
+        let finalized = self.store.finalized_checkpoint().root;
+        on_tick_unpruned(&mut self.store, now).map_err(refused)?;
         let sink = self.sink.as_deref();
-        check_justified(&self.store, &mut self.statuses, sink, &justified)?;
+        // Before the prune of the tick, which can drop a block below the new finalized block.
+        check_justified(&self.store, &mut self.statuses, sink, &justified, finalized)?;
+        prune_after_tick(&mut self.store);
         keep_justified_state(&mut self.store, &provider);
         let justified = self.store.justified_checkpoint().clone();
+        let finalized = self.store.finalized_checkpoint().root;
         on_block(&mut self.store, &provider, block).map_err(refused)?;
-        check_justified(&self.store, &mut self.statuses, sink, &justified)?;
+        check_justified(&self.store, &mut self.statuses, sink, &justified, finalized)?;
         keep_justified_state(&mut self.store, &provider);
         Ok(())
     }
@@ -1200,9 +1207,10 @@ impl<E: Preset> ChainCore<E> {
     /// contradiction too: the store and the head stay as they were (see
     /// [Fork choice](#fork-choice)).
     fn reconcile(&mut self) -> bool {
+        let finalized = self.store.finalized_checkpoint().root;
         if !self.statuses.el_contradiction()
             && self.statuses.take_invalidated()
-            && !latch_justified(&self.store, &mut self.statuses)
+            && !latch_justified(&self.store, finalized, &mut self.statuses)
         {
             let statuses = &self.statuses;
             let invalid = |hash: &Hash32| statuses.status(hash) == Some(ExecutionStatus::Invalid);
@@ -1289,11 +1297,16 @@ fn keep_justified_state<E: Preset>(store: &mut Store<E>, provider: &Provider<'_,
 }
 
 /// Sets the EL contradiction if the justified block of `store` builds on a payload that left
-/// `store.payloads` or that `statuses` has `Invalid` (`is_justified_on_invalid_payload`), and
-/// returns whether it did (see [Fork choice](#fork-choice)).
-fn latch_justified<E: Preset>(store: &Store<E>, statuses: &mut ExecutionStatuses) -> bool {
+/// `store.payloads` or that `statuses` has `Invalid`, down to the block `finalized`
+/// (`is_justified_on_invalid_payload`), and returns whether it did (see
+/// [Fork choice](#fork-choice)).
+fn latch_justified<E: Preset>(
+    store: &Store<E>,
+    finalized: Root,
+    statuses: &mut ExecutionStatuses,
+) -> bool {
     let invalid = |hash: &Hash32| statuses.status(hash) == Some(ExecutionStatus::Invalid);
-    if !is_justified_on_invalid_payload(store, invalid) {
+    if !is_justified_on_invalid_payload(store, finalized, invalid) {
         return false;
     }
     tracing::error!(
@@ -1304,17 +1317,19 @@ fn latch_justified<E: Preset>(store: &Store<E>, statuses: &mut ExecutionStatuses
     true
 }
 
-/// After `on_tick` or `on_block` of an import: if the justified checkpoint of `store` moved
-/// from `before` and [`latch_justified`] sets the EL contradiction, `sink` halts and the import
-/// is IGNORE. A justified checkpoint that did not move was checked when it moved or when a
-/// payload became `Invalid` (`reconcile`).
+/// After `on_tick` (before its prune) or `on_block` of an import: if the justified checkpoint of
+/// `store` moved from `justified` and [`latch_justified`] sets the EL contradiction down to
+/// `finalized`, the finalized root before that step, `sink` halts and the import is IGNORE. The
+/// step can move the finalized checkpoint too. A justified checkpoint that did not move was
+/// checked when it moved or when a payload became `Invalid` (`reconcile`).
 fn check_justified<E: Preset>(
     store: &Store<E>,
     statuses: &mut ExecutionStatuses,
     sink: Option<&dyn ForkchoiceSink>,
-    before: &Checkpoint,
+    justified: &Checkpoint,
+    finalized: Root,
 ) -> Result<(), String> {
-    if store.justified_checkpoint() == before || !latch_justified(store, statuses) {
+    if store.justified_checkpoint() == justified || !latch_justified(store, finalized, statuses) {
         return Ok(());
     }
     if let Some(sink) = sink {

@@ -481,10 +481,16 @@ pub fn invalidate_payloads<E: Preset>(
 
 /// Not a spec function: whether the justified checkpoint block builds on a payload that left
 /// `store.payloads`, or that [`invalidate_payloads`] with `invalid` takes out. From the justified
-/// block down to the finalized checkpoint block (or the anchor), it looks for a block on the
-/// FULL node of a block whose payload is not in `store.payloads`, or whose bid `block_hash`
-/// `invalid` names. The justified block's own payload does not count: [`get_head`] can still
-/// stay on its EMPTY node.
+/// block down to the block `finalized` (or the anchor), it looks for a block on the FULL node of
+/// a block whose payload is not in `store.payloads`, or whose bid `block_hash` `invalid` names.
+/// The justified block's own payload does not count: [`get_head`] can still stay on its EMPTY
+/// node.
+///
+/// `finalized` is the root of the finalized checkpoint before the step (`on_tick` or `on_block`)
+/// that moved the justified checkpoint, or `store.finalized_checkpoint.root` if there was none.
+/// A step can move the finalized checkpoint too, and a walk that stopped at the new finalized
+/// block would miss such a payload below it. The walk reads `store.blocks` alone, so after
+/// `on_tick` it must run before the prune ([`crate::on_tick_unpruned`]).
 ///
 /// [`get_head`] starts at the justified block, so on such a chain it gives a head on a payload
 /// that the EL found invalid. `bellatrix/optimistic-sync.md` (Re-Orgs): if the justified
@@ -494,10 +500,11 @@ pub fn invalidate_payloads<E: Preset>(
 /// [`get_head`]: crate::get_head
 pub fn is_justified_on_invalid_payload<E: Preset>(
     store: &Store<E>,
+    finalized: Root,
     invalid: impl Fn(&Hash32) -> bool,
 ) -> bool {
     let mut root = store.justified_checkpoint.root;
-    while root != store.finalized_checkpoint.root && root != store.anchor_root {
+    while root != finalized && root != store.anchor_root {
         let Some(block) = store.blocks.get(&root) else {
             return false;
         };
