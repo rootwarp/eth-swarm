@@ -12,9 +12,10 @@
 //!
 //! No export block has an envelope that verifies: their bids commit to a zero execution requests
 //! root. So the tests use the slot 1 block with a bid that commits to the empty requests and has
-//! a payload hash of its own (`payload_block`), and the slot 2 block on its FULL payload
-//! (`full_child`). A local transition gives their state roots and post-states, and each envelope
-//! is built from the post-state of its block (`support::envelope_of`).
+//! a payload hash of its own (`payload_block`), the slot 2 block on its FULL payload
+//! (`full_child`), and that block moved to any later slot on the EMPTY node of a block
+//! (`empty_child`). A local transition gives their state roots and post-states, and each
+//! envelope is built from the post-state of its block (`support::envelope_of`).
 
 use crate::support::{envelope_of, export_block, FakeVerify, Fixture, QUEUE};
 use cl_chain::core::{queue, ChainCore, Outcome};
@@ -27,10 +28,13 @@ use cl_engine::queue::Queue;
 use cl_engine::server::{serve, EngineServer, Limits};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock, SignedExecutionPayloadEnvelope};
 use consensus_types::primitives::{BLSPubkey, Bytes32, Epoch, Hash32, Root};
-use consensus_types::Minimal;
+use consensus_types::{EthSpec, Minimal};
 use fork_choice::{DataAvailability, DataAvailabilityCheck};
 use ipc::acl::{AclTables, MethodAcl};
 use network_config::ChainConfig;
+use state_transition::accessors::get_randao_mix;
+use state_transition::caches::proposer::get_beacon_proposer_index;
+use state_transition::per_slot::process_slots;
 use state_transition::{
     state_root, state_transition, AggregationError, BackendError, BlsContext, PubkeyAggregator,
     SignatureBackend, SignatureSet,
@@ -297,8 +301,8 @@ impl PubkeyAggregator for NoAggregate {
     }
 }
 
-/// `block` with the state root of its post-state on `parent`, and that post-state.
-pub fn sealed(parent: &State, mut block: Block, config: &ChainConfig) -> (Block, State) {
+/// Runs `f` with the BLS context of a local transition on the network of `config`.
+fn local<R>(config: &ChainConfig, f: impl FnOnce(&BlsContext) -> R) -> R {
     let schedule = |epoch: Epoch| config.get_blob_parameters(epoch).max_blobs_per_block;
     let bls = BlsContext {
         backend: &AllValid,
@@ -307,10 +311,25 @@ pub fn sealed(parent: &State, mut block: Block, config: &ChainConfig) -> (Block,
         capella_fork_version: config.capella_fork_version().unwrap(),
         blob_schedule: &schedule,
     };
+    f(&bls)
+}
+
+/// `block` with the state root of its post-state on `parent`, and that post-state.
+pub fn sealed(parent: &State, mut block: Block, config: &ChainConfig) -> (Block, State) {
     let mut post = parent.clone();
-    state_transition(&mut post, &block, false, &bls).expect("the test block must apply");
+    local(config, |bls| {
+        state_transition(&mut post, &block, false, bls)
+    })
+    .expect("the test block must apply");
     block.message.state_root = state_root(&mut post).unwrap();
     (block, post)
+}
+
+/// `state` after `process_slots` to `slot`: the empty slots up to it.
+pub fn advanced(state: &State, slot: u64, config: &ChainConfig) -> State {
+    let mut state = state.clone();
+    local(config, |bls| process_slots(&mut state, slot, bls)).expect("the empty slots must apply");
+    state
 }
 
 /// The slot 1 block on the anchor with the graffiti `graffiti` and a bid for the payload
@@ -352,6 +371,41 @@ pub fn full_child(f: &Fixture, parent: &Block, post: &State, n: u8) -> (Block, S
     bid.block_hash = hash(n);
     bid.execution_requests_root = requests_root;
     sealed(post, block, &f.config)
+}
+
+/// The block at `slot` on the EMPTY node of `parent`, with a bid for the payload `hash(n)` that
+/// commits to the empty execution requests: the slot 2 block of the export moved to `slot`, with
+/// the proposer of `slot`. `pre` is the post-state of `parent`, or that state after empty slots.
+/// Sealed on `pre`, with its post-state.
+pub fn empty_child(
+    config: &ChainConfig,
+    parent: &Block,
+    pre: &State,
+    slot: u64,
+    n: u8,
+) -> (Block, State) {
+    let parent_root = root(parent);
+    let at = advanced(pre, slot, config);
+    let mut block = export_block(2);
+    let requests_root = block
+        .message
+        .body
+        .parent_execution_requests
+        .tree_hash_root();
+    block.message.slot = slot;
+    block.message.proposer_index = get_beacon_proposer_index(&at).unwrap();
+    block.message.parent_root = parent_root;
+    block.message.body.attestations = vec![].try_into().unwrap();
+    block.message.body.payload_attestations = vec![].try_into().unwrap();
+    let bid = &mut block.message.body.signed_execution_payload_bid.message;
+    bid.slot = slot;
+    bid.parent_block_root = parent_root;
+    // The payload that `parent` builds on, not its own.
+    bid.parent_block_hash = pre.latest_block_hash;
+    bid.block_hash = hash(n);
+    bid.prev_randao = get_randao_mix(&at, Minimal::epoch_at_slot(slot));
+    bid.execution_requests_root = requests_root;
+    sealed(pre, block, config)
 }
 
 /// The envelope of `block`, whose post-state is `post`, on the network of `config`.

@@ -32,15 +32,15 @@ use consensus_types::gloas::{BeaconState, Checkpoint};
 use consensus_types::primitives::{Bytes32, Hash32};
 use consensus_types::{EthSpec, Minimal};
 use el::{
-    block_item, commit_all, envelope, full_child, hash, invalid_on, payload_block, ready, root,
-    sealed, step, Block, El, Item,
+    advanced, block_item, commit_all, empty_child, envelope, full_child, hash, invalid_on,
+    payload_block, ready, root, sealed, step, Block, El, Item,
 };
 use ethswarm_proto::engine as pb;
 use fork_choice::testing::{
     remove_checkpoint_state, set_finalized_checkpoint, set_justified_checkpoint,
-    set_unrealized_justified_checkpoint,
+    set_unrealized_finalized_checkpoint, set_unrealized_justified_checkpoint,
 };
-use fork_choice::{get_head, is_payload_verified};
+use fork_choice::{get_head, invalidate_payloads, is_payload_verified};
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1283,6 +1283,25 @@ fn slot_time(core: &ChainCore<Minimal>, slot: u64) -> u128 {
     u128::from(store.genesis_time_ms() + slot * store.slot_duration_ms().get())
 }
 
+/// A sibling of `p` on the anchor of `core` with another graffiti and another payload, `0x33`:
+/// a block that the core still admits once the payload of `p` is Invalid. Sealed.
+fn other_payload(
+    core: &ChainCore<Minimal>,
+    p: &Block,
+    config: &network_config::ChainConfig,
+) -> Block {
+    let mut other = p.clone();
+    other.message.body.graffiti = Bytes32::repeat_byte(0x5d);
+    other
+        .message
+        .body
+        .signed_execution_payload_bid
+        .message
+        .block_hash = hash(0x33);
+    let anchor = p.message.parent_root;
+    sealed(core.state(&anchor).unwrap(), other, config).0
+}
+
 /// The `later` core on a test clock in the last slot of epoch 0, where the EL took the payload of
 /// `p` optimistically, with `c` on that FULL payload committed. The anchor is the justified and
 /// the finalized block. The newPayload of the envelope of `c` is INVALID with the execution
@@ -1331,15 +1350,7 @@ async fn a_justified_checkpoint_promoted_onto_a_removed_payload_halts_and_commit
     el_sees(&t.el, sent.last().unwrap()).await;
     let updates = t.el.forkchoice_updates().len();
 
-    let mut other = p.clone();
-    other.message.body.graffiti = Bytes32::repeat_byte(0x5d);
-    other
-        .message
-        .body
-        .signed_execution_payload_bid
-        .message
-        .block_hash = hash(0x33);
-    let (other, _) = sealed(core.state(&anchor).unwrap(), other, &t.config);
+    let other = other_payload(&core, p, &t.config);
     let justified = Checkpoint {
         epoch: 1,
         root: root(c),
@@ -1370,6 +1381,207 @@ async fn a_justified_checkpoint_promoted_onto_a_removed_payload_halts_and_commit
     );
     assert_eq!(core.head(), head, "the head stays");
     assert_eq!(verified(&core), [true, false, false]);
+    assert_eq!(t.sink.sent(), sent, "no forkchoiceUpdated");
+    assert_eq!(core.forkchoice_sent(), forkchoice_sent);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(t.el.forkchoice_updates().len(), updates);
+}
+
+/// The justified checkpoint `(2, d)` and the finalized checkpoint `(1, c)` that a test seam gives
+/// a store, with `d` the block of slot 9 on the EMPTY node of `c`: `c` is the last block of the
+/// chain of `d` at the first slot of epoch 1, and `d` at the first slot of epoch 2.
+fn justified_on_d_finalized_on_c(c: &Block, d: &Block) -> (Checkpoint, Checkpoint) {
+    let justified = Checkpoint {
+        epoch: 2,
+        root: root(d),
+    };
+    let finalized = Checkpoint {
+        epoch: 1,
+        root: root(c),
+    };
+    (justified, finalized)
+}
+
+/// The `later` core on a test clock in the last slot of epoch 1, where the EL took the payload of
+/// `p` optimistically, with `c` on that FULL payload and `d` on the EMPTY node of `c` committed.
+/// The anchor is the justified and the finalized block. The newPayload of the envelope of `c` is
+/// INVALID with the execution parent of the payload of `p` as `latestValidHash`: the justified
+/// block builds on neither payload, so the payload of `p` leaves the store. Then blocks pull the
+/// unrealized justified checkpoint up to `d` and the unrealized finalized checkpoint up to `c`
+/// (test seams stand for a justifying and finalizing chain), and the clock reaches the first slot
+/// of epoch 2. The next import, a sibling of `p` with another payload, ticks the store there: one
+/// `on_tick` makes `d` the justified and `c` the finalized block, and its prune drops `p`, the
+/// parent of `c`. Below `d` the walk must not stop at the new finalized block: `c` builds on the
+/// payload that left the store, so the walk goes down to the finalized block before the tick, and
+/// before the prune. The core fails closed: it sets the EL contradiction, halts the sender and
+/// commits nothing, and the head, the verified payloads and the forkchoiceUpdated calls stay as
+/// they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tick_that_moves_justified_and_finalized_past_a_removed_payload_halts_and_commits_nothing(
+) {
+    let epoch = Minimal::slots_per_epoch();
+    let end_of_epoch_1 = |core: ChainCore<Minimal>| {
+        let at = slot_time(&core, 2 * epoch - 1);
+        core.with_clock(clock_at(at))
+    };
+    let t = later_with(Reply::Syncing, |_| Reply::Syncing, end_of_epoch_1).await;
+    let (p, p_post) = &t.p;
+    let (c, c_post) = &t.c;
+    let (d, _) = empty_child(&t.config, c, c_post, epoch + 1, 0x34);
+    let anchor = p.message.parent_root;
+    let core = commit_all(t.core, &[c, &d], &t.verify).await;
+    t.el.answer(hash(0x32), invalid_on(p_post));
+    let (outcome, core) = step(core, envelope(&t.config, c, c_post), &t.verify).await;
+    assert!(
+        matches!(outcome, Outcome::InvalidEnvelope(_)),
+        "{outcome:?}"
+    );
+    assert!(!core.execution_statuses().el_contradiction());
+    assert!(!t.sink.halted());
+    let store = core.fork_choice();
+    assert_eq!(
+        [store.justified_checkpoint(), store.finalized_checkpoint()]
+            .map(|checkpoint| checkpoint.root),
+        [anchor, anchor]
+    );
+    let verified = |core: &ChainCore<Minimal>| {
+        [anchor, root(p), root(c), root(&d)]
+            .map(|block| is_payload_verified(core.fork_choice(), block))
+    };
+    assert_eq!(
+        verified(&core),
+        [true, false, false, false],
+        "the payload of p left the store"
+    );
+    let head = core.head();
+    assert_eq!(head, head_of(p, PayloadStatus::Empty));
+    let sent = t.sink.sent();
+    let forkchoice_sent = core.forkchoice_sent();
+    assert_eq!(forkchoice_sent.as_ref(), sent.last());
+    el_sees(&t.el, sent.last().unwrap()).await;
+    let updates = t.el.forkchoice_updates().len();
+
+    let other = other_payload(&core, p, &t.config);
+    let (justified, finalized) = justified_on_d_finalized_on_c(c, &d);
+    let start_of_epoch_2 = clock_at(slot_time(&core, 2 * epoch));
+    let core = core
+        .with_fork_choice(|store| {
+            set_unrealized_justified_checkpoint(store, justified.clone());
+            set_unrealized_finalized_checkpoint(store, finalized.clone());
+        })
+        .with_clock(start_of_epoch_2);
+    let (outcome, core) = step(core, block_item(&other), &t.verify).await;
+    let store = core.fork_choice();
+    assert_eq!(
+        (store.justified_checkpoint(), store.finalized_checkpoint()),
+        (&justified, &finalized),
+        "one on_tick of the import makes d the justified and c the finalized block"
+    );
+    assert!(
+        core.execution_statuses().el_contradiction(),
+        "c, below the justified block, builds on a payload that left the store"
+    );
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    assert!(t.sink.halted(), "the core halts the sender");
+    assert!(
+        !core.is_committed(&root(&other)),
+        "the import commits nothing"
+    );
+    assert!(
+        core.fork_choice().block(root(&other)).is_none(),
+        "on_block does not run"
+    );
+    assert_eq!(core.head(), head, "the head stays");
+    assert_eq!(verified(&core), [true, false, false, false]);
+    assert_eq!(t.sink.sent(), sent, "no forkchoiceUpdated");
+    assert_eq!(core.forkchoice_sent(), forkchoice_sent);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(t.el.forkchoice_updates().len(), updates);
+}
+
+/// `on_block` itself moves the checkpoints. The `later` core on a test clock in slot 27, with `c`
+/// on the FULL payload of `p` and `d` on the EMPTY node of `c` committed. The anchor is the
+/// justified and the finalized block, and the unrealized ones too, so the tick of the next import
+/// promotes nothing. The payload of `p` leaves the store (`invalidate_payloads` through a test
+/// seam: an INVALID for it would also make the core refuse each block on `d`, whose bid builds on
+/// that payload). A test seam stands for a justifying and finalizing chain: the walk state of `d`
+/// at the end of epoch 2 has `d` justified and `c` finalized. The block `j` of slot 26 on the
+/// EMPTY node of `d`, far after it, imports from that state, and its post-state realizes both: its
+/// `on_block` makes `d` the justified and `c` the finalized block. `c` builds on the payload that
+/// left the store, and the walk goes down to the finalized block before `on_block`. The core
+/// fails closed after `on_block`: it sets the EL contradiction, halts the sender and commits
+/// nothing, and the head, the verified payloads and the forkchoiceUpdated calls stay as they
+/// were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_that_moves_justified_and_finalized_past_a_removed_payload_halts_and_commits_nothing(
+) {
+    let epoch = Minimal::slots_per_epoch();
+    let in_epoch_3 = |core: ChainCore<Minimal>| {
+        let at = slot_time(&core, 3 * epoch + 3);
+        core.with_clock(clock_at(at))
+    };
+    let t = later_with(Reply::Syncing, |_| Reply::Syncing, in_epoch_3).await;
+    let (p, _) = &t.p;
+    let (c, c_post) = &t.c;
+    let (d, d_post) = empty_child(&t.config, c, c_post, epoch + 1, 0x34);
+    let anchor = p.message.parent_root;
+    let core = commit_all(t.core, &[c, &d], &t.verify).await;
+    let core = core.with_fork_choice(|store| {
+        assert!(invalidate_payloads(store, |payload| *payload == hash(0x31)));
+    });
+    let verified = |core: &ChainCore<Minimal>| {
+        [anchor, root(p), root(c), root(&d)]
+            .map(|block| is_payload_verified(core.fork_choice(), block))
+    };
+    assert_eq!(
+        verified(&core),
+        [true, false, false, false],
+        "the payload of p left the store"
+    );
+    let store = core.fork_choice();
+    assert_eq!(
+        [
+            store.justified_checkpoint(),
+            store.finalized_checkpoint(),
+            store.unrealized_justified_checkpoint(),
+            store.unrealized_finalized_checkpoint(),
+        ]
+        .map(|checkpoint| checkpoint.root),
+        [anchor; 4],
+        "the tick of the import has nothing to promote"
+    );
+
+    let (justified, finalized) = justified_on_d_finalized_on_c(c, &d);
+    let mut kept = advanced(&d_post, 3 * epoch - 1, &t.config);
+    kept.current_justified_checkpoint = justified.clone();
+    kept.finalized_checkpoint = finalized.clone();
+    let (j, _) = empty_child(&t.config, &d, &kept, 3 * epoch + 2, 0x35);
+    let core = core.with_advanced_state(root(&d), 3, kept);
+    let head = core.head();
+    let sent = t.sink.sent();
+    let forkchoice_sent = core.forkchoice_sent();
+    assert_eq!(forkchoice_sent.as_ref(), sent.last());
+    el_sees(&t.el, sent.last().unwrap()).await;
+    let updates = t.el.forkchoice_updates().len();
+
+    let (outcome, core) = step(core, block_item(&j), &t.verify).await;
+    let store = core.fork_choice();
+    assert!(store.block(root(&j)).is_some(), "on_block takes the block");
+    assert_eq!(
+        (store.justified_checkpoint(), store.finalized_checkpoint()),
+        (&justified, &finalized),
+        "on_block of the import makes d the justified and c the finalized block"
+    );
+    assert!(
+        core.execution_statuses().el_contradiction(),
+        "c, below the justified block, builds on a payload that left the store"
+    );
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    assert!(t.sink.halted(), "the core halts the sender");
+    assert!(!core.is_committed(&root(&j)), "the import commits nothing");
+    assert!(core.state(&root(&j)).is_none(), "no pre-state of the block");
+    assert_eq!(core.head(), head, "the head stays");
+    assert_eq!(verified(&core), [true, false, false, false]);
     assert_eq!(t.sink.sent(), sent, "no forkchoiceUpdated");
     assert_eq!(core.forkchoice_sent(), forkchoice_sent);
     tokio::time::sleep(QUIET).await;
