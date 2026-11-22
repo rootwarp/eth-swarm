@@ -52,7 +52,10 @@ pub use envelope::{
     verify_execution_payload_envelope, DataAvailability, DataAvailabilityCheck, ExecutionEngine,
     NewPayloadRequestRef, PayloadImport,
 };
-pub use handlers::{on_block, on_tick, store_target_checkpoint_state, StateProvider};
+pub use handlers::{
+    on_block, on_tick, on_tick_unpruned, prune_after_tick, store_target_checkpoint_state,
+    StateProvider,
+};
 pub use payload_attestation::on_payload_attestation_message;
 pub use store::{
     compute_slots_since_epoch_start, get_ancestor, get_checkpoint_block, get_current_slot,
@@ -437,8 +440,9 @@ impl From<AttestationError> for Error {
 /// Test seams. Only tests may enable them: the feature `testing` is for dev-dependencies.
 /// They change the store without the checks of the handlers that they stand for:
 /// `mark_payload_verified` stands for `on_execution_payload_envelope`, so that a test needs
-/// no envelope, `set_finalized_checkpoint`, `set_justified_checkpoint` and
-/// `set_unrealized_justified_checkpoint` for a finalizing or a justifying chain,
+/// no envelope, `set_finalized_checkpoint`, `set_justified_checkpoint`,
+/// `set_unrealized_justified_checkpoint` and `set_unrealized_finalized_checkpoint` for a
+/// finalizing or a justifying chain,
 /// `remove_checkpoint_state` for a checkpoint state that
 /// `store_target_checkpoint_state` did not store, and the others let a test set a weight
 /// without the committees of an attestation.
@@ -478,6 +482,16 @@ pub mod testing {
         checkpoint: Checkpoint,
     ) {
         store.unrealized_justified_checkpoint = checkpoint;
+    }
+
+    /// Sets `store.unrealized_finalized_checkpoint` to `checkpoint`, as
+    /// `update_unrealized_checkpoints` does when a block pulls it up. Nothing else: `on_tick`
+    /// promotes it to the finalized checkpoint at the first slot of the next epoch.
+    pub fn set_unrealized_finalized_checkpoint<E: Preset>(
+        store: &mut Store<E>,
+        checkpoint: Checkpoint,
+    ) {
+        store.unrealized_finalized_checkpoint = checkpoint;
     }
 
     /// Removes `store.checkpoint_states[checkpoint]`, as a store where

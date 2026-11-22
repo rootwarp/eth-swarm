@@ -46,7 +46,19 @@ pub trait StateProvider<E: Preset> {
 /// (`store::prune`), and keeps what `on_attestation` reads of them. This is not in the spec.
 /// It does not change the result of `on_block` or of `get_head`, and `on_attestation` gives
 /// the result of the spec until the store forgets the dropped blocks.
+///
+/// It is [`on_tick_unpruned`], then [`prune_after_tick`].
 pub fn on_tick<E: Preset>(store: &mut Store<E>, time_ms: u64) -> Result<(), Error> {
+    on_tick_unpruned(store, time_ms)?;
+    prune_after_tick(store);
+    Ok(())
+}
+
+/// The ticks of [`on_tick`] without its prune, for a caller that reads the blocks below the
+/// checkpoints that the ticks moved before [`prune_after_tick`] can drop one of them
+/// (`is_justified_on_invalid_payload`). Without [`prune_after_tick`] the store keeps each block,
+/// as the spec's store does.
+pub fn on_tick_unpruned<E: Preset>(store: &mut Store<E>, time_ms: u64) -> Result<(), Error> {
     let tick_slot = compute_slot_at_time_ms(store, time_ms)?;
     while get_current_slot(store) < tick_slot {
         let next_slot = get_current_slot(store) + 1;
@@ -56,9 +68,14 @@ pub fn on_tick<E: Preset>(store: &mut Store<E>, time_ms: u64) -> Result<(), Erro
         on_tick_per_slot(store, next_slot_time_ms);
     }
     on_tick_per_slot(store, time_ms);
+    Ok(())
+}
+
+/// The end of [`on_tick`] after [`on_tick_unpruned`]: `store::release_dropped`, then
+/// `store::prune`.
+pub fn prune_after_tick<E: Preset>(store: &mut Store<E>) {
     release_dropped(store);
     prune(store);
-    Ok(())
 }
 
 /// `on_tick_per_slot` (P0 L792-808).
