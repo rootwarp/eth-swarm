@@ -3,6 +3,7 @@
 
 mod common;
 
+use cl_engine::capabilities::{FORKCHOICE_UPDATED_V4, NEW_PAYLOAD_V5};
 use cl_engine::client::{Config, EngineEndpoint};
 use cl_engine::queue::Queue;
 use cl_engine::server::{serve, EngineServer, Limits};
@@ -12,14 +13,17 @@ use ethswarm_proto::engine::engine_service_client::EngineServiceClient;
 use http::uri::PathAndQuery;
 use hyper_util::rt::TokioIo;
 use ipc::acl::{AclTables, MethodAcl};
+use prost::Message as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint, Uri};
-use tonic::Code;
+use tonic::{Code, Status};
 
 const SECRET: [u8; 32] = [0x22; 32];
 const NEW_PAYLOAD: &str = "/ethswarm.engine.v1.EngineService/NewPayload";
@@ -545,17 +549,36 @@ type OpenBody = http_body_util::StreamBody<
     >,
 >;
 
-/// A NewPayload request over a raw HTTP/2 connection whose body is `sent` and then stays open:
-/// what tonic's client cannot send. Returns the response status, `grpc-status`, and the body
-/// sender (dropping it would end the body).
-async fn open_body_request(
+/// Sends the rest of an [`OpenBody`]; dropping it ends the body.
+type BodySender =
+    tokio::sync::mpsc::Sender<Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible>>;
+
+/// What a request over a raw HTTP/2 connection got back.
+struct RawReply {
+    status: http::StatusCode,
+    /// From the response headers (a trailers-only answer), else from the trailers.
+    grpc_status: Option<String>,
+    /// The response body: one gRPC message when the call succeeded.
+    body: bytes::Bytes,
+}
+
+fn grpc_status_of(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get("grpc-status")
+        .map(|v| v.to_str().unwrap().to_owned())
+}
+
+/// A request for `method` (its gRPC path) over a raw HTTP/2 connection, with `grpc_timeout` as
+/// its `grpc-timeout` header when given. Its body is `sent`; with `open` the body then stays open
+/// until the returned sender is dropped, else it ends there. tonic's client cannot leave a body
+/// open, and it applies a `grpc-timeout` itself: only a raw request shows what the server does.
+async fn raw_request(
     path: &Path,
+    method: &str,
+    grpc_timeout: Option<&str>,
     sent: Vec<u8>,
-) -> (
-    http::StatusCode,
-    Option<String>,
-    tokio::sync::mpsc::Sender<Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible>>,
-) {
+    open: bool,
+) -> (RawReply, Option<BodySender>) {
     use http_body_util::BodyExt;
     let io = TokioIo::new(UnixStream::connect(path).await.unwrap());
     let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, OpenBody>(
@@ -570,34 +593,64 @@ async fn open_body_request(
         .send(Ok(hyper::body::Frame::data(bytes::Bytes::from(sent))))
         .await
         .unwrap();
-    let request = http::Request::post(format!("http://localhost{NEW_PAYLOAD}"))
+    let body_tx = open.then_some(body_tx);
+    let mut request = http::Request::post(format!("http://localhost{method}"))
         .header("content-type", "application/grpc")
-        .header("te", "trailers")
+        .header("te", "trailers");
+    if let Some(value) = grpc_timeout {
+        request = request.header("grpc-timeout", value);
+    }
+    let request = request
         .body(http_body_util::StreamBody::new(
             tokio_stream::wrappers::ReceiverStream::new(body_rx),
         ))
         .unwrap();
     let response = sender.send_request(request).await.unwrap();
     let status = response.status();
-    let in_headers = response
-        .headers()
-        .get("grpc-status")
-        .map(|v| v.to_str().unwrap().to_owned());
-    let grpc_status = match in_headers {
-        Some(code) => Some(code),
-        None => response
-            .into_body()
-            .collect()
-            .await
-            .ok()
-            .and_then(|body| body.trailers().cloned())
-            .and_then(|trailers| {
-                trailers
-                    .get("grpc-status")
-                    .map(|v| v.to_str().unwrap().to_owned())
-            }),
+    let (grpc_status, body) = match grpc_status_of(response.headers()) {
+        Some(code) => (Some(code), bytes::Bytes::new()),
+        None => match response.into_body().collect().await {
+            Ok(collected) => {
+                let code = collected.trailers().and_then(grpc_status_of);
+                (code, collected.to_bytes())
+            }
+            Err(_) => (None, bytes::Bytes::new()),
+        },
     };
-    (status, grpc_status, body_tx)
+    let reply = RawReply {
+        status,
+        grpc_status,
+        body,
+    };
+    (reply, body_tx)
+}
+
+/// A NewPayload request over a raw HTTP/2 connection whose body is `sent` and then stays open:
+/// what tonic's client cannot send. Returns the response status, `grpc-status`, and the body
+/// sender (dropping it would end the body).
+async fn open_body_request(
+    path: &Path,
+    sent: Vec<u8>,
+) -> (http::StatusCode, Option<String>, BodySender) {
+    let (reply, open) = raw_request(path, NEW_PAYLOAD, None, sent, true).await;
+    (reply.status, reply.grpc_status, open.unwrap())
+}
+
+/// `message` as one uncompressed gRPC message: the flag byte, the 4-byte length, the message.
+fn grpc_message(message: &impl prost::Message) -> Vec<u8> {
+    let bytes = message.encode_to_vec();
+    let mut framed = vec![0];
+    framed.extend(u32::try_from(bytes.len()).unwrap().to_be_bytes());
+    framed.extend(bytes);
+    framed
+}
+
+/// A gRPC message prefix that declares 100 bytes, and 10 of them: a body that never finishes
+/// while its sender is held.
+fn unfinished_body() -> Vec<u8> {
+    let mut partial = vec![0, 0, 0, 0, 100];
+    partial.extend([b'['; 10]);
+    partial
 }
 
 /// A gRPC message prefix that declares more than the limit, and nothing after it: refused from
@@ -749,4 +802,395 @@ async fn forkchoice_updated_ends_at_its_own_request_deadline() {
     assert_eq!(cut.code(), Code::Cancelled, "{cut:?}");
     assert!(elapsed >= own && elapsed < LATE_EL_ANSWER, "{elapsed:?}");
     assert_eq!(sent(&running.mock), ["engine_forkchoiceUpdatedV4"]);
+}
+
+/// The EL's VALID answer to a forkchoiceUpdated, with no payload.
+fn forkchoice_valid() -> serde_json::Value {
+    let status =
+        serde_json::json!({"status": "VALID", "latestValidHash": null, "validationError": null});
+    serde_json::json!({"payloadStatus": status, "payloadId": null})
+}
+
+/// A caller's `grpc-timeout` longer than the method's request deadline does not extend it: a late
+/// EL answer is cut off (`CANCELLED`) at the method's deadline, not at the caller's. For
+/// forkchoiceUpdated that is its own deadline, not the shared one; every other method keeps the
+/// shared one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_longer_grpc_timeout_is_capped_at_the_method_deadline() {
+    let shared = Duration::from_millis(300);
+    let own = Duration::from_millis(800);
+    let limits = Limits {
+        request_timeout: shared,
+        forkchoice_updated_timeout: own,
+        ..Limits::default()
+    };
+    let running = start(acl(me(), &[NEW_PAYLOAD, FORKCHOICE]), limits).await;
+    running
+        .mock
+        .set_method_delay(FORKCHOICE_UPDATED_V4, LATE_EL_ANSWER);
+    running
+        .mock
+        .set_method_delay(NEW_PAYLOAD_V5, LATE_EL_ANSWER);
+    let caller = Duration::from_secs(30);
+    let mut client = EngineServiceClient::new(channel(&running.path).await);
+
+    let mut request = tonic::Request::new(forkchoice_updated(1));
+    request.set_timeout(caller);
+    let started = std::time::Instant::now();
+    let cut = client
+        .forkchoice_updated(request)
+        .await
+        .expect_err("forkchoiceUpdated ran past its own request deadline");
+    let elapsed = started.elapsed();
+    assert_eq!(cut.code(), Code::Cancelled, "{cut:?}");
+    assert!(elapsed >= own && elapsed < LATE_EL_ANSWER, "{elapsed:?}");
+
+    let mut request = tonic::Request::new(new_payload(2, br#"[{"blockNumber":"0x2"}]"#.to_vec()));
+    request.set_timeout(caller);
+    let started = std::time::Instant::now();
+    let cut = client
+        .new_payload(request)
+        .await
+        .expect_err("newPayload ran past the shared request deadline");
+    let elapsed = started.elapsed();
+    assert_eq!(cut.code(), Code::Cancelled, "{cut:?}");
+    assert!(elapsed >= shared && elapsed < own, "{elapsed:?}");
+}
+
+/// A caller's `grpc-timeout` shorter than the method's request deadline is honored: the call
+/// ends (`CANCELLED`) at the caller's timeout, though the EL answers well inside the deadline, as
+/// the same call without the header shows. Sent raw, so the server's answer is what comes back,
+/// not tonic's client giving up at the same moment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shorter_grpc_timeout_ends_the_call_before_the_method_deadline() {
+    let running = start(acl(me(), &[FORKCHOICE]), Limits::default()).await;
+    running
+        .mock
+        .set_method_delay(FORKCHOICE_UPDATED_V4, LATE_EL_ANSWER);
+    running.mock.push_result(forkchoice_valid());
+    running.mock.push_result(forkchoice_valid());
+
+    let started = std::time::Instant::now();
+    let (answered, _) = raw_request(
+        &running.path,
+        FORKCHOICE,
+        None,
+        grpc_message(&forkchoice_updated(1)),
+        false,
+    )
+    .await;
+    assert!(
+        started.elapsed() >= LATE_EL_ANSWER,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(answered.status, http::StatusCode::OK);
+    assert_eq!(answered.grpc_status.as_deref(), Some("0"), "OK");
+    let reply = pb::ForkchoiceUpdatedResponse::decode(&answered.body[5..]).unwrap();
+    assert!(reply.error.is_none(), "{:?}", reply.error);
+    assert_eq!(
+        reply.status.map(|status| status.status),
+        Some(pb::PayloadStatusKind::Valid as i32)
+    );
+
+    let caller = Duration::from_millis(300);
+    let header = format!("{}m", caller.as_millis());
+    let started = std::time::Instant::now();
+    let (cut, _) = raw_request(
+        &running.path,
+        FORKCHOICE,
+        Some(&header),
+        grpc_message(&forkchoice_updated(2)),
+        false,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(cut.status, http::StatusCode::OK);
+    assert_eq!(cut.grpc_status.as_deref(), Some("1"), "CANCELLED");
+    assert!(elapsed >= caller && elapsed < LATE_EL_ANSWER, "{elapsed:?}");
+}
+
+/// `grpc-timeout` values that do not parse: no unit, a unit that is not one of `HMSmun`, more
+/// than the eight digits the gRPC spec allows, a sign, a fraction, no digits, and no value.
+const MALFORMED_GRPC_TIMEOUTS: [&str; 7] = ["15", "15s", "123456789S", "-1S", "1.5S", "S", ""];
+
+/// A `grpc-timeout` that does not parse is the same as none: the call is served, and the
+/// method's request deadline still ends it. An EL answer inside the deadline comes back; a body
+/// that never finishes and an EL answer later than forkchoiceUpdated's own deadline are cut off
+/// (`CANCELLED`) at the method's deadline, not sooner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_grpc_timeout_leaves_the_method_deadline_in_force() {
+    let shared = Duration::from_millis(300);
+    let own = Duration::from_millis(800);
+    let limits = Limits {
+        request_timeout: shared,
+        forkchoice_updated_timeout: own,
+        // One connection per raw request below, and the client's.
+        max_connections: 16,
+        ..Limits::default()
+    };
+    let running = start(acl(me(), &[NEW_PAYLOAD, FORKCHOICE]), limits).await;
+    let client = EngineServiceClient::new(channel(&running.path).await);
+    let with_header = |seq: u64, value: &'static str| {
+        let mut request = tonic::Request::new(forkchoice_updated(seq));
+        request
+            .metadata_mut()
+            .insert("grpc-timeout", MetadataValue::from_static(value));
+        request
+    };
+    let mut seqs = 1..;
+
+    for value in MALFORMED_GRPC_TIMEOUTS {
+        running.mock.push_result(forkchoice_valid());
+        let reply = client
+            .clone()
+            .forkchoice_updated(with_header(seqs.next().unwrap(), value))
+            .await
+            .unwrap_or_else(|err| panic!("{value:?}: {err:?}"))
+            .into_inner();
+        assert!(reply.error.is_none(), "{value:?}: {:?}", reply.error);
+        assert_eq!(
+            reply.status.map(|status| status.status),
+            Some(pb::PayloadStatusKind::Valid as i32),
+            "{value:?}"
+        );
+    }
+
+    for value in MALFORMED_GRPC_TIMEOUTS {
+        let started = std::time::Instant::now();
+        let (cut, _open) = tokio::time::timeout(
+            Duration::from_secs(5),
+            raw_request(
+                &running.path,
+                NEW_PAYLOAD,
+                Some(value),
+                unfinished_body(),
+                true,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{value:?}: a body that never finishes was not ended"));
+        let elapsed = started.elapsed();
+        assert_eq!(cut.status, http::StatusCode::OK, "{value:?}");
+        assert_eq!(
+            cut.grpc_status.as_deref(),
+            Some("1"),
+            "{value:?}: CANCELLED"
+        );
+        assert!(elapsed >= shared && elapsed < own, "{value:?}: {elapsed:?}");
+    }
+
+    running
+        .mock
+        .set_method_delay(FORKCHOICE_UPDATED_V4, LATE_EL_ANSWER);
+    // At once: each is cut at its own deadline, the first while the EL holds it, the rest while
+    // they wait behind it.
+    let calls: Vec<_> = MALFORMED_GRPC_TIMEOUTS
+        .into_iter()
+        .map(|value| {
+            let mut client = client.clone();
+            let request = with_header(seqs.next().unwrap(), value);
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let answer = client.forkchoice_updated(request).await;
+                (value, started.elapsed(), answer)
+            })
+        })
+        .collect();
+    for call in calls {
+        let (value, elapsed, answer) = call.await.unwrap();
+        let cut = answer.expect_err("forkchoiceUpdated ran past its own request deadline");
+        assert_eq!(cut.code(), Code::Cancelled, "{value:?}: {cut:?}");
+        assert!(
+            elapsed >= own && elapsed < LATE_EL_ANSWER,
+            "{value:?}: {elapsed:?}"
+        );
+    }
+}
+
+/// A method the ACL does not allow, on a connection it admitted (the peer's UID is a caller), is
+/// denied (`PERMISSION_DENIED`) at once: before its body is read, and not held until the method's
+/// request deadline or the caller's `grpc-timeout`. Nothing reaches the EL, and the connection
+/// still serves an allowed method.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_acl_denial_is_answered_at_once_not_at_the_request_deadline() {
+    let deadline = Duration::from_secs(30);
+    let limits = Limits {
+        request_timeout: deadline,
+        forkchoice_updated_timeout: deadline,
+        ..Limits::default()
+    };
+    let running = start(acl(me(), &[NEW_PAYLOAD]), limits).await;
+    running
+        .mock
+        .set_method_delay(FORKCHOICE_UPDATED_V4, LATE_EL_ANSWER);
+    let at_once = Duration::from_secs(1);
+
+    let header = format!("{}S", deadline.as_secs());
+    let (denied, _open) = tokio::time::timeout(
+        at_once,
+        raw_request(
+            &running.path,
+            FORKCHOICE,
+            Some(&header),
+            unfinished_body(),
+            true,
+        ),
+    )
+    .await
+    .expect("the denial waited for the body or the deadline");
+    assert_eq!(denied.status, http::StatusCode::OK);
+    assert_eq!(
+        denied.grpc_status.as_deref(),
+        Some("7"),
+        "PERMISSION_DENIED"
+    );
+
+    let mut client = EngineServiceClient::new(channel(&running.path).await);
+    let mut request = tonic::Request::new(forkchoice_updated(1));
+    request.set_timeout(deadline);
+    let err = tokio::time::timeout(at_once, client.forkchoice_updated(request))
+        .await
+        .expect("the denial waited for the deadline")
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err:?}");
+
+    let reply = tokio::time::timeout(
+        at_once,
+        client.new_payload(new_payload(1, br#"[{"blockNumber":"0x1"}]"#.to_vec())),
+    )
+    .await
+    .expect("the allowed call after a denial was held")
+    .unwrap()
+    .into_inner();
+    assert!(reply.error.is_none(), "{:?}", reply.error);
+    assert_eq!(sent(&running.mock), [NEW_PAYLOAD_V5]);
+}
+
+/// Holds the paused clock still until dropped, as in `tests/faults.rs`: tokio does not
+/// auto-advance paused time while a blocking task runs, and without this, waiting on loopback
+/// I/O would jump the clock to the next pending deadline.
+struct Frozen {
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+fn freeze() -> Frozen {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        // Returns once the sender is dropped.
+        let _ = released.recv();
+    });
+    Frozen { _release: release }
+}
+
+/// Waits, with the paused clock still, until `mock` has been sent `method`: the clock is where
+/// the EL's delay started.
+async fn reached(mock: &MockEl, method: &str) {
+    let wall = std::time::Instant::now();
+    while !mock.seen().iter().any(|seen| seen.method == method) {
+        assert!(
+            wall.elapsed() < Duration::from_secs(10),
+            "{method} never reached the EL"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A forkchoiceUpdated on its own connection to `path` from a caller that raised its wait to
+/// `wait`, as `timeout_ms` and as its `grpc-timeout`. The task returns the answer and when (on the
+/// paused clock) it came.
+async fn raised_forkchoice_updated(
+    path: &Path,
+    seq: u64,
+    wait: Duration,
+) -> JoinHandle<(
+    Result<pb::ForkchoiceUpdatedResponse, Status>,
+    tokio::time::Instant,
+)> {
+    let mut client = EngineServiceClient::new(channel(path).await);
+    let mut request = tonic::Request::new(pb::ForkchoiceUpdatedRequest {
+        timeout_ms: u32::try_from(wait.as_millis()).unwrap(),
+        ..forkchoice_updated(seq)
+    });
+    request.set_timeout(wait);
+    tokio::spawn(async move {
+        let answer = client
+            .forkchoice_updated(request)
+            .await
+            .map(tonic::Response::into_inner);
+        (answer, tokio::time::Instant::now())
+    })
+}
+
+/// With the default limits, a forkchoiceUpdated whose caller raised its wait past both request
+/// deadlines (`timeout_ms` and `grpc-timeout`) runs past the shared deadline: an EL answer between
+/// the shared deadline and forkchoiceUpdated's own comes back. It stops at its own deadline: an
+/// EL answer after that never reaches the caller, and the call ends there, not at the caller's
+/// longer wait. The raised EL wait is capped at that same deadline, so either ends the call at
+/// that moment: the request deadline (`CANCELLED`) or the EL wait (a timeout error).
+#[tokio::test(start_paused = true)]
+async fn a_raised_forkchoice_updated_wait_runs_past_the_shared_deadline_up_to_its_own() {
+    let _frozen = freeze();
+    let limits = Limits::default();
+    let (shared, own) = (limits.request_timeout, limits.forkchoice_updated_timeout);
+    assert!(shared < own, "{shared:?} {own:?}");
+    let raised = own + Duration::from_secs(3);
+    let between = shared + (own - shared) / 2;
+    let after = own + Duration::from_secs(1);
+    let answers = start(acl(me(), &[FORKCHOICE]), limits).await;
+    let late = start(acl(me(), &[FORKCHOICE]), limits).await;
+    answers
+        .mock
+        .set_method_delay(FORKCHOICE_UPDATED_V4, between);
+    late.mock.set_method_delay(FORKCHOICE_UPDATED_V4, after);
+    answers.mock.push_result(forkchoice_valid());
+    late.mock.push_result(forkchoice_valid());
+
+    let started = tokio::time::Instant::now();
+    let answered = raised_forkchoice_updated(&answers.path, 1, raised).await;
+    let cut = raised_forkchoice_updated(&late.path, 1, raised).await;
+    reached(&answers.mock, FORKCHOICE_UPDATED_V4).await;
+    reached(&late.mock, FORKCHOICE_UPDATED_V4).await;
+
+    // Past the shared deadline first, then to the first EL answer: a wait that stopped at the
+    // shared deadline has run out before the EL answers.
+    let past_shared = shared + Duration::from_millis(500);
+    tokio::time::advance(past_shared).await;
+    tokio::time::advance(between - past_shared).await;
+    let (answer, at) = answered.await.unwrap();
+    let reply = answer.expect("forkchoiceUpdated was cut off before its own request deadline");
+    assert!(reply.error.is_none(), "{:?}", reply.error);
+    assert_eq!(
+        reply.status.map(|status| status.status),
+        Some(pb::PayloadStatusKind::Valid as i32)
+    );
+    assert!(
+        at - started > shared && at - started < own,
+        "{:?}",
+        at - started
+    );
+    assert!(!cut.is_finished(), "a call ended before its own deadline");
+
+    tokio::time::advance(own - between).await;
+    let (answer, at) = cut.await.unwrap();
+    assert!(
+        at - started >= own && at - started < after,
+        "{:?}",
+        at - started
+    );
+    match answer {
+        Err(status) => assert_eq!(status.code(), Code::Cancelled, "{status:?}"),
+        Ok(reply) => {
+            assert!(
+                reply.status.is_none(),
+                "the late answer came back: {reply:?}"
+            );
+            assert_eq!(
+                reply.error.map(|error| error.kind),
+                Some(pb::EngineErrorKind::Timeout as i32)
+            );
+        }
+    }
+    assert_eq!(sent(&answers.mock), [FORKCHOICE_UPDATED_V4]);
+    assert_eq!(sent(&late.mock), [FORKCHOICE_UPDATED_V4]);
 }
