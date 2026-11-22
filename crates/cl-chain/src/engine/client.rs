@@ -11,15 +11,20 @@
 //! - **`seq`.** Every call takes the next value of the process's one [`EngineSeq`], which
 //!   cl-engine's queue orders calls by. It never resets in the process, a reconnect included,
 //!   and a retry takes a new one.
+//! - **The wait.** The request asks for no raised wait (`timeout_ms` 0), so cl-engine gives the
+//!   EL the spec's 8 s ([`FORKCHOICE_UPDATED_TIMEOUT`]) and answers by its end: with the EL's
+//!   status, or `EngineError` `TIMEOUT`. The sender waits longer for that answer,
+//!   [`FCU_CALL_TIMEOUT`] (10 s), so an answer the EL gives within cl-engine's wait, an
+//!   `INVALID` included, reaches the caller and is not lost and retried. A call still running at
+//!   10 s (held in cl-engine's queue first, or a stuck cl-engine) is lost.
 //! - **Retries.** A failure on the way to the EL is retried with the latest arguments (the
 //!   failed ones, unless newer ones came), after a backoff that doubles from [`BACKOFF_MIN`] to
 //!   [`BACKOFF_MAX`] and resets after an answer. Those failures are: no connection to
 //!   cl-engine's socket within [`CALL_TIMEOUT`], or a server that is not the expected user; the
-//!   call fails in transport (`UNAVAILABLE`,
-//!   `CANCELLED`, `UNKNOWN`, `DEADLINE_EXCEEDED`, or no answer within [`CALL_TIMEOUT`]), after
-//!   which the connection is opened again; or cl-engine answers that the EL is unreachable or
-//!   timed out. Any other gRPC status (a contract violation) is not retried: the same arguments
-//!   would be refused again.
+//!   call fails in transport (`UNAVAILABLE`, `CANCELLED`, `UNKNOWN`, `DEADLINE_EXCEEDED`, or no
+//!   answer within [`FCU_CALL_TIMEOUT`]), after which the connection is opened again; or
+//!   cl-engine answers that the EL is unreachable or timed out. Any other gRPC status (a
+//!   contract violation) is not retried: the same arguments would be refused again.
 //! - **Answers.** The response, `PayloadStatus` included, goes to the caller as it is
 //!   ([`FcuSender::outcomes`], and once each through [`ForkchoiceSink::take_outcome`]), an
 //!   `EngineError` other than the retried ones too. This module reads no verdict from it. It
@@ -57,14 +62,34 @@ use tonic::Code;
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 /// The longest pause before a retry.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(8);
-/// How long a connection to cl-engine, or one call on it, may take before it counts as lost in
-/// transport: the Engine API's wait for `engine_newPayloadV5` ([`NEW_PAYLOAD_V5_TIMEOUT`]), and
-/// no longer, so a stalled cl-engine holds the chain core's writer no longer than the EL may
-/// take ([`DEFAULT_ENGINE_TIMEOUT`](crate::core::DEFAULT_ENGINE_TIMEOUT)). It is under
-/// cl-engine's 10 s request deadline and its 8 s wait for `engine_forkchoiceUpdated`, so an
-/// answer that cl-engine gives later is lost to the caller: a newPayload call has no verdict,
-/// and a forkchoiceUpdated call is retried.
+/// How long a connection to cl-engine, or one newPayload call on it, may take before it counts
+/// as lost in transport: the Engine API's wait for `engine_newPayloadV5`
+/// ([`NEW_PAYLOAD_V5_TIMEOUT`]), and no longer, so a stalled cl-engine holds the chain core's
+/// writer no longer than the EL may take
+/// ([`DEFAULT_ENGINE_TIMEOUT`](crate::core::DEFAULT_ENGINE_TIMEOUT)). It is under cl-engine's
+/// 10 s request deadline, so a newPayload answer that cl-engine gives later is lost to the
+/// caller: the call has no verdict. [`FcuSender`] connects within it too, but waits
+/// [`FCU_CALL_TIMEOUT`] for a forkchoiceUpdated answer.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// `engine_forkchoiceUpdated`'s timeout (execution-apis `paris.md`, kept by later forks): the
+/// wait cl-engine gives the EL (its own `FORKCHOICE_UPDATED_TIMEOUT`, the same 8 s) before it
+/// answers `EngineError` `TIMEOUT`. The request asks for no other (`timeout_ms` 0, which never
+/// shortens it).
+pub const FORKCHOICE_UPDATED_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How long [`FcuSender`] waits for cl-engine's answer to one forkchoiceUpdated call, from the
+/// send, before the call counts as lost in transport. It is longer than cl-engine's wait for the
+/// EL ([`FORKCHOICE_UPDATED_TIMEOUT`]), so cl-engine answers first: the EL's status, an
+/// `INVALID` included, or its own `TIMEOUT`. Only a call still running at 10 s, held in
+/// cl-engine's queue or by a cl-engine stuck past the EL wait, is lost here. cl-engine's
+/// request deadline is 10 s as well, and can end such a call at the same moment: either way the
+/// call is lost, so retried with the latest arguments, and the EL may still have applied it.
+pub const FCU_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+// cl-engine's wait for the EL on forkchoiceUpdated ends before the sender's: its answer, the
+// EL's status or its TIMEOUT, comes first.
+const _: () = assert!(FORKCHOICE_UPDATED_TIMEOUT.as_millis() < FCU_CALL_TIMEOUT.as_millis());
 
 /// The `seq` of cl-chain's engine.v1 calls: one counter per process, shared by every caller,
 /// from 1 and strictly increasing.
@@ -366,7 +391,7 @@ impl Task {
         let seq = self.seq.next();
         self.metrics.sent.inc();
         let call = client.forkchoice_updated(args.request(seq));
-        let response = match tokio::time::timeout(CALL_TIMEOUT, call).await {
+        let response = match tokio::time::timeout(FCU_CALL_TIMEOUT, call).await {
             Ok(Ok(response)) => response.into_inner(),
             Ok(Err(status)) => {
                 self.metrics.error(FcuErrorKind::Rpc);
