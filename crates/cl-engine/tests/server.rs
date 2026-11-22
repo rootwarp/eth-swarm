@@ -654,3 +654,73 @@ async fn a_request_body_that_never_finishes_ends_at_the_request_deadline() {
     );
     assert!(sent(&running.mock).is_empty());
 }
+
+/// How late the EL answers in the deadline tests: past the shared request deadline they set,
+/// inside the EL wait of each method (6 s and more).
+const LATE_EL_ANSWER: Duration = Duration::from_millis(1500);
+
+/// A forkchoiceUpdated request for the mock EL's VALID answer, with no payload attributes.
+fn forkchoice_updated(seq: u64) -> pb::ForkchoiceUpdatedRequest {
+    pb::ForkchoiceUpdatedRequest {
+        seq,
+        head_block_hash: vec![1; 32],
+        safe_block_hash: vec![2; 32],
+        finalized_block_hash: vec![3; 32],
+        ..Default::default()
+    }
+}
+
+/// forkchoiceUpdated has a request deadline of its own, longer than the shared one: an EL answer
+/// that comes after the shared deadline, inside the EL wait, still reaches the caller. Every other
+/// method keeps the shared deadline: a newPayload answer as late is cut off (`CANCELLED`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forkchoice_updated_runs_past_the_shared_request_deadline() {
+    let limits = Limits {
+        request_timeout: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let running = start(acl(me(), &[NEW_PAYLOAD, FORKCHOICE]), limits).await;
+    running
+        .mock
+        .set_method_delay("engine_forkchoiceUpdatedV4", LATE_EL_ANSWER);
+    running
+        .mock
+        .set_method_delay("engine_newPayloadV5", LATE_EL_ANSWER);
+    let status =
+        serde_json::json!({"status": "VALID", "latestValidHash": null, "validationError": null});
+    running
+        .mock
+        .push_result(serde_json::json!({"payloadStatus": status, "payloadId": null}));
+    let mut client = EngineServiceClient::new(channel(&running.path).await);
+    let started = std::time::Instant::now();
+    let answer = client
+        .forkchoice_updated(forkchoice_updated(1))
+        .await
+        .expect("forkchoiceUpdated was cut off at the shared request deadline")
+        .into_inner();
+    assert!(
+        started.elapsed() >= LATE_EL_ANSWER,
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(answer.error.is_none(), "{:?}", answer.error);
+    assert_eq!(
+        answer.status.map(|status| status.status),
+        Some(pb::PayloadStatusKind::Valid as i32)
+    );
+    let started = std::time::Instant::now();
+    let cut = client
+        .new_payload(new_payload(2, br#"[{"blockNumber":"0x2"}]"#.to_vec()))
+        .await
+        .expect_err("newPayload ran past the shared request deadline");
+    assert_eq!(cut.code(), Code::Cancelled, "{cut:?}");
+    assert!(
+        started.elapsed() < LATE_EL_ANSWER,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        sent(&running.mock),
+        ["engine_forkchoiceUpdatedV4", "engine_newPayloadV5"]
+    );
+}
