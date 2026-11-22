@@ -57,9 +57,14 @@ use tonic::Code;
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 /// The longest pause before a retry.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(8);
-/// How long one call may take before it counts as lost in transport: above cl-engine's 10 s
-/// request deadline, so cl-engine's own answer comes first.
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long a connection to cl-engine, or one call on it, may take before it counts as lost in
+/// transport: the Engine API's wait for `engine_newPayloadV5` ([`NEW_PAYLOAD_V5_TIMEOUT`]), and
+/// no longer, so a stalled cl-engine holds the chain core's writer no longer than the EL may
+/// take ([`DEFAULT_ENGINE_TIMEOUT`](crate::core::DEFAULT_ENGINE_TIMEOUT)). It is under
+/// cl-engine's 10 s request deadline and its 8 s wait for `engine_forkchoiceUpdated`, so an
+/// answer that cl-engine gives later is lost to the caller: a newPayload call has no verdict,
+/// and a forkchoiceUpdated call is retried.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// The `seq` of cl-chain's engine.v1 calls: one counter per process, shared by every caller,
 /// from 1 and strictly increasing.
@@ -485,11 +490,13 @@ impl Drop for FcuSender {
 /// `engine_newPayloadV5`'s timeout (execution-apis `amsterdam.md`): the wait cl-engine gives
 /// the EL before it answers `EngineError` `TIMEOUT`. The request asks for no other
 /// (`timeout_ms` 0, which never shortens it), and [`NewPayloadClient`] waits [`CALL_TIMEOUT`],
-/// longer, for cl-engine's answer.
+/// the same 6 s, for cl-engine's answer: cl-engine's `TIMEOUT` and the end of the client's wait
+/// can come together, and either is no verdict.
 pub const NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
 
-// The client never gives up before cl-engine's wait for the EL is over.
-const _: () = assert!(CALL_TIMEOUT.as_secs() > NEW_PAYLOAD_V5_TIMEOUT.as_secs());
+// The client never gives up before cl-engine's wait for the EL is over. It gives up when it is
+// over: the two are equal (pinned by the client tests).
+const _: () = assert!(CALL_TIMEOUT.as_millis() >= NEW_PAYLOAD_V5_TIMEOUT.as_millis());
 
 /// The largest JSON params body cl-chain builds or sends: engine.proto caps JSON `data` at
 /// 32 MiB (33554432 bytes).
@@ -603,8 +610,11 @@ impl NewPayloadMetrics {
 ///   [`ElVerdict::NotVerified`]; calling again is the caller's choice.
 /// - **The wait.** `timeout_ms` is 0, so cl-engine gives the EL the spec's 6 s
 ///   ([`NEW_PAYLOAD_V5_TIMEOUT`]) and answers `EngineError` `TIMEOUT` after it. The client gives
-///   cl-engine [`CALL_TIMEOUT`] to connect and as much to answer; no answer by then is
-///   [`Reason::Timeout`].
+///   cl-engine [`CALL_TIMEOUT`], the same 6 s, to connect and as much to answer; no answer by
+///   then is [`Reason::Timeout`]. Each of those waits is [`CALL_TIMEOUT`] on its own, so one
+///   call can take longer in all. The chain core bounds the whole call with one wait of its own
+///   ([`DEFAULT_ENGINE_TIMEOUT`](crate::core::DEFAULT_ENGINE_TIMEOUT) by default, the same 6 s),
+///   so a slow call holds its writer no longer than that wait.
 /// - **Fail closed.** Only a status, read by [`verdict::map_proto`] for the envelope's
 ///   `block_hash`, gives a verdict. An `EngineError` (also beside a status), a failed call, an
 ///   answer for another `seq`, no status, a `VALID` whose `latestValidHash` is not the
