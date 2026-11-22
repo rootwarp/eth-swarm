@@ -1,9 +1,9 @@
 //! The newPayload verdict contract: `verdict::map` of every `PayloadStatusV1`,
 //! [`NewPayloadClient`] against a mock `ethswarm.engine.v1` server on a Unix socket, and the
-//! per-block [`ExecutionStatuses`]. The client tests run on paused time, so the 6 s and 12 s
-//! waits take no wall-clock time; the timeout test also holds the paused clock still
-//! ([`freeze`]), so only `tokio::time::advance` moves it. The concurrency tests, which wait for
-//! nothing, run on real time.
+//! per-block [`ExecutionStatuses`]. The client tests run on paused time, so the 6 s waits take
+//! no wall-clock time; the timeout test also holds the paused clock still ([`freeze`]), so only
+//! `tokio::time::advance` moves it. The concurrency tests, which wait for nothing, run on real
+//! time.
 
 use cl_chain::engine::client::{
     new_payload_json, EngineSeq, NewPayloadClient, NewPayloadMetrics, CALL_TIMEOUT,
@@ -568,8 +568,9 @@ fn status_of(kind: Kind) -> Option<pb::PayloadStatus> {
     })
 }
 
-/// The client's wait for cl-engine's answer, as a number: [`CALL_TIMEOUT`] must be 12 s.
-const CLIENT_WAIT: Duration = Duration::from_secs(12);
+/// The client's wait for cl-engine's answer, as a number: [`CALL_TIMEOUT`] must be 6 s, the
+/// Engine API's own wait for `engine_newPayloadV5`, and no longer.
+const CLIENT_WAIT: Duration = Duration::from_secs(6);
 /// cl-engine's wait for the EL on `engine_newPayloadV5` (`amsterdam.md`), as a number:
 /// [`NEW_PAYLOAD_V5_TIMEOUT`] must be 6 s.
 const ENGINE_WAIT: Duration = Duration::from_secs(6);
@@ -590,10 +591,28 @@ fn freeze() -> Frozen {
     Frozen { _release: release }
 }
 
+/// The most wall-clock time a call has for its verdict once the frozen clock is at its `at`:
+/// the clock cannot move then, so no Tokio timer bounds the wait.
+const WALL_LIMIT: Duration = Duration::from_secs(10);
+
+/// The output of `fut`, or `None` if it has none within `limit` of wall-clock time.
+async fn within_wall<T>(fut: impl std::future::Future<Output = T>, limit: Duration) -> Option<T> {
+    let (done, over) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
+        let _ = done.send(());
+    });
+    tokio::select! {
+        biased;
+        out = fut => Some(out),
+        _ = over => None,
+    }
+}
+
 /// Sends `block`, and the mock gives `answer` `after` the request arrives. Waits for the
 /// request to arrive, moves the frozen clock to 1 ms before `at`, and checks that the call has
 /// no verdict yet. Then moves the clock to `at` and gives the verdict, with the time the call
-/// took on the paused clock.
+/// took on the paused clock. A call with no verdict at `at` fails the test.
 async fn verdict_at(
     s: &Setup,
     block: &Block,
@@ -622,16 +641,18 @@ async fn verdict_at(
         }
     }
     tokio::time::advance(Duration::from_millis(1)).await;
-    let verdict = call.await;
+    let verdict = within_wall(call, WALL_LIMIT)
+        .await
+        .unwrap_or_else(|| panic!("no verdict at {at:?}: the client waits longer"));
     (verdict, start.elapsed())
 }
 
-/// The two waits, pinned apart. A VALID 1 ms inside cl-engine's 6 s wait is taken. cl-engine's
-/// own TIMEOUT comes at 6 s, and the client takes it then. A cl-engine that never answers, and a
-/// VALID that comes after 13 s, end at the client's 12 s wait, not before. With a client wait
-/// of 7 s, the stalled call would end before 12 s and this test would fail. None of these
-/// permits the import or records a status, and no request shortens cl-engine's wait
-/// (`timeout_ms` 0).
+/// The two waits are the same 6 s. A VALID 1 ms inside it is taken. cl-engine's own TIMEOUT for
+/// the EL comes at 6 s, when the client's wait ends too: either one ends the call then, with no
+/// verdict. A cl-engine that never answers, a VALID 1 ms after the client's wait and one 1 s
+/// after it end at 6 s, not before and not later: a client that waits longer (7 s, 12 s) has no
+/// verdict at 6 s and fails this test. None of these permits the import or records a status,
+/// and no request shortens cl-engine's wait (`timeout_ms` 0).
 #[tokio::test(start_paused = true)]
 async fn timeout_never_valid() {
     assert_eq!(NEW_PAYLOAD_V5_TIMEOUT, ENGINE_WAIT);
@@ -648,27 +669,44 @@ async fn timeout_never_valid() {
     assert_eq!(took, just_under);
 
     let block = block(2, 1);
+    let engine_timeout = Reason::Engine(pb::EngineErrorKind::Timeout as i32);
     let unverified = [
-        // cl-engine's wait for the EL ran out at 6 s.
+        // cl-engine's wait for the EL ran out at 6 s, as the client's did.
         (
             ENGINE_WAIT,
             engine_error(pb::EngineErrorKind::Timeout),
             ENGINE_WAIT,
-            Reason::Engine(pb::EngineErrorKind::Timeout as i32),
+            vec![engine_timeout, Reason::Timeout],
         ),
         // cl-engine never answers.
-        (Duration::ZERO, Answer::Stall, CLIENT_WAIT, Reason::Timeout),
-        // The VALID comes after the client gave up.
+        (
+            Duration::ZERO,
+            Answer::Stall,
+            CLIENT_WAIT,
+            vec![Reason::Timeout],
+        ),
+        // The VALID comes just after the client gave up, and well after.
+        (
+            CLIENT_WAIT + ms(1),
+            Answer::Valid,
+            CLIENT_WAIT,
+            vec![Reason::Timeout],
+        ),
         (
             CLIENT_WAIT + Duration::from_secs(1),
             Answer::Valid,
             CLIENT_WAIT,
-            Reason::Timeout,
+            vec![Reason::Timeout],
         ),
     ];
-    for (after, answer, at, reason) in unverified {
+    for (after, answer, at, reasons) in unverified {
         let (verdict, took) = verdict_at(&s, &block, after, answer.clone(), at).await;
-        assert_eq!(verdict, ElVerdict::NotVerified(reason), "{answer:?}");
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| verdict == ElVerdict::NotVerified(*reason)),
+            "{answer:?}: {verdict:?}, want one of {reasons:?}"
+        );
         assert_eq!(took, at, "{answer:?}");
         assert!(!verdict.permits_payload_import());
         assert_eq!(

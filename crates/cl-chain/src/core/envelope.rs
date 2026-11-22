@@ -56,7 +56,8 @@ impl<E: Preset> SignatureVerifier<E> for EnvelopeHooks<'_, E> {
 impl<E: Preset> ExecutionEngine<E> for EnvelopeHooks<'_, E> {
     /// Sends the envelope and its bid (the request is built from them again), records the
     /// verdict, and permits the import only if the EL has not contradicted itself and the table
-    /// permits it. No answer within the wait is [`Reason::Timeout`]. `INVALID` with a `null`
+    /// permits it. The wait covers the whole call, a connection to cl-engine included: no
+    /// answer within it is [`Reason::Timeout`], and the call is dropped. `INVALID` with a `null`
     /// `latestValidHash` refuses this envelope and records nothing for its `block_hash`
     /// ([`ExecutionStatuses::record`]): this payload does not hash to it, and the honest one can.
     fn verify_and_notify_new_payload(&self, _: &NewPayloadRequestRef<'_, E>) -> PayloadImport {

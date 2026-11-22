@@ -141,7 +141,10 @@
 //! `latestValidHash` strictly below it or zero, is such a contradiction; a `latestValidHash`
 //! equal to it is not ([`ExecutionStatuses`]). So is a late one that answers a forkchoiceUpdated
 //! whose head a prune at finality already dropped, at or below the finalized payload
-//! ([`ExecutionStatuses::record_head`]). So is INVALID_BLOCK_HASH as the answer to a
+//! ([`ExecutionStatuses::record_head`]). Such an INVALID, with a non-null `latestValidHash`
+//! for a payload at or below finality, latches the contradiction and records nothing also when
+//! that hash has been recorded in the table again since the prune: `record_head` checks
+//! finality before the table. So is INVALID_BLOCK_HASH as the answer to a
 //! forkchoiceUpdated, a newPayload status: a protocol fault, which records nothing. So is a
 //! verdict that makes `Invalid` a payload that the justified block builds on, down to the
 //! finalized block (`is_justified_on_invalid_payload`): `get_head` starts at the justified
@@ -195,7 +198,8 @@
 //! - `verify_execution_payload_envelope` on the post-state of the block. The signature goes to
 //!   cl-verify with the deadline of a block import; a failed check is REJECT, no verdict IGNORE.
 //!   Last, the newPayload call runs on the runtime of the core, which waits up to
-//!   [`ChainCore::with_engine_timeout`] ([`DEFAULT_ENGINE_TIMEOUT`]). The core records the
+//!   [`ChainCore::with_engine_timeout`] ([`DEFAULT_ENGINE_TIMEOUT`], 6 s) for the whole call:
+//!   a call with no verdict by then is dropped, and the core goes on. The core records the
 //!   verdict in its [`ExecutionStatuses`], the only writer of it. If the EL has now contradicted
 //!   itself, the envelope is IGNORE. Else only the table's permit
 //!   ([`ExecutionStatuses::permits_payload_import`]) imports it: INVALID is REJECT, and another
@@ -263,9 +267,10 @@ use tree_hash::TreeHash;
 /// again.
 pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// The time an envelope import gives the EL's newPayload verdict, from the start of the call
-/// \[est\]: the wait of [`NewPayloadClient`](crate::engine::client::NewPayloadClient) for
-/// cl-engine's answer. The core thread waits for it.
+/// The time an envelope import gives the EL's newPayload verdict, from the start of the call:
+/// the wait of [`NewPayloadClient`](crate::engine::client::NewPayloadClient) for cl-engine's
+/// answer, 6 s, the Engine API's wait for `engine_newPayloadV5`. The core thread waits for it,
+/// and no longer: it is one wait around the whole call, a connection to cl-engine included.
 pub const DEFAULT_ENGINE_TIMEOUT: Duration = CALL_TIMEOUT;
 
 /// The most slots a block can be ahead of the slot of the wall clock: one slot of clock skew
