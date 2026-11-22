@@ -437,8 +437,9 @@ impl From<AttestationError> for Error {
 /// Test seams. Only tests may enable them: the feature `testing` is for dev-dependencies.
 /// They change the store without the checks of the handlers that they stand for:
 /// `mark_payload_verified` stands for `on_execution_payload_envelope`, so that a test needs
-/// no envelope, `set_finalized_checkpoint` and `set_justified_checkpoint` for a finalizing or
-/// a justifying chain, `remove_checkpoint_state` for a checkpoint state that
+/// no envelope, `set_finalized_checkpoint`, `set_justified_checkpoint` and
+/// `set_unrealized_justified_checkpoint` for a finalizing or a justifying chain,
+/// `remove_checkpoint_state` for a checkpoint state that
 /// `store_target_checkpoint_state` did not store, and the others let a test set a weight
 /// without the committees of an attestation.
 #[cfg(any(test, feature = "testing"))]
@@ -467,6 +468,16 @@ pub mod testing {
                 .or_insert_with(|| state.clone());
         }
         store.justified_checkpoint = checkpoint;
+    }
+
+    /// Sets `store.unrealized_justified_checkpoint` to `checkpoint`, as
+    /// `update_unrealized_checkpoints` does when a block pulls it up. Nothing else: `on_tick`
+    /// promotes it to the justified checkpoint at the first slot of the next epoch.
+    pub fn set_unrealized_justified_checkpoint<E: Preset>(
+        store: &mut Store<E>,
+        checkpoint: Checkpoint,
+    ) {
+        store.unrealized_justified_checkpoint = checkpoint;
     }
 
     /// Removes `store.checkpoint_states[checkpoint]`, as a store where
