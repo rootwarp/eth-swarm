@@ -699,6 +699,65 @@ fn an_fcu_invalid_for_a_pruned_ancestor_of_the_finalized_payload_is_an_el_contra
     }
 }
 
+/// Finality at 3 prunes 1, 2 and 3 and keeps 4. Then a late newPayload records one of them
+/// again, Optimistic or Valid. INVALID with a `latestValidHash` (its parent) as the answer to a
+/// forkchoiceUpdated whose head is that payload is still an EL contradiction that records
+/// nothing: for the finalized payload 3 and for the ancestors that finality pruned (2, 1). The
+/// payload keeps the status it was recorded again with, 4 stays Optimistic, and the table does
+/// not grow. The same answer for 4, above finality, is recorded as before, with no EL
+/// contradiction.
+#[test]
+fn an_fcu_invalid_for_a_finalized_payload_recorded_again_is_an_el_contradiction_that_records_nothing(
+) {
+    let finalized_at_3 = || {
+        let mut statuses = ExecutionStatuses::new();
+        chain(
+            &mut statuses,
+            &[(1, 0, VALID), (2, 1, OPT), (3, 2, OPT), (4, 3, OPT)],
+        );
+        assert_eq!(statuses.prune_finalized(&hash(3)), 3);
+        assert_eq!(
+            statuses_of(&statuses, [1, 2, 3, 4]),
+            [None, None, None, Some(Optimistic)]
+        );
+        statuses
+    };
+    for (head, parent) in [(3, 2), (2, 1), (1, 0)] {
+        for (again, status) in [(OPT, Optimistic), (VALID, Valid)] {
+            let mut statuses = finalized_at_3();
+            assert_eq!(
+                statuses.record(hash(head), hash(parent), &again),
+                Some(status)
+            );
+            assert!(!statuses.el_contradiction());
+            assert_eq!(statuses.len(), 2, "head {head} is back in the table");
+            assert_eq!(
+                statuses.record_head(hash(head), &invalid(Some(hash(parent)))),
+                Some(status),
+                "head {head} recorded again {status:?}"
+            );
+            assert!(
+                statuses.el_contradiction(),
+                "head {head} recorded again {status:?}"
+            );
+            assert_eq!(
+                statuses_of(&statuses, [head, 4]),
+                [Some(status), Some(Optimistic)],
+                "head {head} recorded again {status:?} records nothing"
+            );
+            assert_eq!(statuses.len(), 2);
+        }
+    }
+
+    let mut statuses = finalized_at_3();
+    assert_eq!(
+        statuses.record_head(hash(4), &invalid(Some(hash(3)))),
+        Some(Invalid)
+    );
+    assert!(!statuses.el_contradiction(), "4 is above finality");
+    assert_eq!(statuses.len(), 1);
+}
+
 /// The table keeps at most `MAX_FINALIZED_PAYLOADS` payloads at or below finality, the oldest
 /// going first. A chain of that many on the payload `wide(0)`, finalized at its top: the walk
 /// ends at `wide(0)`, one past the bound, so an INVALID for it is dropped like one for a hash the
