@@ -9,7 +9,8 @@
 //! `hash(n)`, and `chain` records each `(n, parent, verdict)` in order.
 
 use cl_chain::engine::verdict::{
-    self, ElVerdict, ExecutionStatus, ExecutionStatuses, Reason, MAX_INVALID_PAYLOADS,
+    self, ElVerdict, ExecutionStatus, ExecutionStatuses, Reason, MAX_FINALIZED_PAYLOADS,
+    MAX_INVALID_PAYLOADS,
 };
 use consensus_types::primitives::Hash32;
 use engine_api::{FixedData, PayloadStatusV1, ValidationStatus};
@@ -616,6 +617,109 @@ fn an_fcu_invalid_for_the_pruned_finalized_payload_is_an_el_contradiction_that_r
         );
         assert_eq!(statuses.len(), 1);
     }
+}
+
+/// Finality at 10, a payload the table never recorded, then 1 on 11 (another one, the payload
+/// the walk of the next prune ends at), 2 on 1, 3 on 2, 4 on 3, and the fork 5 on 1. Finality at
+/// 3 prunes 1, 2, 3 and the fork. INVALID with a `latestValidHash` as the answer to a
+/// forkchoiceUpdated whose head finality has passed calls a finalized payload invalid: an EL
+/// contradiction that records nothing, for 3 and for each ancestor that finality pruned (2, 1),
+/// that the walk ended at (11) or that was finalized before (10). It stays one after a later
+/// finality at 4. The same answer for the pruned fork 5, or for a head the table never had (9),
+/// is no contradiction, and INVALID with a `null` `latestValidHash` records nothing either.
+#[test]
+fn an_fcu_invalid_for_a_pruned_ancestor_of_the_finalized_payload_is_an_el_contradiction() {
+    let finalized_at_3 = || {
+        let mut statuses = ExecutionStatuses::new();
+        statuses.prune_finalized(&hash(10));
+        chain(
+            &mut statuses,
+            &[
+                (1, 11, VALID),
+                (2, 1, OPT),
+                (3, 2, OPT),
+                (4, 3, OPT),
+                (5, 1, OPT),
+            ],
+        );
+        assert_eq!(statuses.prune_finalized(&hash(3)), 4);
+        assert_eq!(
+            statuses_of(&statuses, [1, 2, 3, 4, 5]),
+            [None, None, None, Some(Optimistic), None]
+        );
+        statuses
+    };
+    let nothing_recorded = |statuses: &ExecutionStatuses, head: u8| {
+        assert_eq!(
+            statuses_of(statuses, [1, 2, 3, 4, 5, 9, 10, 11]),
+            [None, None, None, Some(Optimistic), None, None, None, None],
+            "head {head} records nothing"
+        );
+        assert_eq!(statuses.len(), 1);
+    };
+    for (head, contradiction) in [
+        (3, true),
+        (2, true),
+        (1, true),
+        (11, true),
+        (10, true),
+        (5, false),
+        (9, false),
+    ] {
+        let mut statuses = finalized_at_3();
+        assert_eq!(
+            statuses.record_head(hash(head), &invalid(Some(hash(11)))),
+            None
+        );
+        assert_eq!(statuses.el_contradiction(), contradiction, "head {head}");
+        nothing_recorded(&statuses, head);
+    }
+
+    let mut statuses = finalized_at_3();
+    assert_eq!(statuses.record_head(hash(2), &invalid(None)), None);
+    assert!(!statuses.el_contradiction(), "a null latestValidHash");
+    nothing_recorded(&statuses, 2);
+
+    for head in [3, 1, 10] {
+        let mut statuses = finalized_at_3();
+        statuses.record(hash(6), hash(4), &OPT);
+        assert_eq!(statuses.prune_finalized(&hash(4)), 1);
+        assert_eq!(
+            statuses.record_head(hash(head), &invalid(Some(hash(11)))),
+            None
+        );
+        assert!(
+            statuses.el_contradiction(),
+            "head {head} after a later finality at 4"
+        );
+        assert_eq!(
+            statuses_of(&statuses, [head, 4, 6]),
+            [None, None, Some(Optimistic)]
+        );
+    }
+}
+
+/// The table keeps at most `MAX_FINALIZED_PAYLOADS` payloads at or below finality, the oldest
+/// going first. A chain of that many on the payload `wide(0)`, finalized at its top: the walk
+/// ends at `wide(0)`, one past the bound, so an INVALID for it is dropped like one for a hash the
+/// table never had. One for the next payload, `wide(1)`, is still an EL contradiction.
+#[test]
+fn the_payloads_at_or_below_finality_that_the_table_keeps_are_bounded() {
+    let mut statuses = ExecutionStatuses::new();
+    let top = u32::try_from(MAX_FINALIZED_PAYLOADS).unwrap();
+    for i in 1..=top {
+        statuses.record(wide(i), wide(i - 1), &VALID);
+    }
+    assert_eq!(statuses.prune_finalized(&wide(top)), MAX_FINALIZED_PAYLOADS);
+    assert!(statuses.is_empty());
+    let verdict = invalid(Some(wide(0)));
+    assert_eq!(statuses.record_head(wide(0), &verdict), None);
+    assert!(
+        !statuses.el_contradiction(),
+        "the oldest went past the bound"
+    );
+    assert_eq!(statuses.record_head(wide(1), &verdict), None);
+    assert!(statuses.el_contradiction());
 }
 
 /// INVALID with a `null` `latestValidHash` is the Engine API's answer to a payload that does not
