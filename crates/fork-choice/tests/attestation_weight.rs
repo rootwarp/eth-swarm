@@ -11,12 +11,13 @@ use consensus_types::gloas::{
     BeaconBlock, BeaconState, Checkpoint, PayloadAttestation, PayloadAttestationData,
     SignedBeaconBlock,
 };
-use consensus_types::primitives::{Bytes32, Gwei, Root, Slot, ValidatorIndex};
+use consensus_types::primitives::{Bytes32, Gwei, Hash32, Root, Slot, ValidatorIndex};
 use consensus_types::Minimal;
 use fork_choice::testing::{add_equivocating_index, mark_payload_verified, set_latest_message};
 use fork_choice::{
-    get_forkchoice_store, get_head, get_weight, on_block, on_tick, store_target_checkpoint_state,
-    Error, ForkChoiceNode, LatestMessage, PayloadStatus, StateProvider, Store,
+    get_forkchoice_store, get_head, get_weight, invalidate_payloads, on_block, on_tick,
+    store_target_checkpoint_state, Error, ForkChoiceNode, LatestMessage, PayloadStatus,
+    StateProvider, Store,
 };
 use ssz::BitVector;
 use state_transition::caches::CommitteeCache;
@@ -456,7 +457,9 @@ fn a_message_of_the_slot_of_its_block_supports_only_the_pending_node() {
         assert_eq!(w(&f, empty(root)), 0);
         assert_eq!(w(&f, full(root)), 0);
     }
-    // A message of a later slot supports the node of its payload status.
+    // A message of a later slot supports the node of its payload status. `on_attestation` takes
+    // a vote for the FULL node only once the payload is verified.
+    mark_payload_verified(&mut f.store, f.c);
     vote(&mut f.store, 0, 3, f.b, false);
     vote(&mut f.store, 1, 3, f.c, true);
     assert_eq!(w(&f, empty(f.b)), BALANCE);
@@ -507,4 +510,95 @@ fn get_head_starts_at_the_new_justified_block_once_its_state_is_stored() {
     tick(&mut store, 10);
     assert!(store.block(rb).is_some() && store.block(anchor).is_some());
     assert_eq!(get_head(&store), Ok(empty(rc)));
+}
+
+/// The bid `block_hash` of block `root` of `store`: the payload that the EL can find invalid.
+fn block_hash(store: &Store<E>, root: Root) -> Hash32 {
+    store
+        .block(root)
+        .unwrap()
+        .body
+        .signed_execution_payload_bid
+        .message
+        .block_hash
+}
+
+/// The EL finds the verified payload of `a` invalid, and `invalidate_payloads` takes it out of
+/// `store.payloads`. `bellatrix/optimistic-sync.md`: the weights of an `INVALIDATED` block must
+/// not be applied to its ancestors. A vote for the FULL node of `a`, or for `b` on that FULL
+/// node, then adds no weight to any node. A vote for the EMPTY node of `a`, or for `c` on that
+/// EMPTY node, still does.
+#[test]
+fn votes_on_an_invalidated_full_branch_add_no_weight() {
+    let mut f = fork();
+    // The payload nodes of `b` and `c` (slot 2) are not of the previous slot.
+    tick(&mut f.store, 4);
+    let w = |f: &Fork, n: ForkChoiceNode| get_weight(&f.store, &n).unwrap();
+    vote(&mut f.store, 0, 3, f.a, true);
+    vote(&mut f.store, 1, 3, f.b, false);
+    vote(&mut f.store, 2, 3, f.a, false);
+    vote(&mut f.store, 3, 3, f.c, false);
+    assert_eq!(w(&f, full(f.a)), 2 * BALANCE);
+    assert_eq!(w(&f, empty(f.a)), 2 * BALANCE);
+    assert_eq!(w(&f, pending(f.a)), 4 * BALANCE);
+    assert_eq!(w(&f, empty(f.anchor)), 4 * BALANCE);
+
+    let a_hash = block_hash(&f.store, f.a);
+    assert!(invalidate_payloads(&mut f.store, |hash| *hash == a_hash));
+    for n in [full(f.a), pending(f.b), empty(f.b)] {
+        assert_eq!(w(&f, n), 0, "{n:?} is on the invalidated FULL branch");
+    }
+    assert_eq!(w(&f, empty(f.a)), 2 * BALANCE);
+    assert_eq!(w(&f, pending(f.c)), BALANCE);
+    assert_eq!(w(&f, empty(f.c)), BALANCE);
+    // Only the votes on the EMPTY side reach the ancestors.
+    assert_eq!(w(&f, pending(f.a)), 2 * BALANCE);
+    assert_eq!(w(&f, empty(f.anchor)), 2 * BALANCE);
+    assert_eq!(get_head(&f.store), Ok(empty(f.c)));
+}
+
+/// The parent `p` of slot 1 with its payload verified, and its timely child `c` at the start of
+/// slot 2, which gets the proposer boost: on the FULL `p` if `on_full` is true, else on the
+/// EMPTY `p`.
+fn boost_on(on_full: bool) -> Boost {
+    let (mut store, anchor_block) = new_store();
+    tick(&mut store, 1);
+    let p = child(&anchor_block, 1, false, PROPOSER);
+    on_block(&mut store, &PLAIN, &p).unwrap();
+    mark_payload_verified(&mut store, root_of(&p));
+    tick(&mut store, 2);
+    let c = child(&p.message, 2, on_full, PROPOSER + 1);
+    on_block(&mut store, &PLAIN, &c).unwrap();
+    assert_eq!(store.proposer_boost_root(), root_of(&c));
+    Boost {
+        store,
+        p: root_of(&p),
+        c: root_of(&c),
+    }
+}
+
+/// The EL finds the verified payload of `p` invalid. The proposer boost of `c` on the FULL `p`
+/// then adds no weight to `c` or to its ancestors. The boost of `c` on the EMPTY `p` still
+/// does: `should_apply_proposer_boost` applies it (a weak parent, no early equivocation).
+#[test]
+fn proposer_boost_on_an_invalidated_full_branch_adds_no_weight() {
+    for on_full in [true, false] {
+        let mut b = boost_on(on_full);
+        let anchor = b.store.block(b.p).unwrap().parent_root;
+        // The payload nodes of `p` are of the previous slot: they have no weight anyway.
+        let nodes = [pending(b.c), pending(b.p), empty(anchor)];
+        for n in nodes {
+            assert_eq!(get_weight(&b.store, &n), Ok(PROPOSER_SCORE), "{n:?}");
+        }
+        let p_hash = block_hash(&b.store, b.p);
+        assert!(invalidate_payloads(&mut b.store, |hash| *hash == p_hash));
+        let want = if on_full { 0 } else { PROPOSER_SCORE };
+        for n in nodes {
+            assert_eq!(
+                get_weight(&b.store, &n),
+                Ok(want),
+                "{n:?}, boosted block on the FULL parent: {on_full}"
+            );
+        }
+    }
 }

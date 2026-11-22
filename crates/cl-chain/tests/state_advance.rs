@@ -1241,15 +1241,36 @@ async fn a_block_past_the_cap_or_with_a_bad_signature_spends_no_admission_budget
     let f = fixture();
     let wall = Wall::of(&f);
     let anchor = anchor_state(&f);
-    let mut core = f.core.with_clock(wall.at(cap()));
-    // Past the cap from the anchor: IGNORE before cl-verify.
+    // The store took the tick of the slot after the wall clock: a block of that slot is not
+    // after the current slot of fork choice, and not more than `MAX_FUTURE_SLOTS` ahead of the
+    // wall clock, so it reaches the walk cap.
+    let mut core = store_at(f.core.with_clock(wall.at(cap())), &wall, cap() + 1);
+    // Past the cap from the anchor: IGNORE before cl-verify, with no walk.
     let mut far = f.block.clone();
     far.message.slot = cap() + 1;
+    let past_cap = format!(
+        "more than {} slots after the state at slot {}",
+        cap(),
+        f.anchor.slot
+    );
     for _ in 0..3 {
-        let (outcome, next, verify) = import_one(core, far.clone(), Answer::Valid).await;
-        assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+        let verify = FakeVerify::new(Answer::Valid);
+        let watched = import_watched(
+            core,
+            far.clone(),
+            Arc::clone(&verify),
+            &verify,
+            &Waiting::default(),
+            None,
+        )
+        .await;
+        match &watched.outcome {
+            Some(Outcome::Ignored(why)) => assert!(why.contains(&past_cap), "{why}"),
+            other => panic!("the walk cap must IGNORE the block: {other:?}"),
+        }
+        assert!(watched.walk.is_empty(), "the core must not start the walk");
         assert!(verify.calls().is_empty());
-        core = next;
+        core = watched.core;
     }
     // A bad signature: INVALID before the walk.
     let (block, _) = moved(&f.block, &anchor, cap(), &f.config);

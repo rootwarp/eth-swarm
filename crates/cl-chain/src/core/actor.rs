@@ -124,8 +124,9 @@
 //! EL answers to a forkchoiceUpdated (the core takes one answer of the sink at the start of each
 //! turn, [`ForkchoiceSink::take_outcome`]: an unread INVALID first, else the latest), can make
 //! payloads `Invalid` that the store has verified. They leave the store (`invalidate_payloads`),
-//! so `get_head` offers no FULL node of their blocks, and the head moves at once, with its
-//! forkchoiceUpdated.
+//! so `get_head` offers no FULL node of their blocks and `get_weight` no vote or boost on them,
+//! and the head moves at once, with its forkchoiceUpdated. A verdict that makes no payload
+//! `Invalid`, such as an INVALID for payloads that are `Invalid` already, does not scan the store.
 //! [`ChainCore::payload_verified`] is `true` while the store has the payload and the LRU holds
 //! the pre-state of its block; the checks of an import read the store alone
 //! (`is_payload_verified`).
@@ -138,7 +139,11 @@
 //! reach the EL, and a later answer is not read. An INVALID for the finalized payload, or with a
 //! `latestValidHash` strictly below it or zero, is such a contradiction; a `latestValidHash`
 //! equal to it is not ([`ExecutionStatuses`]). So is INVALID_BLOCK_HASH as the answer to a
-//! forkchoiceUpdated, a newPayload status: a protocol fault, which records nothing.
+//! forkchoiceUpdated, a newPayload status: a protocol fault, which records nothing. So is a
+//! verdict that makes `Invalid` a payload that the justified block builds on, down to the
+//! finalized block (`is_justified_on_invalid_payload`): `get_head` starts at the justified
+//! block. The core sets the contradiction before such a payload leaves the store. An `Invalid`
+//! payload of the justified block itself is not one: the head can move to its EMPTY node.
 //!
 //! # Seen roots
 //!
@@ -224,9 +229,10 @@ use consensus_types::primitives::{BLSPubkey, Epoch, Hash32, Root, Slot, Validato
 use consensus_types::signing::DOMAIN_BEACON_PROPOSER;
 use ethswarm_proto::verify::BlsSet;
 use fork_choice::{
-    get_current_slot, get_forkchoice_store, get_head, invalidate_payloads, is_payload_verified,
-    on_block, on_execution_payload_envelope, on_tick, store_target_checkpoint_state,
-    DataAvailabilityCheck, EnvelopeError, StateProvider, Store,
+    get_current_slot, get_forkchoice_store, get_head, invalidate_payloads,
+    is_justified_on_invalid_payload, is_payload_verified, on_block, on_execution_payload_envelope,
+    on_tick, store_target_checkpoint_state, DataAvailabilityCheck, EnvelopeError, StateProvider,
+    Store,
 };
 use network_config::ChainConfig;
 use state_transition::accessors::get_domain;
@@ -1175,20 +1181,32 @@ impl<E: Preset> ChainCore<E> {
         }
     }
 
-    /// After a verdict in the table: `true` on an EL contradiction, and the sink halts. Else
-    /// each verified payload that the table now has `Invalid` leaves the fork choice store, and
-    /// the head follows if one did.
+    /// After a verdict in the table: `true` on an EL contradiction, and the sink halts. Else, if
+    /// a payload became `Invalid`, each verified payload that the table now has `Invalid` leaves
+    /// the fork choice store, and the head follows if one did. A verdict that made no payload
+    /// `Invalid` cannot invalidate a verified payload, so the store is not scanned. If the
+    /// justified block builds on a payload that would leave (or left) the store, that is a
+    /// contradiction too: the store and the head stay as they were (see
+    /// [Fork choice](#fork-choice)).
     fn reconcile(&mut self) -> bool {
+        if !self.statuses.el_contradiction() && self.statuses.take_invalidated() {
+            let statuses = &self.statuses;
+            let invalid = |hash: &Hash32| statuses.status(hash) == Some(ExecutionStatus::Invalid);
+            if is_justified_on_invalid_payload(&self.store, invalid) {
+                tracing::error!(
+                    justified = %self.store.justified_checkpoint().root,
+                    "the justified checkpoint builds on a payload the EL found INVALID: halting"
+                );
+                self.statuses.set_contradiction();
+            } else if invalidate_payloads(&mut self.store, invalid) {
+                self.refresh();
+            }
+        }
         if self.statuses.el_contradiction() {
             if let Some(sink) = self.sink.as_deref() {
                 sink.halt();
             }
             return true;
-        }
-        let statuses = &self.statuses;
-        let invalid = |hash: &Hash32| statuses.status(hash) == Some(ExecutionStatus::Invalid);
-        if invalidate_payloads(&mut self.store, invalid) {
-            self.refresh();
         }
         false
     }

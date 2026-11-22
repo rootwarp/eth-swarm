@@ -451,10 +451,12 @@ pub fn is_payload_verified<E: Preset>(store: &Store<E>, root: Root) -> bool {
 /// `block_hash` the EL has now found invalid (`invalid`). `bellatrix/optimistic-sync.md`: an
 /// `INVALIDATED` payload MUST NOT be in the canonical chain. [`get_node_children`] then gives no
 /// FULL node of such a block, so [`get_head`] moves to its EMPTY node or another branch, and
-/// `on_block` refuses a child on that payload. Returns whether it took any out.
+/// `on_block` refuses a child on that payload. [`get_weight`] adds no weight of a vote or of the
+/// proposer boost on that FULL node or on a block built on it. Returns whether it took any out.
 ///
 /// [`get_node_children`]: crate::get_node_children
 /// [`get_head`]: crate::get_head
+/// [`get_weight`]: crate::get_weight
 pub fn invalidate_payloads<E: Preset>(
     store: &mut Store<E>,
     invalid: impl Fn(&Hash32) -> bool,
@@ -475,6 +477,43 @@ pub fn invalidate_payloads<E: Preset>(
         })
     });
     payloads.len() != before
+}
+
+/// Not a spec function: whether the justified checkpoint block builds on a payload that left
+/// `store.payloads`, or that [`invalidate_payloads`] with `invalid` takes out. From the justified
+/// block down to the finalized checkpoint block (or the anchor), it looks for a block on the
+/// FULL node of a block whose payload is not in `store.payloads`, or whose bid `block_hash`
+/// `invalid` names. The justified block's own payload does not count: [`get_head`] can still
+/// stay on its EMPTY node.
+///
+/// [`get_head`] starts at the justified block, so on such a chain it gives a head on a payload
+/// that the EL found invalid. `bellatrix/optimistic-sync.md` (Re-Orgs): if the justified
+/// checkpoint becomes `INVALIDATED`, a consensus engine MAY alert the user and exit. The caller
+/// decides; the chain core fails closed.
+///
+/// [`get_head`]: crate::get_head
+pub fn is_justified_on_invalid_payload<E: Preset>(
+    store: &Store<E>,
+    invalid: impl Fn(&Hash32) -> bool,
+) -> bool {
+    let mut root = store.justified_checkpoint.root;
+    while root != store.finalized_checkpoint.root && root != store.anchor_root {
+        let Some(block) = store.blocks.get(&root) else {
+            return false;
+        };
+        let parent = block.parent_root;
+        if is_parent_node_full(store, block).unwrap_or(false) {
+            let left = !store.payloads.contains(&parent)
+                || store.blocks.get(&parent).is_some_and(|parent| {
+                    invalid(&parent.body.signed_execution_payload_bid.message.block_hash)
+                });
+            if left {
+                return true;
+            }
+        }
+        root = parent;
+    }
+    false
 }
 
 /// `get_parent_payload_status` (G L368-372): FULL when the bid of `block` builds on the block
